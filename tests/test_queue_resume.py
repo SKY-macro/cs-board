@@ -197,6 +197,25 @@ class QueueResumeTests(unittest.TestCase):
                 set(),
             )
 
+    def test_detect_callable_text_model_skips_rate_limited_candidates(self) -> None:
+        limited = SERVER.ProviderHTTPError(429, "Upstream rate limit exceeded")
+        unavailable = SERVER.ProviderHTTPError(503, "Service temporarily unavailable")
+        with mock.patch.object(SERVER, "probe_text_model_once", side_effect=[limited, unavailable, "gpt-5.5"]) as probe:
+            selected = SERVER.detect_callable_text_model(
+                {"api_key": "test", "base_url": "https://relay.example/v1", "text_model": "gpt-5.4"},
+                {"gpt-5.4", "gpt-5.2", "gpt-5.5"},
+            )
+        self.assertEqual(selected, "gpt-5.5")
+        self.assertEqual([call.args[1] for call in probe.call_args_list], ["gpt-5.4", "gpt-5.2", "gpt-5.5"])
+
+    def test_detect_callable_text_model_returns_only_successful_response_model(self) -> None:
+        with mock.patch.object(SERVER, "provider_models", return_value={"gpt-5.4", "gpt-5.5"}), mock.patch.object(
+            SERVER, "detect_callable_text_model", return_value="gpt-5.5"
+        ):
+            catalog = SERVER.detect_models({"api_key": "test", "base_url": "https://relay.example/v1"})
+        self.assertEqual(catalog["text_models"], ["gpt-5.5"])
+        self.assertEqual(catalog["selected_text_model"], "gpt-5.5")
+
     def test_whiteboard_render_command_hides_drawing_hand(self) -> None:
         command = SERVER.whiteboard_render_command(
             Path("board.png"), Path("board.annotation.json"), Path("board.partial.mp4"), "detailed"

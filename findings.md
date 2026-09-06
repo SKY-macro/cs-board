@@ -7,3 +7,4 @@
 - 风格库中 repo-adapted 条目附带 MIT 许可，许可文本需要随集成资产保留。
 - 当前 cs-board 已有 12 种风格卡片，静态预览位于 `web/public/styles`；后端风格配方位于 `webapp/server.py::STYLE_PRESETS`。
 - 集成策略：保留现有 12 种风格，再追加来源 Skill 的 20 种，避免破坏历史任务；后端使用来源库完整配方，前端使用来源中文名、摘要与原始示例图。
+- 当前中转站 `/models` 条目只有 `id/type/display_name/created_at`，没有渠道健康、可调用状态或支持端点字段；因此仅靠列表无法过滤 429/503，必须执行最小真实文本请求确认。

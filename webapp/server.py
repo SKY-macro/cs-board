@@ -835,6 +835,53 @@ def provider_models(config: dict[str, Any], timeout: float = 30) -> set[str]:
     return {str(item.get("id")) for item in payload.get("data", []) if isinstance(item, dict) and item.get("id")}
 
 
+def probe_text_model_once(config: dict[str, Any], model: str, timeout: float = 20) -> str:
+    """Verify one advertised model with a minimal request and no retry loop."""
+    headers = {"Authorization": f"Bearer {config['api_key']}", "Content-Type": "application/json"}
+    base_url = str(config["base_url"]).rstrip("/")
+    attempts = (
+        ("responses", {"model": model, "input": "只回复OK", "max_output_tokens": 8}),
+        ("chat/completions", {
+            "model": model,
+            "messages": [{"role": "user", "content": "只回复OK"}],
+            "max_tokens": 8,
+        }),
+    )
+    with httpx.Client(timeout=timeout) as client:
+        for index, (endpoint, payload) in enumerate(attempts):
+            response = client.post(f"{base_url}/{endpoint}", headers=headers, json=payload)
+            if not response.is_error:
+                try:
+                    response_payload = response.json()
+                except ValueError:
+                    response_payload = {}
+                return str(response_payload.get("model") or model)
+            if index == 0 and response.status_code in {400, 404, 405, 501}:
+                continue
+            raise ProviderHTTPError(response.status_code, f"模型可用性检测失败：{response.status_code} {response.text[:500]}")
+    raise RuntimeError(f"模型 {model} 没有可用的文本生成接口")
+
+
+def detect_callable_text_model(config: dict[str, Any], models: set[str]) -> str:
+    """Return the first model that completes a real request, stopping immediately on success."""
+    catalog = build_model_catalog(models, str(config.get("text_model") or ""), str(config.get("image_model") or ""))
+    preferred = str(catalog["selected_text_model"] or "")
+    candidates = [preferred, *(model for model in catalog["text_models"] if model != preferred)]
+    failures: list[str] = []
+    for candidate in candidates:
+        try:
+            probe_text_model_once(config, candidate)
+            return candidate
+        except ProviderHTTPError as exc:
+            if exc.status_code in {401, 403}:
+                raise
+            failures.append(f"{candidate}: HTTP {exc.status_code}")
+        except (httpx.HTTPError, RuntimeError) as exc:
+            failures.append(f"{candidate}: {str(exc)[:80]}")
+    summary = "；".join(failures[:8])
+    raise RuntimeError(f"接口列出了文本模型，但当前没有模型通过真实调用验证：{summary}")
+
+
 def _is_image_model(model: str) -> bool:
     value = model.lower()
     return any(token in value for token in ("gpt-image", "dall-e", "imagen", "flux", "stable-diffusion", "ideogram", "recraft"))
@@ -2659,12 +2706,13 @@ def save_config(payload: dict[str, Any]) -> dict[str, Any]:
 def detect_models(payload: dict[str, Any]) -> dict[str, Any]:
     config = merged_provider_config(payload)
     text_models = provider_models(config)
+    callable_text_model = detect_callable_text_model(config, text_models)
     image_config = image_provider_config(config)
     if image_config.get("base_url") == config.get("base_url") and image_config.get("api_key") == config.get("api_key"):
         image_models = text_models
     else:
         image_models = provider_models(image_config)
-    text_catalog = build_model_catalog(text_models, str(config["text_model"]), str(config["image_model"]))
+    text_catalog = build_model_catalog({callable_text_model}, callable_text_model, str(config["image_model"]))
     image_catalog = build_model_catalog(image_models, str(config["text_model"]), str(config["image_model"]))
     return {
         "text_models": text_catalog["text_models"],
