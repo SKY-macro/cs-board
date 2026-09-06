@@ -100,13 +100,22 @@ class QueueResumeTests(unittest.TestCase):
     def test_story_handdrawn_recipe_keeps_positive_and_negative_constraints(self) -> None:
         recipe = SERVER.style_recipe("水墨写意")
         self.assertIn("浓淡干湿", recipe)
-        self.assertIn("色彩要求", recipe)
-        self.assertIn("排除项", recipe)
+        self.assertIn("禁止", recipe)
+        self.assertIn("内容边界", recipe)
 
-    def test_colored_pencil_diary_uses_its_full_profile(self) -> None:
+    def test_handdrawn_visual_recipes_do_not_seed_people_or_places(self) -> None:
+        contaminated_terms = ("elderly", "hospital", "clinic", "school", "老人", "孩子", "儿童", "医院", "诊所", "学校", "教室", "家庭")
+        for name, recipe in SERVER.HANDDRAWN_STYLE_PRESETS.items():
+            with self.subTest(style=name):
+                normalized = recipe.lower()
+                self.assertFalse(any(term in normalized for term in contaminated_terms))
+                self.assertIn("只能来自当前分镜", recipe)
+
+    def test_colored_pencil_diary_uses_clean_visual_profile(self) -> None:
         recipe = SERVER.style_recipe("彩铅日记漫画（默认）")
-        self.assertIn("oversized rounded heads", recipe)
-        self.assertIn("dry wax-colored-pencil fills", recipe)
+        self.assertIn("黑色毡尖笔轮廓", recipe)
+        self.assertIn("干性彩铅笔触", recipe)
+        self.assertIn("年龄特征必须服从分镜", recipe)
 
     def test_specialized_codex_review_model_is_not_a_text_candidate(self) -> None:
         catalog = SERVER.build_model_catalog(
