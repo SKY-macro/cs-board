@@ -211,6 +211,17 @@ class QueueResumeTests(unittest.TestCase):
         self.assertEqual(resolved["base_url"], "https://relay.example/v1")
         self.assertEqual(resolved["api_key"], "shared-key")
 
+    def test_text_provider_falls_back_to_another_advertised_model_on_upstream_limit(self) -> None:
+        limited = SERVER.ProviderHTTPError(429, "Upstream rate limit exceeded")
+        with mock.patch.object(SERVER, "provider_text_once", side_effect=[limited, {"output_text": "ok"}]) as request:
+            payload = SERVER.provider_text(
+                {"api_key": "test", "base_url": "https://relay.example/v1", "_text_models": ["gpt-5.4", "gpt-4o"]},
+                "gpt-5.4",
+                "hello",
+            )
+        self.assertEqual(payload["output_text"], "ok")
+        self.assertEqual([call.args[1] for call in request.call_args_list], ["gpt-5.4", "gpt-4o"])
+
     def test_scene_durations_fit_voice_track_exactly(self) -> None:
         scenes = [
             {"text": "短句", "duration_ms": 2000},

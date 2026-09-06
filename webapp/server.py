@@ -684,6 +684,11 @@ def provider_post(config: dict[str, Any], endpoint: str, payload: dict[str, Any]
         except (httpx.TimeoutException, httpx.TransportError, ProviderHTTPError) as exc:
             last_error = exc
             retryable = not isinstance(exc, ProviderHTTPError) or exc.status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+            message = str(exc).lower()
+            if isinstance(exc, ProviderHTTPError) and any(token in message for token in (
+                "upstream rate limit", "model_not_found", "no available channel", "get_channel_failed",
+            )):
+                retryable = False
             if not retryable or attempt == 2:
                 raise
             if job_id and job_id in JOBS:
@@ -692,7 +697,7 @@ def provider_post(config: dict[str, Any], endpoint: str, payload: dict[str, Any]
     raise RuntimeError(f"模型服务重试失败：{last_error}")
 
 
-def provider_text(config: dict[str, Any], model: str, prompt: str, timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
+def provider_text_once(config: dict[str, Any], model: str, prompt: str, timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
     """Call either generation API used by OpenAI-compatible gateways.
 
     Newer providers expose ``/responses`` while many relay services only
@@ -713,6 +718,27 @@ def provider_text(config: dict[str, Any], model: str, prompt: str, timeout: floa
     )
 
 
+def provider_text(config: dict[str, Any], model: str, prompt: str, timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
+    """Call text generation and fail over across models advertised by a relay."""
+    advertised = [str(item) for item in config.get("_text_models", []) if str(item)]
+    candidates = [model, *(item for item in advertised if item != model)]
+    last_error: Exception | None = None
+    for index, candidate in enumerate(candidates):
+        try:
+            return provider_text_once(config, candidate, prompt, timeout=timeout, job_id=job_id)
+        except ProviderHTTPError as exc:
+            last_error = exc
+            message = str(exc).lower()
+            unavailable = exc.status_code in {429, 500, 502, 503, 504} and any(token in message for token in (
+                "rate limit", "rate_limit", "model_not_found", "no available channel", "get_channel_failed", "upstream",
+            ))
+            if not unavailable or index == len(candidates) - 1:
+                raise
+            if job_id and job_id in JOBS:
+                update_job(job_id, stage=f"模型 {candidate} 暂不可用，自动切换到 {candidates[index + 1]}")
+    raise RuntimeError(f"没有可用的文本模型：{last_error}")
+
+
 def provider_models(config: dict[str, Any], timeout: float = 30) -> set[str]:
     if not config.get("api_key"):
         raise RuntimeError("请先在 API 设置中填写 API Key")
@@ -729,7 +755,10 @@ def provider_models(config: dict[str, Any], timeout: float = 30) -> set[str]:
             if response.status_code in {404, 405, 501}:
                 return set()
             raise ProviderHTTPError(response.status_code, f"模型列表读取失败：{response.status_code} {response.text[:800]}")
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError("模型列表接口没有返回有效 JSON，请检查接口地址是否包含正确的 /v1 路径") from exc
     return {str(item.get("id")) for item in payload.get("data", []) if isinstance(item, dict) and item.get("id")}
 
 
@@ -783,6 +812,7 @@ def resolve_configured_models(config: dict[str, Any]) -> dict[str, Any]:
         text_models = provider_models(config)
         if text_models:
             catalog = build_model_catalog(text_models, str(config["text_model"]), str(config["image_model"]))
+            resolved["_text_models"] = [catalog["selected_text_model"], *(model for model in catalog["text_models"] if model != catalog["selected_text_model"])]
             if catalog["text_models"]:
                 resolved["text_model"] = catalog["selected_text_model"]
     except Exception:
