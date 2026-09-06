@@ -127,6 +127,50 @@ STYLE_PRESETS = {
     ),
 }
 
+HANDDRAWN_STYLE_LIBRARY_PATH = ROOT / "assets" / "story-handdrawn" / "handdrawn-style-library.json"
+
+
+def load_handdrawn_style_presets(path: Path = HANDDRAWN_STYLE_LIBRARY_PATH) -> dict[str, str]:
+    """Load the bundled story-to-handdrawn-video recipes without flattening their constraints."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"手绘风格库加载失败：{path}") from exc
+    styles = payload.get("styles")
+    if not isinstance(styles, list) or len(styles) != 20:
+        raise RuntimeError("手绘风格库必须包含 20 种画面风格")
+    presets: dict[str, str] = {}
+    for entry in styles:
+        if not isinstance(entry, dict):
+            raise RuntimeError("手绘风格库包含无效条目")
+        name = str(entry.get("name_zh") or "").strip()
+        prompt_blocks = entry.get("prompt_blocks")
+        profile_file = str(entry.get("profile_file") or "").strip()
+        if not prompt_blocks and profile_file:
+            profile_path = path.parent / Path(profile_file).name
+            try:
+                prompt_blocks = [profile_path.read_text(encoding="utf-8").strip()]
+            except OSError as exc:
+                raise RuntimeError(f"手绘风格详细配方加载失败：{profile_path}") from exc
+        blocks = [str(block).strip() for block in (prompt_blocks or []) if str(block).strip()]
+        color_hint = str(entry.get("color_hint") or "").strip()
+        avoid = str(entry.get("avoid") or "").strip()
+        if not name or not blocks:
+            raise RuntimeError("手绘风格库的名称或提示词不完整")
+        recipe = "".join(blocks)
+        if color_hint:
+            recipe += f" 色彩要求：{color_hint}"
+        if avoid:
+            recipe += f" 排除项：{avoid}。"
+        presets[name] = recipe
+    if len(presets) != 20:
+        raise RuntimeError("手绘风格库存在重复名称")
+    return presets
+
+
+HANDDRAWN_STYLE_PRESETS = load_handdrawn_style_presets()
+STYLE_PRESETS.update(HANDDRAWN_STYLE_PRESETS)
+
 
 def style_recipe(style: str) -> str:
     if style not in STYLE_PRESETS:

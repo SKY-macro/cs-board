@@ -92,6 +92,22 @@ class QueueResumeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "后台未加载画面风格"):
             SERVER.style_recipe("不存在的风格")
 
+    def test_story_handdrawn_library_adds_exactly_twenty_styles(self) -> None:
+        self.assertEqual(len(SERVER.HANDDRAWN_STYLE_PRESETS), 20)
+        self.assertIn("彩铅日记漫画（默认）", SERVER.HANDDRAWN_STYLE_PRESETS)
+        self.assertIn("粗粝木刻社论插画", SERVER.HANDDRAWN_STYLE_PRESETS)
+
+    def test_story_handdrawn_recipe_keeps_positive_and_negative_constraints(self) -> None:
+        recipe = SERVER.style_recipe("水墨写意")
+        self.assertIn("浓淡干湿", recipe)
+        self.assertIn("色彩要求", recipe)
+        self.assertIn("排除项", recipe)
+
+    def test_colored_pencil_diary_uses_its_full_profile(self) -> None:
+        recipe = SERVER.style_recipe("彩铅日记漫画（默认）")
+        self.assertIn("oversized rounded heads", recipe)
+        self.assertIn("dry wax-colored-pencil fills", recipe)
+
     def test_specialized_codex_review_model_is_not_a_text_candidate(self) -> None:
         catalog = SERVER.build_model_catalog(
             {"gpt-5.4", "codex-auto-review", "text-embedding-3-small", "gpt-image-2"},
