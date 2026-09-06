@@ -665,7 +665,7 @@ def image_provider_config(config: dict[str, Any]) -> dict[str, Any]:
 
 def provider_post(config: dict[str, Any], endpoint: str, payload: dict[str, Any], timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
     if not config.get("api_key"):
-        raise RuntimeError("请先在 API 设置中填写 OpenLux API Key")
+        raise RuntimeError("请先在 API 设置中填写 API Key")
     last_error: Exception | None = None
     for attempt in range(3):
         try:
@@ -676,7 +676,7 @@ def provider_post(config: dict[str, Any], endpoint: str, payload: dict[str, Any]
                     json=payload,
                 )
             if response.is_error:
-                error = ProviderHTTPError(response.status_code, f"OpenLux 调用失败：{response.status_code} {response.text[:800]}")
+                error = ProviderHTTPError(response.status_code, f"模型服务调用失败：{response.status_code} {response.text[:800]}")
                 if response.status_code not in {408, 409, 425, 429, 500, 502, 503, 504}:
                     raise error
                 raise error
@@ -692,16 +692,41 @@ def provider_post(config: dict[str, Any], endpoint: str, payload: dict[str, Any]
     raise RuntimeError(f"模型服务重试失败：{last_error}")
 
 
+def provider_text(config: dict[str, Any], model: str, prompt: str, timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
+    """Call either generation API used by OpenAI-compatible gateways.
+
+    Newer providers expose ``/responses`` while many relay services only
+    implement ``/chat/completions``. Prefer Responses and transparently fall
+    back when that route is unsupported.
+    """
+    try:
+        return provider_post(config, "responses", {"model": model, "input": prompt}, timeout=timeout, job_id=job_id)
+    except ProviderHTTPError as exc:
+        if exc.status_code not in {400, 404, 405, 501}:
+            raise
+    return provider_post(
+        config,
+        "chat/completions",
+        {"model": model, "messages": [{"role": "user", "content": prompt}]},
+        timeout=timeout,
+        job_id=job_id,
+    )
+
+
 def provider_models(config: dict[str, Any], timeout: float = 30) -> set[str]:
     if not config.get("api_key"):
-        raise RuntimeError("请先在 API 设置中填写 OpenLux API Key")
+        raise RuntimeError("请先在 API 设置中填写 API Key")
     with httpx.Client(timeout=timeout) as client:
         response = client.get(
             f"{config['base_url'].rstrip('/')}/models",
             headers={"Authorization": f"Bearer {config['api_key']}"},
         )
         if response.is_error:
-            raise ProviderHTTPError(response.status_code, f"OpenLux 模型列表读取失败：{response.status_code} {response.text[:800]}")
+            # The models route is optional in OpenAI-compatible relays. An
+            # absent route means availability must be verified on first use.
+            if response.status_code in {404, 405, 501}:
+                return set()
+            raise ProviderHTTPError(response.status_code, f"模型列表读取失败：{response.status_code} {response.text[:800]}")
         payload = response.json()
     return {str(item.get("id")) for item in payload.get("data", []) if isinstance(item, dict) and item.get("id")}
 
@@ -1061,7 +1086,7 @@ elements 必须是恰好 3 个具体可画的中文短语，按叙事顺序排�
     scenes: list[dict[str, Any]] = []
     last_plan_error: Exception | None = None
     for attempt in range(3):
-        payload = provider_post(config, "responses", {"model": config["text_model"], "input": prompt}, job_id=job_id)
+        payload = provider_text(config, str(config["text_model"]), prompt, job_id=job_id)
         try:
             candidate = parse_json_block(extract_response_text(payload))
             if not isinstance(candidate, list) or not candidate:
@@ -1462,6 +1487,16 @@ def make_branded_hand(text: str, target: Path) -> Path:
     hand.alpha_composite(rotated, (430, 300))
     hand.save(target)
     return target
+
+
+def whiteboard_render_command(image: Path, annotation: Path, output: Path, stroke_detail: str) -> list[str]:
+    """Build a hand-free whiteboard reveal command."""
+    return [
+        str(PYTHON), str(ROOT / "scripts" / "render_stream_whiteboard.py"),
+        str(image), str(annotation), str(output),
+        "--bare-tip", "--ink-path", "skeleton", "--stroke-detail", stroke_detail,
+        "--color-fill", "contour-wipe",
+    ]
 
 
 def _subtitle_chunks(text: str, max_chars: int = 22) -> list[str]:
@@ -1929,7 +1964,6 @@ def render_generated_job(job_id: str, scenes: list[dict[str, Any]], boards: list
                 partial_silent.replace(silent)
             update_job(job_id, checkpoint="render", completed_videos=len(scenes), render_engine="remotion-semantic-v1")
         else:
-            hand_asset = make_branded_hand(pen_text, job_dir / "hand-branded.png")
             videos: list[Path] = []
             for i, board in enumerate(boards, 1):
                 progress = 78 + int((i - 1) / len(boards) * 12)
@@ -1944,7 +1978,7 @@ def render_generated_job(job_id: str, scenes: list[dict[str, Any]], boards: list
                     partial_video = job_dir / f"{stem}.partial.mp4"
                     partial_video.unlink(missing_ok=True)
                     write_board_annotation(board, image, annotation, i)
-                    run([str(PYTHON), str(ROOT / "scripts" / "render_stream_whiteboard.py"), str(image), str(annotation), str(partial_video), str(hand_asset), "--ink-path", "skeleton", "--stroke-detail", stroke_detail, "--color-fill", "contour-wipe"], job_id=job_id)
+                    run(whiteboard_render_command(image, annotation, partial_video, stroke_detail), job_id=job_id)
                     if not valid_media_file(partial_video):
                         raise RuntimeError(f"第 {i} 段手绘视频无效")
                     partial_video.replace(video)
@@ -1999,7 +2033,6 @@ def rerender_job(job_id: str, scenes_per_image: int, pen_text: str, include_key_
         if fit_scene_durations(scenes, duration):
             atomic_write_json(job_dir / "plan.json", scenes)
         boards = [scenes[i:i + scenes_per_image] for i in range(0, len(scenes), scenes_per_image)]
-        hand_asset = make_branded_hand(pen_text, job_dir / "hand-branded.png")
         from scripts.add_key_text import add_key_text
         videos: list[Path] = []
         for i, board in enumerate(boards, 1):
@@ -2023,7 +2056,7 @@ def rerender_job(job_id: str, scenes_per_image: int, pen_text: str, include_key_
                 video.unlink(missing_ok=True)
                 partial_video = job_dir / f"{stem}.partial.mp4"
                 partial_video.unlink(missing_ok=True)
-                run([str(PYTHON), str(ROOT / "scripts" / "render_stream_whiteboard.py"), str(image), str(annotation), str(partial_video), str(hand_asset), "--ink-path", "skeleton", "--stroke-detail", stroke_detail, "--color-fill", "contour-wipe"], job_id=job_id)
+                run(whiteboard_render_command(image, annotation, partial_video, stroke_detail), job_id=job_id)
                 if not valid_media_file(partial_video):
                     raise RuntimeError(f"第 {i} 段重新渲染视频无效")
                 partial_video.replace(video)
@@ -2396,8 +2429,8 @@ def test_config(payload: dict[str, Any]) -> dict[str, Any]:
             config[key] = value
     results: dict[str, Any] = {}
     try:
-        provider_post(config, "responses", {"model": config["text_model"], "input": "只回复：连接成功"}, timeout=60)
-        results["openlux"] = {"ok": True, "message": f"OpenLux {config['text_model']} 连接成功"}
+        provider_text(config, str(config["text_model"]), "只回复：连接成功", timeout=60)
+        results["openlux"] = {"ok": True, "message": f"文本模型 {config['text_model']} 连接成功"}
     except Exception as exc:
         results["openlux"] = {"ok": False, "message": str(exc)}
     try:

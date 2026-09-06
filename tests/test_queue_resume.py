@@ -139,6 +139,41 @@ class QueueResumeTests(unittest.TestCase):
         self.assertEqual(payload["output_text"], "ok")
         self.assertEqual(client.__enter__.return_value.post.call_count, 3)
 
+    def test_text_provider_falls_back_to_chat_completions(self) -> None:
+        unsupported = mock.Mock(is_error=True, status_code=404, text="responses endpoint not found")
+        succeeded = mock.Mock(is_error=False, status_code=200)
+        succeeded.json.return_value = {"choices": [{"message": {"content": "连接成功"}}]}
+        client = mock.MagicMock()
+        client.__enter__.return_value.post.side_effect = [unsupported, succeeded]
+        with mock.patch.object(SERVER.httpx, "Client", return_value=client):
+            payload = SERVER.provider_text(
+                {"api_key": "test", "base_url": "https://relay.example/v1"},
+                "model-name",
+                "只回复：连接成功",
+            )
+        calls = client.__enter__.return_value.post.call_args_list
+        self.assertEqual(calls[0].args[0], "https://relay.example/v1/responses")
+        self.assertEqual(calls[1].args[0], "https://relay.example/v1/chat/completions")
+        self.assertEqual(calls[1].kwargs["json"]["messages"][0]["content"], "只回复：连接成功")
+        self.assertEqual(SERVER.extract_response_text(payload), "连接成功")
+
+    def test_provider_models_treats_missing_optional_endpoint_as_unknown(self) -> None:
+        missing = mock.Mock(is_error=True, status_code=404, text="not found")
+        client = mock.MagicMock()
+        client.__enter__.return_value.get.return_value = missing
+        with mock.patch.object(SERVER.httpx, "Client", return_value=client):
+            self.assertEqual(
+                SERVER.provider_models({"api_key": "test", "base_url": "https://relay.example/v1"}),
+                set(),
+            )
+
+    def test_whiteboard_render_command_hides_drawing_hand(self) -> None:
+        command = SERVER.whiteboard_render_command(
+            Path("board.png"), Path("board.annotation.json"), Path("board.partial.mp4"), "detailed"
+        )
+        self.assertIn("--bare-tip", command)
+        self.assertNotIn(str(SERVER.HAND), command)
+
     def test_scene_durations_fit_voice_track_exactly(self) -> None:
         scenes = [
             {"text": "短句", "duration_ms": 2000},
