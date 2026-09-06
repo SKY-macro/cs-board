@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -239,9 +240,11 @@ VOICE_NODE_LOCK = threading.Lock()
 MODEL_WORKER_THREADS: list[threading.Thread] = []
 RENDER_THREADS: set[threading.Thread] = set()
 RENDER_THREADS_LOCK = threading.Lock()
-RUNNING_PROCESSES: dict[str, subprocess.Popen[str]] = {}
+RUNNING_PROCESSES: dict[str, set[subprocess.Popen[str]]] = {}
 RUNNING_PROCESSES_LOCK = threading.Lock()
 MODEL_CONCURRENCY = 4
+IMAGE_GENERATION_CONCURRENCY = max(1, min(4, int(os.environ.get("IMAGE_GENERATION_CONCURRENCY", "3"))))
+WHITEBOARD_RENDER_CONCURRENCY = max(1, min(4, int(os.environ.get("WHITEBOARD_RENDER_CONCURRENCY", "3"))))
 MAX_ACTIVE_AND_QUEUED = 20
 
 
@@ -261,25 +264,26 @@ def ensure_job_active(job_id: str) -> None:
 
 def terminate_running_process(job_id: str) -> None:
     with RUNNING_PROCESSES_LOCK:
-        process = RUNNING_PROCESSES.get(job_id)
-    if process is None or process.poll() is not None:
-        return
-    try:
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                capture_output=True,
-                text=True,
-                timeout=8,
-                check=False,
-            )
-        else:
-            process.terminate()
-    except (OSError, subprocess.SubprocessError):
+        processes = list(RUNNING_PROCESSES.get(job_id, set()))
+    for process in processes:
+        if process.poll() is not None:
+            continue
         try:
-            process.kill()
-        except OSError:
-            pass
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                    check=False,
+                )
+            else:
+                process.terminate()
+        except (OSError, subprocess.SubprocessError):
+            try:
+                process.kill()
+            except OSError:
+                pass
 
 
 def _persist_job_locked(job_id: str) -> None:
@@ -568,7 +572,7 @@ def run(cmd: list[str], cwd: Path = ROOT, job_id: str | None = None) -> None:
     process = subprocess.Popen(cmd, **popen_options)
     if job_id:
         with RUNNING_PROCESSES_LOCK:
-            RUNNING_PROCESSES[job_id] = process
+            RUNNING_PROCESSES.setdefault(job_id, set()).add(process)
     try:
         while True:
             try:
@@ -590,8 +594,11 @@ def run(cmd: list[str], cwd: Path = ROOT, job_id: str | None = None) -> None:
     finally:
         if job_id:
             with RUNNING_PROCESSES_LOCK:
-                if RUNNING_PROCESSES.get(job_id) is process:
-                    RUNNING_PROCESSES.pop(job_id, None)
+                processes = RUNNING_PROCESSES.get(job_id)
+                if processes is not None:
+                    processes.discard(process)
+                    if not processes:
+                        RUNNING_PROCESSES.pop(job_id, None)
 
 
 def probe_duration(path: Path) -> float:
@@ -766,8 +773,60 @@ def _is_image_model(model: str) -> bool:
 
 def _is_text_model(model: str) -> bool:
     value = model.lower()
-    excluded = ("embedding", "moderation", "whisper", "tts", "speech", "transcri", "rerank")
+    excluded = (
+        "embedding", "moderation", "whisper", "tts", "speech", "transcri", "rerank",
+        "codex", "review", "realtime", "audio", "vision-preview",
+    )
     return not _is_image_model(model) and not any(token in value for token in excluded)
+
+
+def verify_text_model(config: dict[str, Any], model: str, timeout: float = 20) -> None:
+    """Make one cheap live request without the normal retry/backoff delays."""
+    if not config.get("api_key"):
+        raise RuntimeError("请先在 API 设置中填写 API Key")
+    headers = {"Authorization": f"Bearer {config['api_key']}", "Content-Type": "application/json"}
+    base_url = str(config["base_url"]).rstrip("/")
+    attempts = (
+        ("responses", {"model": model, "input": "只回复 OK", "max_output_tokens": 8}),
+        ("chat/completions", {
+            "model": model,
+            "messages": [{"role": "user", "content": "只回复 OK"}],
+            "max_tokens": 8,
+        }),
+    )
+    with httpx.Client(timeout=timeout) as client:
+        for index, (endpoint, payload) in enumerate(attempts):
+            response = client.post(f"{base_url}/{endpoint}", headers=headers, json=payload)
+            if not response.is_error:
+                return
+            if index == 0 and response.status_code in {400, 404, 405, 501}:
+                continue
+            raise ProviderHTTPError(response.status_code, f"模型预检失败：{response.status_code} {response.text[:500]}")
+    raise RuntimeError(f"模型 {model} 不支持文本生成接口")
+
+
+def select_working_text_model(config: dict[str, Any], job_id: str | None = None) -> str:
+    """Select the first general text model that succeeds on a live request."""
+    advertised = [str(item) for item in config.get("_text_models", []) if _is_text_model(str(item))]
+    selected = str(config.get("text_model") or "")
+    candidates = [selected, *(item for item in advertised if item != selected)]
+    candidates = [item for item in candidates if item and _is_text_model(item)][:8]
+    if not candidates:
+        raise RuntimeError("接口没有识别到可用于内容生成的通用文本模型")
+    failures: list[str] = []
+    for index, candidate in enumerate(candidates, 1):
+        if job_id:
+            update_job(job_id, stage=f"正在预检文本模型 {index}/{len(candidates)}：{candidate}")
+        try:
+            verify_text_model(config, candidate)
+            config["text_model"] = candidate
+            config["_text_models"] = [candidate, *(item for item in advertised if item != candidate)]
+            if job_id:
+                update_job(job_id, text_model=candidate, stage=f"模型 {candidate} 预检通过")
+            return candidate
+        except (ProviderHTTPError, httpx.HTTPError, RuntimeError) as exc:
+            failures.append(f"{candidate}: {str(exc)[:120]}")
+    raise RuntimeError("所有候选文本模型均未通过实时预检：" + "；".join(failures))
 
 
 def _preferred_model(models: list[str], configured: str, priorities: tuple[str, ...]) -> str:
@@ -1891,6 +1950,9 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
         reference_images, reference_instruction, character_context = custom_reference_context(job_id)
         infographic = is_infographic_job(job_id)
 
+        begin_phase(job_id, "preflight", "接口预检", "正在验证当前 API 的通用文本模型", 15)
+        select_working_text_model(config, job_id)
+
         phrase_timeline: dict[str, Any] | None = None
         if infographic:
             begin_phase(job_id, "alignment", "短语时间表", "正在制作完整的短语—真实旁白时间 JSON", 16)
@@ -1994,10 +2056,13 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
             for i, board in enumerate(boards)
         ])
         from scripts.add_key_text import add_key_text
-        for i, board in enumerate(boards, 1):
+        completed_images = 0
+        completed_images_lock = threading.Lock()
+
+        def generate_board_image(i: int, board: list[dict[str, Any]]) -> int:
+            nonlocal completed_images
             board_images, _board_instruction, board_prompt = board_specs[i - 1]
-            base_progress = 36 + int((i - 1) / len(boards) * 40)
-            begin_phase(job_id, "images", "PPT 插图", f"正在按第 {i}/{len(boards)} 页已确定的插图槽位生成插画", base_progress)
+            ensure_job_active(job_id)
             stem = f"board-{i:02d}"
             image = job_dir / f"{stem}.png"
             source_image = job_dir / f"{stem}.source.png"
@@ -2029,7 +2094,23 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
                 add_key_text(source_image, [str(scene.get("key_text", "")) for scene in board], image)
             else:
                 shutil.copy2(source_image, image)
-            update_job(job_id, checkpoint="images", completed_boards=i)
+            with completed_images_lock:
+                completed_images += 1
+                done = completed_images
+            update_job(
+                job_id,
+                stage=f"并行生成插图：已完成 {done}/{len(boards)} 张",
+                progress=36 + int(done / len(boards) * 40),
+                checkpoint="images",
+                completed_boards=done,
+            )
+            return i
+
+        begin_phase(job_id, "images", "PPT 插图", f"正在以 {min(IMAGE_GENERATION_CONCURRENCY, len(boards))} 路并行生成 {len(boards)} 张插图", 36)
+        with ThreadPoolExecutor(max_workers=min(IMAGE_GENERATION_CONCURRENCY, len(boards))) as executor:
+            futures = [executor.submit(generate_board_image, i, board) for i, board in enumerate(boards, 1)]
+            for future in as_completed(futures):
+                future.result()
         queue_for_stage(job_id, "render", "准备本地渲染", 78)
         start_render_task(render_generated_job, job_id, scenes, boards, pen_text, include_subtitles, stroke_detail, duration)
     except Exception as exc:
@@ -2039,6 +2120,7 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
             "planning": "内容结构失败",
             "deck": "Remotion PPT 结构失败",
             "images": "PPT 插图生成失败",
+            "preflight": "API 模型预检失败",
         }.get(current_phase, "模型调用失败")
         fail_job(job_id, stage, exc)
 
@@ -2077,10 +2159,12 @@ def render_generated_job(job_id: str, scenes: list[dict[str, Any]], boards: list
                 partial_silent.replace(silent)
             update_job(job_id, checkpoint="render", completed_videos=len(scenes), render_engine="remotion-semantic-v1")
         else:
-            videos: list[Path] = []
-            for i, board in enumerate(boards, 1):
-                progress = 78 + int((i - 1) / len(boards) * 12)
-                begin_phase(job_id, "drawing", "手绘渲染", f"正在绘制第 {i}/{len(boards)} 张分镜图", progress)
+            completed_videos = 0
+            completed_videos_lock = threading.Lock()
+
+            def render_board_video(i: int, board: list[dict[str, Any]]) -> tuple[int, Path]:
+                nonlocal completed_videos
+                ensure_job_active(job_id)
                 stem = f"board-{i:02d}"
                 image = job_dir / f"{stem}.png"
                 annotation = job_dir / f"{stem}.annotation.json"
@@ -2095,8 +2179,25 @@ def render_generated_job(job_id: str, scenes: list[dict[str, Any]], boards: list
                     if not valid_media_file(partial_video):
                         raise RuntimeError(f"第 {i} 段手绘视频无效")
                     partial_video.replace(video)
-                videos.append(video)
-                update_job(job_id, checkpoint="render", completed_videos=i)
+                with completed_videos_lock:
+                    completed_videos += 1
+                    done = completed_videos
+                update_job(
+                    job_id,
+                    stage=f"并行渲染分镜：已完成 {done}/{len(boards)} 段",
+                    progress=78 + int(done / len(boards) * 12),
+                    checkpoint="render",
+                    completed_videos=done,
+                )
+                return i, video
+
+            begin_phase(job_id, "drawing", "手绘渲染", f"正在以 {min(WHITEBOARD_RENDER_CONCURRENCY, len(boards))} 路并行渲染 {len(boards)} 段分镜", 78)
+            rendered: list[tuple[int, Path]] = []
+            with ThreadPoolExecutor(max_workers=min(WHITEBOARD_RENDER_CONCURRENCY, len(boards))) as executor:
+                futures = [executor.submit(render_board_video, i, board) for i, board in enumerate(boards, 1)]
+                for future in as_completed(futures):
+                    rendered.append(future.result())
+            videos = [video for _index, video in sorted(rendered)]
 
             silent = job_dir / "silent.mp4"
             final = job_dir / "final.mp4"

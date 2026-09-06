@@ -91,6 +91,31 @@ class QueueResumeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "后台未加载画面风格"):
             SERVER.style_recipe("不存在的风格")
 
+    def test_specialized_codex_review_model_is_not_a_text_candidate(self) -> None:
+        catalog = SERVER.build_model_catalog(
+            {"gpt-5.4", "codex-auto-review", "text-embedding-3-small", "gpt-image-2"},
+            "gpt-5.4",
+            "gpt-image-2",
+        )
+        self.assertEqual(catalog["text_models"], ["gpt-5.4"])
+
+    def test_preflight_selects_first_model_that_really_responds(self) -> None:
+        config = {
+            "api_key": "test-key",
+            "base_url": "https://relay.invalid/v1",
+            "text_model": "gpt-5.4",
+            "_text_models": ["gpt-5.4", "gpt-4.1", "codex-auto-review"],
+        }
+        with mock.patch.object(
+            SERVER,
+            "verify_text_model",
+            side_effect=[SERVER.ProviderHTTPError(429, "no available channel"), None],
+        ) as verify:
+            selected = SERVER.select_working_text_model(config)
+        self.assertEqual(selected, "gpt-4.1")
+        self.assertEqual(config["text_model"], "gpt-4.1")
+        self.assertEqual([call.args[1] for call in verify.call_args_list], ["gpt-5.4", "gpt-4.1"])
+
     def test_snapshot_keeps_reference_summary_private(self) -> None:
         job_id = "reference-snapshot"
         metadata = self.job(job_id)
