@@ -158,6 +158,23 @@ class QueueResumeTests(unittest.TestCase):
         self.assertIn("不得复制", instruction)
         self.assertIn("身份、数量、服装、动作、道具和场景", instruction)
 
+        prompt = SERVER.build_board_prompt(
+            [{
+                "title": "出门",
+                "concept": "爸爸牵着七岁乐乐去公园放风筝",
+                "elements": ["爸爸背着风筝", "七岁乐乐牵着爸爸", "公园入口"],
+                "text": "周六早晨，爸爸答应带七岁的乐乐去公园放风筝。",
+            }],
+            SERVER.CLEAR_STORYBOOK_STYLE,
+            instruction,
+            aspect_ratio="3:4",
+            presentation_mode="story-color",
+        )
+        self.assertLessEqual(len(prompt), 1000)
+        self.assertEqual(prompt.count(instruction), 1)
+        self.assertIn("爸爸背着风筝", prompt)
+        self.assertIn("人物身份、数量、年龄和性别严格来自原文", prompt)
+
     def test_specialized_codex_review_model_is_not_a_text_candidate(self) -> None:
         catalog = SERVER.build_model_catalog(
             {"gpt-5.4", "codex-auto-review", "text-embedding-3-small", "gpt-image-2"},
