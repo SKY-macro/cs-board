@@ -123,11 +123,17 @@ class QueueResumeTests(unittest.TestCase):
     def test_clear_japanese_storybook_style_is_visual_only(self) -> None:
         recipe = SERVER.style_recipe("清透日系生活绘本")
         self.assertIn("黑灰墨线", recipe)
-        self.assertIn("极稀疏短斜线", recipe)
-        self.assertIn("不画虹膜渐变", recipe)
+        self.assertIn("成年人约 5～6 头身", recipe)
+        self.assertIn("儿童约 4～5 头身", recipe)
+        self.assertIn("小型黑色竖椭圆或圆点眼", recipe)
+        self.assertIn("哑光平涂", recipe)
         self.assertIn("禁止蜡笔颗粒", recipe)
         self.assertIn("禁止泛黄纸纹", recipe)
+        self.assertIn("禁止 Q 版", recipe)
+        self.assertIn("禁止风景绘本式铺满背景", recipe)
         self.assertIn("只能来自当前分镜", recipe)
+        self.assertNotIn("偏大的圆头", recipe)
+        self.assertNotIn("短而紧凑的身体", recipe)
         self.assertNotIn("书包", recipe)
         self.assertNotIn("玄关", recipe)
 
@@ -139,8 +145,18 @@ class QueueResumeTests(unittest.TestCase):
             presentation_mode="story-color",
         )
         self.assertIn("人物位置、景别和构图服从当前剧情", prompt)
+        self.assertIn("人物身份、数量、年龄和性别严格来自原文", prompt)
+        self.assertNotIn("同一主角固定为：中国青年男性", prompt)
         self.assertIn("两人站立交谈", prompt)
-        self.assertLessEqual(len(prompt), 1000)
+        self.assertLessEqual(len(prompt), 1200)
+
+    def test_clear_japanese_storybook_uses_built_in_style_reference(self) -> None:
+        paths, instruction = SERVER.clear_storybook_reference_context()
+        self.assertEqual(paths, [SERVER.CLEAR_STORYBOOK_REFERENCE_PATH])
+        self.assertTrue(paths[0].is_file())
+        self.assertIn("人物造型语法", instruction)
+        self.assertIn("不得复制", instruction)
+        self.assertIn("身份、数量、服装、动作、道具和场景", instruction)
 
     def test_specialized_codex_review_model_is_not_a_text_candidate(self) -> None:
         catalog = SERVER.build_model_catalog(

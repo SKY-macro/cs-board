@@ -129,14 +129,14 @@ STYLE_PRESETS = {
         "同时确保人物面部和关键物体清楚可读。"
     ),
     CLEAR_STORYBOOK_STYLE: (
-        "纯白无纸纹数字页；用较细、略钝的黑灰毡尖笔形成黑灰墨线，粗细轻微不均并有可见手抖，干净却不精修、不顺滑、不矢量完美；"
-        "内部只留少量衣褶、发丝和接地细线。人物为朴素日记绘本造型：偏大的圆头、短而紧凑的身体、纤细四肢、简单手形，姿态自然。"
-        "脸部只画点状或短椭圆黑眼、小鼻、短嘴和有表情的短眉，最多针尖高光；不画虹膜渐变、睫毛、眼睑阴影、尖下巴或精致美型五官。"
-        "头发用不规则深色涂块和少量翘起短线，不能画成一根根柔顺发丝；皮肤为极淡蜜桃色和少量粉颊。衣物道具以整洁低饱和数字平涂为主，"
-        "仅在色块内部加极稀疏短斜线作为约一成彩铅触感，背景、皮肤和墨线不得出现颗粒。"
-        "限定炭黑、米白、卡其、灰绿、芥末黄、暗藏青、砖红和浅肤色。人物位置、景别和构图服从当前剧情，背景仅画必要细线并保留大面积纯白。"
+        "纯白无纸纹数字页；用纤细、清晰、略有手绘起伏的黑灰墨线勾勒外轮廓，线条克制利落，内部只留少量发丝、衣褶和接地线。"
+        "人物采用自然纤细的现代生活绘本比例：成年人约 5～6 头身，儿童约 4～5 头身；头部仅轻度放大，肩颈、手脚和四肢完整清楚，绝不短胖幼态化。"
+        "脸型为柔和短椭圆，五官集中但留有宽阔面部空白；眼睛只画小型黑色竖椭圆或圆点眼，鼻子是一笔短线，嘴和眉细小克制。"
+        "不画彩色虹膜、闪亮大眼、浓睫毛、眼睑阴影和尖削美型脸。头发是轮廓清楚的深色块面，以少量细碎发束收边，不画蓬松尖刺动漫发型。"
+        "肤色极淡，腮红近乎不可见；服装与道具使用边界整洁的低饱和哑光平涂，只在局部加入极淡细排线，不做水彩晕染、颗粒铺底或体积光影。"
+        "限定炭黑、米白、卡其、灰绿、芥末黄、暗藏青、砖红和浅肤色。人物位置、景别和构图服从当前剧情；优先完整全身或四分之三身平视群像，背景只画必要空间线和道具，大面积保持纯白。"
         "内容边界：人物身份、数量、年龄、外貌、服装、动作、关系、道具与场景只能来自当前分镜，绝不继承风格示例图中的具体内容。"
-        "禁止泛黄纸纹；禁止蜡笔颗粒、炭笔噪点、满页排线、水彩晕染、精致日漫美型脸、半身特写、复杂陈设、强光影、3D、写实摄影、文字和水印。"
+        "禁止 Q 版、chibi、婴儿肥和短粗身体；不要默认用背影视角掩盖人物脸部，也不要使用电影感运镜。禁止风景绘本式铺满背景、繁茂植物、空气透视、柔焦和渐变；禁止泛黄纸纹、禁止蜡笔颗粒、炭笔噪点、强光影、3D、写实摄影、文字和水印。"
     ),
 }
 
@@ -267,6 +267,7 @@ def paper_metaphor_reference_context(scenes: list[dict[str, Any]]) -> tuple[list
 
 OIL_VISUAL_STYLE = "漫画墨线解释风"
 OIL_VISUAL_REFERENCE_DIR = ROOT / "assets" / "style-references" / "oil-visual"
+CLEAR_STORYBOOK_REFERENCE_PATH = ROOT / "web" / "public" / "styles" / "clear-japanese-storybook.png"
 
 
 def oil_visual_reference_context(scenes: list[dict[str, Any]], infographic: bool = False) -> tuple[list[Path], str]:
@@ -302,6 +303,17 @@ def oil_visual_reference_context(scenes: list[dict[str, Any]], infographic: bool
         f"{division}"
     )
     return [path], instruction
+
+
+def clear_storybook_reference_context() -> tuple[list[Path], str]:
+    if not valid_image_file(CLEAR_STORYBOOK_REFERENCE_PATH):
+        raise RuntimeError("清透日系生活绘本的本地风格参考图缺失")
+    instruction = (
+        "输入图仅定义清透日系生活绘本的视觉语法，重点迁移人物造型语法、自然头身比例、小型克制五官、"
+        "纤细黑灰线条、低饱和哑光平涂和大面积纯白留白。"
+        "当前分镜决定全部内容；不得复制参考图中的人物身份、数量、服装、动作、道具和场景，也不得固定成家庭或门口构图。"
+    )
+    return [CLEAR_STORYBOOK_REFERENCE_PATH], instruction
 
 app = FastAPI(title="白板声画工坊", version="0.1.0")
 app.add_middleware(
@@ -1384,6 +1396,8 @@ def make_plan(
         if style == OIL_VISUAL_STYLE else
         "主角必须严格来自原文；原文是动物就保持该动物，原文没有指定身份时才使用普通中国青年。所有分镜中的同一角色外观保持一致。"
         if style == PAPER_METAPHOR_STYLE else
+        "人物身份、数量、年龄和性别严格来自原文，不得擅自替换成固定青年男性；成年人、儿童和老人必须保持各自年龄比例，同一角色跨分镜保持外貌与服装一致。"
+        if style == CLEAR_STORYBOOK_STYLE else
         "同一位主角始终是“中国青年男性，短黑发，朴素深色上衣”，人物外观必须保持一致。"
     )
     paper_rule = (
@@ -1497,6 +1511,8 @@ def build_image_prompt(scene: dict[str, Any], style: str, aspect_ratio: str = "1
     character_instruction = (
         "原文指定的人物或动物身份优先；没有指定身份且确实需要通用讲解角色时，才使用戴细圆框眼镜的圆头极简线人。暖黄边牧仅在语义合适时陪伴，不强制出现。"
         if style == OIL_VISUAL_STYLE else
+        "人物身份、数量、年龄和性别严格来自原文；所有人物都执行视觉配方中的自然头身、小型五官和深色块面头发，同一角色的脸型、发型、年龄与服装保持一致。"
+        if style == CLEAR_STORYBOOK_STYLE else
         "同一主角固定为：中国青年男性，短黑发，朴素深色上衣，普通人形象；不要改变年龄与外貌。"
     )
     aspect_ratio = normalize_aspect_ratio(aspect_ratio)
@@ -1543,7 +1559,7 @@ PPT 已确定的视觉策略：{scene.get('visual_strategy', '左侧文字，右
     panel_text = "\n".join(panels)
     style_instruction = (
         f"视觉配方：{style_recipe(style)}\n{reference_instruction}"
-        if style == OIL_VISUAL_STYLE and reference_instruction else
+        if style in {OIL_VISUAL_STYLE, CLEAR_STORYBOOK_STYLE} and reference_instruction else
         "严格复现输入风格参考图的配色、线条粗细、材质、造型比例与构图语言；不要复制风格图里原有的人物或事件。"
         if reference_instruction else
         f"视觉配方：{style_recipe(style)}\n必须严格执行这套视觉配方，不得自动改回其他白板风格；人物、物体和配色都要让所选风格一眼可辨。"
@@ -1555,6 +1571,8 @@ PPT 已确定的视觉策略：{scene.get('visual_strategy', '左侧文字，右
         if style == OIL_VISUAL_STYLE else
         "主角必须严格来自原文；动物、人物身份与年龄不得被替换，同一角色在所有分镜中保持一致。"
         if style == PAPER_METAPHOR_STYLE else
+        "人物身份、数量、年龄和性别严格来自原文；所有人物都执行视觉配方中的自然头身、小型五官和深色块面头发，同一角色的脸型、发型、年龄与服装保持一致。"
+        if style == CLEAR_STORYBOOK_STYLE else
         "同一主角固定为：中国青年男性，短黑发，朴素深色上衣，普通人形象；所有分镜中的年龄与外貌保持一致。"
     )
     reference_block = f"参考图说明：\n{reference_instruction}\n" if reference_instruction else ""
@@ -2327,6 +2345,9 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path | None, scen
             elif style == OIL_VISUAL_STYLE and not board_images:
                 board_images, board_instruction = oil_visual_reference_context(board, infographic)
                 use_character_references = False
+            elif style == CLEAR_STORYBOOK_STYLE and not board_images:
+                board_images, board_instruction = clear_storybook_reference_context()
+                use_character_references = False
             board_prompt = build_board_prompt(board, style, board_instruction, use_character_references, infographic, aspect_ratio, presentation_mode)
             board_specs.append((board_images, board_instruction, board_prompt))
         update_job(job_id, duration=duration, scenes=len(scenes), boards=len(boards), checkpoint="plan_done")
@@ -2663,6 +2684,8 @@ def regenerate_board_image(job_id: str, page: int, prompt: str) -> None:
             reference_images, _reference_instruction = paper_metaphor_reference_context(board)
         elif style == OIL_VISUAL_STYLE and not reference_images:
             reference_images, _reference_instruction = oil_visual_reference_context(board, is_infographic_job(job_id))
+        elif style == CLEAR_STORYBOOK_STYLE and not reference_images:
+            reference_images, _reference_instruction = clear_storybook_reference_context()
 
         stem = f"board-{page:02d}"
         image = job_dir / f"{stem}.png"
