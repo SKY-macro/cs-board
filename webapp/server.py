@@ -147,6 +147,11 @@ def normalize_aspect_ratio(value: Any) -> str:
     return ratio if ratio in ASPECT_RATIO_PRESETS else "16:9"
 
 
+def normalize_presentation_mode(value: Any) -> str:
+    mode = str(value or "whiteboard").strip()
+    return mode if mode in {"whiteboard", "story-color"} else "whiteboard"
+
+
 def aspect_video_dimensions(value: Any) -> tuple[int, int]:
     return ASPECT_RATIO_PRESETS[normalize_aspect_ratio(value)]["video"]
 
@@ -1457,7 +1462,7 @@ def build_image_prompt(scene: dict[str, Any], style: str, aspect_ratio: str = "1
 禁止任何文字、字母、数字、Logo、水印、边框、对话框和装饰性填充。画面底部保留约 16% 空白作为字幕安全区。"""
 
 
-def build_board_prompt(scenes: list[dict[str, Any]], style: str, reference_instruction: str = "", use_character_references: bool = False, infographic: bool = False, aspect_ratio: str = "16:9") -> str:
+def build_board_prompt(scenes: list[dict[str, Any]], style: str, reference_instruction: str = "", use_character_references: bool = False, infographic: bool = False, aspect_ratio: str = "16:9", presentation_mode: str = "whiteboard") -> str:
     aspect_ratio = normalize_aspect_ratio(aspect_ratio)
     layout_direction = "从上到下" if aspect_ratio in {"9:16", "3:4"} else "从左到右"
     if infographic:
@@ -1499,6 +1504,11 @@ PPT 已确定的视觉策略：{scene.get('visual_strategy', '左侧文字，右
         "同一主角固定为：中国青年男性，短黑发，朴素深色上衣，普通人形象；所有分镜中的年龄与外貌保持一致。"
     )
     reference_block = f"参考图说明：\n{reference_instruction}\n" if reference_instruction else ""
+    layout_rule = (
+        "每个叙事区域上方保留约 25% 的纯净留白供程序后期排版手写字幕；插画主体集中在中下部。"
+        if normalize_presentation_mode(presentation_mode) == "story-color" else
+        "所有区域的主体垂直居中并略微靠上，主要人物和物体中心位于画面高度 42%～48%，顶部不得出现大面积无意义空白。画面底部保留约 16% 空白作为字幕安全区。"
+    )
     return f"""{reference_block}生成一张用于中文口播的 {aspect_ratio} 白板动画原画，一张图承载 {len(scenes)} 个连续分镜。
 风格名称：{style}。
 {style_instruction}
@@ -1506,8 +1516,8 @@ PPT 已确定的视觉策略：{scene.get('visual_strategy', '左侧文字，右
 画面必须{layout_direction}平均分成 {len(scenes)} 个互不重叠的叙事区域，不画边框；每区内部可以组合人物、动作和关键物体，但不得跨区。
 {panel_text}
 严格表现上述事件，不得生成原文没有的童年成长、旅行、花鸟、山水、宠物或装饰性意象。
-所有区域的主体垂直居中并略微靠上，主要人物和物体中心位于画面高度 42%～48%，顶部不得出现大面积无意义空白。
-禁止任何文字、字母、数字、Logo、水印、边框和对话框。画面底部保留约 16% 空白作为字幕安全区。"""
+{layout_rule}
+禁止任何文字、字母、数字、Logo、水印、边框和对话框；字幕由程序后期准确添加，图片模型不得写字。"""
 
 
 def normalize_generated_image_aspect(path: Path, aspect_ratio: str) -> None:
@@ -1716,7 +1726,7 @@ def write_annotation(scene: dict[str, Any], image: Path, target: Path, index: in
     target.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def write_board_annotation(scenes: list[dict[str, Any]], image: Path, target: Path, index: int) -> None:
+def write_board_annotation(scenes: list[dict[str, Any]], image: Path, target: Path, index: int, presentation_mode: str = "whiteboard") -> None:
     from PIL import Image
 
     with Image.open(image) as im:
@@ -1731,13 +1741,15 @@ def write_board_annotation(scenes: list[dict[str, Any]], image: Path, target: Pa
     for i, scene in enumerate(scenes):
         x = margin_x if portrait else round(margin_x + i * band)
         x2 = width - margin_x if portrait else round(margin_x + (i + 1) * band)
-        y = round(margin_y + i * band) if portrait else round(height * 0.02)
+        story_color = normalize_presentation_mode(presentation_mode) == "story-color"
+        y = round(margin_y + i * band + (band * 0.24 if story_color else 0)) if portrait else round(height * (0.26 if story_color else 0.02))
         y2 = round(margin_y + (i + 1) * band) if portrait else round(height * 0.82)
         duration = int(scene["duration_ms"])
         elements.append({
             "id": f"panel-{i + 1}", "label": scene.get("title", f"分镜{i + 1}"),
             "sequence": i + 1, "narrativeRole": scene.get("concept", "按原文叙事"),
             "subtitle": scene.get("text", ""), "type": "scene",
+            "captionRegion": {"x": x, "y": round(margin_y + i * band) if portrait else margin_y, "width": x2 - x, "height": round(band * 0.23) if portrait else round(height * 0.23)},
             "region": {"x": x, "y": y, "width": x2 - x, "height": y2 - y},
             "reveal": {"direction": "top_to_bottom" if portrait else "left_to_right", "startMs": offset, "durationMs": duration, "maskPaddingPx": 14, "protectedRegions": []},
             "handPath": {"start": [width // 2, y + 5], "end": [width // 2, y2 - 5], "easing": "easeInOut"} if portrait else {"start": [x + 5, height // 2], "end": [x2 - 5, height // 2], "easing": "easeInOut"},
@@ -1784,14 +1796,17 @@ def make_branded_hand(text: str, target: Path) -> Path:
     return target
 
 
-def whiteboard_render_command(image: Path, annotation: Path, output: Path, stroke_detail: str) -> list[str]:
+def whiteboard_render_command(image: Path, annotation: Path, output: Path, stroke_detail: str, presentation_mode: str = "whiteboard") -> list[str]:
     """Build a hand-free whiteboard reveal command."""
-    return [
+    command = [
         str(PYTHON), str(ROOT / "scripts" / "render_stream_whiteboard.py"),
         str(image), str(annotation), str(output),
         "--bare-tip", "--ink-path", "skeleton", "--stroke-detail", stroke_detail,
         "--color-fill", "contour-wipe",
     ]
+    if normalize_presentation_mode(presentation_mode) == "story-color":
+        command.append("--story-color")
+    return command
 
 
 def _subtitle_chunks(text: str, max_chars: int = 22) -> list[str]:
@@ -2086,6 +2101,7 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
         duration = probe_duration(voice)
         reference_images, reference_instruction, character_context = custom_reference_context(job_id)
         infographic = is_infographic_job(job_id)
+        presentation_mode = normalize_presentation_mode(JOBS.get(job_id, {}).get("presentation_mode"))
 
         phrase_timeline: dict[str, Any] | None = None
         if infographic:
@@ -2182,7 +2198,7 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
             elif style == OIL_VISUAL_STYLE and not board_images:
                 board_images, board_instruction = oil_visual_reference_context(board, infographic)
                 use_character_references = False
-            board_prompt = build_board_prompt(board, style, board_instruction, use_character_references, infographic, aspect_ratio)
+            board_prompt = build_board_prompt(board, style, board_instruction, use_character_references, infographic, aspect_ratio, presentation_mode)
             board_specs.append((board_images, board_instruction, board_prompt))
         update_job(job_id, duration=duration, scenes=len(scenes), boards=len(boards), checkpoint="plan_done")
         atomic_write_json(job_dir / "boards.json", [
@@ -2262,6 +2278,7 @@ def render_generated_job(job_id: str, scenes: list[dict[str, Any]], boards: list
     job_dir = JOBS_DIR / job_id
     try:
         infographic = is_infographic_job(job_id)
+        presentation_mode = normalize_presentation_mode(JOBS.get(job_id, {}).get("presentation_mode"))
         duration_ms = round(duration * 1000)
         if infographic:
             begin_phase(job_id, "drawing", "Remotion 渲染", "正在按真实旁白时间编排动态信息图", 80)
@@ -2308,8 +2325,8 @@ def render_generated_job(job_id: str, scenes: list[dict[str, Any]], boards: list
                     video.unlink(missing_ok=True)
                     partial_video = job_dir / f"{stem}.partial.mp4"
                     partial_video.unlink(missing_ok=True)
-                    write_board_annotation(board, image, annotation, i)
-                    run(whiteboard_render_command(image, annotation, partial_video, stroke_detail), job_id=job_id)
+                    write_board_annotation(board, image, annotation, i, presentation_mode)
+                    run(whiteboard_render_command(image, annotation, partial_video, stroke_detail, presentation_mode), job_id=job_id)
                     if not valid_media_file(partial_video):
                         raise RuntimeError(f"第 {i} 段手绘视频无效")
                     partial_video.replace(video)
@@ -2349,7 +2366,7 @@ def render_generated_job(job_id: str, scenes: list[dict[str, Any]], boards: list
             partial_final.unlink(missing_ok=True)
             video_input = silent
             subtitle_filter = None
-            if include_subtitles:
+            if include_subtitles and presentation_mode != "story-color":
                 subtitles = job_dir / "subtitles.srt"
                 write_subtitles(scenes, subtitles)
                 video_input, subtitle_filter = _subtitle_video_input(
@@ -2375,6 +2392,7 @@ def render_generated_job(job_id: str, scenes: list[dict[str, Any]], boards: list
 def rerender_job(job_id: str, scenes_per_image: int, pen_text: str, include_key_text: bool, include_subtitles: bool, stroke_detail: str) -> None:
     job_dir = JOBS_DIR / job_id
     try:
+        presentation_mode = normalize_presentation_mode(JOBS.get(job_id, {}).get("presentation_mode"))
         scenes = json.loads((job_dir / "plan.json").read_text(encoding="utf-8"))
         voice = job_dir / "voice.wav"
         duration = probe_duration(voice)
@@ -2398,13 +2416,13 @@ def rerender_job(job_id: str, scenes_per_image: int, pen_text: str, include_key_
                     shutil.copy2(source_image, image)
             if not image.exists():
                 raise RuntimeError(f"缺少可复用的分镜图：{image.name}")
-            write_board_annotation(board, image, annotation, i)
+            write_board_annotation(board, image, annotation, i, presentation_mode)
             expected_ms = sum(int(scene["duration_ms"]) for scene in board)
             if not valid_timed_video(video, expected_ms):
                 video.unlink(missing_ok=True)
                 partial_video = job_dir / f"{stem}.partial.mp4"
                 partial_video.unlink(missing_ok=True)
-                run(whiteboard_render_command(image, annotation, partial_video, stroke_detail), job_id=job_id)
+                run(whiteboard_render_command(image, annotation, partial_video, stroke_detail, presentation_mode), job_id=job_id)
                 if not valid_media_file(partial_video):
                     raise RuntimeError(f"第 {i} 段重新渲染视频无效")
                 partial_video.replace(video)
@@ -2426,7 +2444,7 @@ def rerender_job(job_id: str, scenes_per_image: int, pen_text: str, include_key_
             partial_final.unlink(missing_ok=True)
             video_input = job_dir / "silent.mp4"
             subtitle_filter = None
-            if include_subtitles:
+            if include_subtitles and presentation_mode != "story-color":
                 subtitles = job_dir / "subtitles.srt"
                 write_subtitles(scenes, subtitles)
                 video_input, subtitle_filter = _subtitle_video_input(
@@ -2861,6 +2879,7 @@ async def create_job(
     include_key_text: bool = Form(True),
     include_subtitles: bool = Form(True),
     stroke_detail: str = Form("detailed"),
+    presentation_mode: str = Form("whiteboard"),
     voice_mode: str = Form("clone"),
     reference: UploadFile = File(...),
     reference_mode: str = Form("standard"),
@@ -2946,6 +2965,7 @@ async def create_job(
     scenes_per_image = max(1, min(4, scenes_per_image))
     aspect_ratio = normalize_aspect_ratio(aspect_ratio)
     stroke_detail = stroke_detail if stroke_detail in {"light", "standard", "detailed", "full"} else "detailed"
+    presentation_mode = normalize_presentation_mode(presentation_mode)
     task_name = normalized_task_name(task_name, script, job_id)
     now = time.time()
     with LOCK:
@@ -2964,7 +2984,7 @@ async def create_job(
             "copy": script.strip(),
             "pen_text": pen_text.strip()[:12], "include_key_text": include_key_text,
             "include_subtitles": include_subtitles,
-            "stroke_detail": stroke_detail, "can_rerender": False,
+            "stroke_detail": stroke_detail, "presentation_mode": presentation_mode, "can_rerender": False,
             "current_phase": None, "phase_started_at": None, "total_elapsed": 0.0,
         }
         _persist_job_locked(job_id)
@@ -3079,6 +3099,7 @@ def get_job_parameters(job_id: str) -> dict[str, Any]:
         "include_key_text": bool(selected.get("include_key_text", source.get("include_key_text", True))),
         "include_subtitles": bool(selected.get("include_subtitles", source.get("include_subtitles", True))),
         "stroke_detail": str(selected.get("stroke_detail", source.get("stroke_detail", "detailed"))),
+        "presentation_mode": normalize_presentation_mode(selected.get("presentation_mode", source.get("presentation_mode"))),
         "reference": asset_descriptor(source_id, reference.name if reference else None),
         "style_reference": asset_descriptor(source_id, style_filename),
         "characters": characters,
@@ -3240,6 +3261,7 @@ def create_rerender(job_id: str, payload: dict[str, Any], request: Request) -> d
     pen_text = str(payload.get("pen_text", source.get("pen_text", ""))).strip()[:12]
     include_key_text = bool(payload.get("include_key_text", source.get("include_key_text", True)))
     include_subtitles = bool(payload.get("include_subtitles", source.get("include_subtitles", True)))
+    presentation_mode = normalize_presentation_mode(payload.get("presentation_mode", source.get("presentation_mode")))
     new_id = uuid.uuid4().hex[:12]
     target_dir = JOBS_DIR / new_id
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -3264,7 +3286,7 @@ def create_rerender(job_id: str, payload: dict[str, Any], request: Request) -> d
             "task_name": task_name,
             "scenes_per_image": scenes_per_image, "pen_text": pen_text,
             "include_key_text": include_key_text, "include_subtitles": include_subtitles,
-            "stroke_detail": detail, "can_rerender": False,
+            "stroke_detail": detail, "presentation_mode": presentation_mode, "can_rerender": False,
             "current_phase": None, "phase_started_at": None, "total_elapsed": 0.0,
         }
         _persist_job_locked(new_id)

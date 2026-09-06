@@ -438,6 +438,31 @@ class QueueResumeTests(unittest.TestCase):
         self.assertEqual(elements[0]["region"]["x"], elements[1]["region"]["x"])
         self.assertLess(elements[0]["region"]["y"], elements[1]["region"]["y"])
 
+    def test_story_color_reserves_caption_space_and_passes_renderer_flag(self) -> None:
+        from PIL import Image
+
+        image_path = Path(self.temporary.name) / "story.png"
+        annotation_path = Path(self.temporary.name) / "story.json"
+        Image.new("RGB", (1024, 1366), "white").save(image_path)
+        scenes = [{"title": "相遇", "text": "那天我们第一次见面。", "duration_ms": 2400}]
+        SERVER.write_board_annotation(scenes, image_path, annotation_path, 1, "story-color")
+        element = json.loads(annotation_path.read_text(encoding="utf-8"))["elements"][0]
+        self.assertEqual(element["subtitle"], "那天我们第一次见面。")
+        self.assertLess(element["captionRegion"]["y"], element["region"]["y"])
+        command = SERVER.whiteboard_render_command(image_path, annotation_path, Path("out.mp4"), "detailed", "story-color")
+        self.assertIn("--story-color", command)
+
+    def test_story_color_prompt_reserves_top_space_but_forbids_generated_text(self) -> None:
+        prompt = SERVER.build_board_prompt(
+            [{"title": "相遇", "concept": "两人在门口相遇", "elements": ["青年挥手"], "text": "那天我们第一次见面。"}],
+            SERVER.DEFAULT_STYLE,
+            aspect_ratio="3:4",
+            presentation_mode="story-color",
+        )
+        self.assertIn("上方保留约 25%", prompt)
+        self.assertIn("字幕由程序后期准确添加", prompt)
+        self.assertIn("图片模型不得写字", prompt)
+
     def test_two_minutes_allow_twenty_scenes(self) -> None:
         self.assertEqual(SERVER.scene_limit_for_duration(120), 20)
         self.assertEqual(SERVER.scene_limit_for_duration(180), 20)

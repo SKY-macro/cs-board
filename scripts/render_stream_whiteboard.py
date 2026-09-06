@@ -29,6 +29,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 # 复用 stream 渲染器的全部构件（同目录）
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -62,6 +63,79 @@ def _frame_progress_indices(n_steps: int, target_frames: int) -> list[int]:
     return [round(f * (n_steps - 1) / (target_frames - 1)) for f in range(target_frames)]
 
 
+def _handwriting_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    candidates = [
+        Path("C:/Windows/Fonts/STXINGKA.TTF"),
+        Path("C:/Windows/Fonts/STKAITI.TTF"),
+        Path("C:/Windows/Fonts/simkai.ttf"),
+        Path("/System/Library/Fonts/STKaiti.ttc"),
+        Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+    ]
+    font_path = next((path for path in candidates if path.exists()), None)
+    return ImageFont.truetype(str(font_path), size) if font_path else ImageFont.load_default()
+
+
+def _wrap_handwritten_text(text: str, max_chars: int) -> list[str]:
+    compact = "".join(str(text).split())
+    return [compact[index:index + max_chars] for index in range(0, len(compact), max_chars)] or [""]
+
+
+def _burn_story_captions(source: Path, target: Path, annotation: dict) -> Path:
+    capture = cv2.VideoCapture(str(source))
+    fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
+    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    writer = cv2.VideoWriter(str(target), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    sx = width / annotation["canvas"]["width"]
+    sy = height / annotation["canvas"]["height"]
+    elements = sorted(annotation["elements"], key=lambda item: item["reveal"]["startMs"])
+    frame_index = 0
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            current_ms = frame_index * 1000.0 / fps
+            canvas = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            draw = ImageDraw.Draw(canvas)
+            for element in elements:
+                reveal = element["reveal"]
+                start_ms = float(reveal["startMs"])
+                duration_ms = max(1.0, float(reveal["durationMs"]))
+                if current_ms < start_ms:
+                    continue
+                text = str(element.get("subtitle") or "").strip()
+                if not text:
+                    continue
+                progress = min(1.0, (current_ms - start_ms) / max(1.0, duration_ms * 0.18))
+                visible = text[:max(1, round(len(text) * progress))]
+                region = element.get("captionRegion") or element["region"]
+                x0, y0, x1, y1 = _scaled_rect(region, sx, sy, width, height)
+                region_w, region_h = max(1, x1 - x0), max(1, y1 - y0)
+                font_size = max(22, min(round(height * 0.055), round(region_h * 0.30)))
+                while font_size > 22:
+                    font = _handwriting_font(font_size)
+                    max_chars = max(4, int(region_w / max(1, font_size * 1.02)))
+                    lines = _wrap_handwritten_text(visible, max_chars)
+                    if len(lines) * font_size * 1.28 <= region_h:
+                        break
+                    font_size -= 2
+                font = _handwriting_font(font_size)
+                max_chars = max(4, int(region_w / max(1, font_size * 1.02)))
+                lines = _wrap_handwritten_text(visible, max_chars)
+                draw.multiline_text(
+                    (x0 + max(8, round(region_w * 0.04)), y0 + max(4, round(region_h * 0.04))),
+                    "\n".join(lines), font=font, fill=(23, 23, 20), spacing=max(3, font_size // 5),
+                    stroke_width=max(0, font_size // 42), stroke_fill=(23, 23, 20),
+                )
+            writer.write(cv2.cvtColor(np.asarray(canvas), cv2.COLOR_RGB2BGR))
+            frame_index += 1
+    finally:
+        capture.release()
+        writer.release()
+    return target
+
+
 # ──────────────────────────────────────────────────────────────
 # 每区域的 stream 笔迹渲染，写入共享持久画布
 # ──────────────────────────────────────────────────────────────
@@ -69,11 +143,13 @@ class RegionStreamRenderer:
     """持有整段渲染的共享状态；逐区域把 stream 笔迹画进同一张画布。"""
 
     def __init__(self, image_bgr: np.ndarray, annotation: dict, cfg: sr.Config,
-                 hand_png: Path | None, bare_tip: bool, max_skeleton_strokes: int = 96) -> None:
+                 hand_png: Path | None, bare_tip: bool, max_skeleton_strokes: int = 96,
+                 story_color: bool = False) -> None:
         self.cfg = cfg
         self.ann = annotation
         self.canvas_bgr = sr._hex_to_bgr(cfg.canvas_hex)
         self.max_skeleton_strokes = max(0, max_skeleton_strokes)
+        self.story_color = story_color
 
         # 输出尺寸：长边限到 cap，对齐到 grid_edge 的偶数倍（编码要求偶数）
         h0, w0 = image_bgr.shape[:2]
@@ -399,8 +475,10 @@ class RegionStreamRenderer:
 
                 allowed = self._allowed_mask(element, elements[idx + 1:])
                 # 混合绘制：手只负责约 32% 的主轮廓，细节无手淡入，剩余时间观看成图。
-                ink_frames = max(1, round(dur_ms * 0.32 * cfg.fps / 1000))
-                color_frames = max(1, round(dur_ms * 0.10 * cfg.fps / 1000))
+                if self.story_color:
+                    fill_static(start_ms + dur_ms * 0.18)
+                ink_frames = max(1, round(dur_ms * (0.38 if self.story_color else 0.32) * cfg.fps / 1000))
+                color_frames = max(1, round(dur_ms * (0.32 if self.story_color else 0.10) * cfg.fps / 1000))
 
                 if cfg.ink_path_mode == "skeleton":
                     strokes = self._region_skeleton_strokes(allowed)
@@ -505,6 +583,8 @@ def _parse_args(argv=None):
     p.add_argument("--stroke-detail", default="detailed",
                    choices=["light", "standard", "detailed", "full"],
                    help="手绘线条量: light 24条; standard 48条; detailed 96条; full 全部")
+    p.add_argument("--story-color", action="store_true",
+                   help="故事绘本模式：手写字幕后期揭示，再显示黑白线稿并逐渐上色")
     return p.parse_args(argv)
 
 
@@ -559,6 +639,7 @@ def main(argv=None) -> int:
     renderer = RegionStreamRenderer(
         image_bgr, annotation, cfg, hand_png, args.bare_tip,
         max_skeleton_strokes=stroke_limits[args.stroke_detail],
+        story_color=args.story_color,
     )
     print(f"  输入: {args.image}")
     print(f"  输出尺寸: {renderer.out_w}x{renderer.out_h}, 帧率: {cfg.fps}")
@@ -566,7 +647,11 @@ def main(argv=None) -> int:
           f"笔迹: {cfg.ink_path_mode}, 线条量: {args.stroke_detail}, 上色: {cfg.color_fill}")
 
     renderer.render_to(raw_path, total_ms)
-    final = sr.transcode_h264(raw_path, out_path)
+    transcode_source = raw_path
+    if args.story_color:
+        captioned_path = out_path.with_name(out_path.stem + "_captioned_raw.mp4")
+        transcode_source = _burn_story_captions(raw_path, captioned_path, annotation)
+    final = sr.transcode_h264(transcode_source, out_path)
 
     size_mb = final.stat().st_size / (1024 * 1024)
     print(f"\n最终视频: {final}  ({size_mb:.2f} MB)")
