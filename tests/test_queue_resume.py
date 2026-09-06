@@ -174,6 +174,13 @@ class QueueResumeTests(unittest.TestCase):
         self.assertIn("--bare-tip", command)
         self.assertNotIn(str(SERVER.HAND), command)
 
+    def test_uploaded_narration_command_normalizes_audio_without_tts(self) -> None:
+        command = SERVER.uploaded_narration_command(Path("narration.mp3"), Path("voice.partial.wav"))
+        self.assertEqual(command[0], "ffmpeg")
+        self.assertIn("narration.mp3", command)
+        self.assertIn("pcm_s16le", command)
+        self.assertEqual(command[-1], "voice.partial.wav")
+
     def test_scene_durations_fit_voice_track_exactly(self) -> None:
         scenes = [
             {"text": "短句", "duration_ms": 2000},

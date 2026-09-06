@@ -1392,6 +1392,14 @@ def synthesize_voice(config: dict[str, Any], reference: Path, copy: str, target:
     raise RuntimeError(f"语音克隆失败：{raw}") from last_error
 
 
+def uploaded_narration_command(source: Path, target: Path) -> list[str]:
+    """Normalize a user-provided complete narration for the render pipeline."""
+    return [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(source),
+        "-vn", "-ac", "1", "-ar", "44100", "-c:a", "pcm_s16le", str(target),
+    ]
+
+
 def write_annotation(scene: dict[str, Any], image: Path, target: Path, index: int) -> None:
     from PIL import Image
 
@@ -1744,18 +1752,28 @@ def fail_job(job_id: str, stage: str, exc: Exception) -> None:
     update_job(job_id, status="error", stage=stage, error=str(exc))
 
 
-def voice_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_image: int, pen_text: str, include_key_text: bool, include_subtitles: bool, stroke_detail: str, tts_url: str, node_index: int) -> None:
+def voice_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_image: int, pen_text: str, include_key_text: bool, include_subtitles: bool, stroke_detail: str, voice_mode: str, tts_url: str, node_index: int) -> None:
     job_dir = JOBS_DIR / job_id
     try:
         config = load_config()
         config["tts_url"] = tts_url
         update_job(job_id, tts_node=tts_url, tts_node_index=node_index + 1)
-        begin_phase(job_id, "voice", "语音克隆", f"语音节点 {node_index + 1} 正在克隆声音", 8)
+        direct_narration = voice_mode == "uploaded"
+        begin_phase(
+            job_id,
+            "voice",
+            "旁白处理" if direct_narration else "语音克隆",
+            "正在使用上传的完整旁白" if direct_narration else f"语音节点 {node_index + 1} 正在克隆声音",
+            8,
+        )
         voice = job_dir / "voice.wav"
         if not valid_media_file(voice):
             partial_voice = job_dir / "voice.partial.wav"
             partial_voice.unlink(missing_ok=True)
-            synthesize_voice(config, reference, copy, partial_voice)
+            if direct_narration:
+                run(uploaded_narration_command(reference, partial_voice), job_id=job_id)
+            else:
+                synthesize_voice(config, reference, copy, partial_voice)
             ensure_job_active(job_id)
             if not valid_media_file(partial_voice):
                 raise RuntimeError("语音服务返回的音频文件无效")
@@ -2341,6 +2359,7 @@ def enqueue_job_from_checkpoint(job_id: str, item: dict[str, Any]) -> None:
     if not copy:
         raise RuntimeError("旧任务缺少可恢复的文案，请从历史记录重新提交")
     reference = next(iter(sorted(job_dir.glob("reference.*"))), job_dir / "reference.wav")
+    voice_mode = "uploaded" if item.get("voice_mode") == "uploaded" else "clone"
     task = (job_id, copy, str(item.get("style", DEFAULT_STYLE)), reference, scenes_per_image, pen_text, include_key_text, include_subtitles, stroke_detail)
     if valid_media_file(job_dir / "voice.wav"):
         queue_for_stage(job_id, "model", "已恢复配音，等待继续模型任务", max(14, int(item.get("progress", 14))))
@@ -2348,8 +2367,8 @@ def enqueue_job_from_checkpoint(job_id: str, item: dict[str, Any]) -> None:
     else:
         if not reference.exists():
             raise RuntimeError("任务缺少参考音频，无法从断点继续")
-        queue_for_stage(job_id, "voice", "等待恢复语音克隆", max(1, int(item.get("progress", 1))))
-        VOICE_QUEUE.put(task)
+        queue_for_stage(job_id, "voice", "等待恢复上传旁白" if voice_mode == "uploaded" else "等待恢复语音克隆", max(1, int(item.get("progress", 1))))
+        VOICE_QUEUE.put((*task, voice_mode))
 
 
 def resume_pending_jobs() -> None:
@@ -2491,6 +2510,7 @@ async def create_job(
     include_key_text: bool = Form(True),
     include_subtitles: bool = Form(True),
     stroke_detail: str = Form("detailed"),
+    voice_mode: str = Form("clone"),
     reference: UploadFile = File(...),
     reference_mode: str = Form("standard"),
     character_manifest: str = Form("[]"),
@@ -2511,6 +2531,7 @@ async def create_job(
     with reference_path.open("wb") as target:
         shutil.copyfileobj(reference.file, target)
     reference_mode = reference_mode if reference_mode in {"custom", "infographic"} else "standard"
+    voice_mode = "uploaded" if voice_mode == "uploaded" else "clone"
     visual_references: dict[str, Any] = {}
     if reference_mode == "custom":
         uploads = character_references or []
@@ -2577,7 +2598,7 @@ async def create_job(
     now = time.time()
     with LOCK:
         JOBS[job_id] = {
-            "id": job_id, "status": "queued", "stage": "等待语音克隆", "progress": 1,
+            "id": job_id, "status": "queued", "stage": "等待处理上传旁白" if voice_mode == "uploaded" else "等待语音克隆", "progress": 1,
             "created_at": now, "started_at": now, "timings": {},
             "queue_stage": "voice", "queue_order": time.time_ns(),
             "client_ip": request_client_ip(request),
@@ -2586,6 +2607,7 @@ async def create_job(
             "reference_mode": reference_mode, "character_count": len(visual_references.get("characters", [])),
             "visual_references": visual_references,
             "task_name": task_name,
+            "voice_mode": voice_mode,
             "copy": script.strip(),
             "pen_text": pen_text.strip()[:12], "include_key_text": include_key_text,
             "include_subtitles": include_subtitles,
@@ -2593,7 +2615,7 @@ async def create_job(
             "current_phase": None, "phase_started_at": None, "total_elapsed": 0.0,
         }
         _persist_job_locked(job_id)
-    VOICE_QUEUE.put((job_id, script.strip(), style, reference_path, scenes_per_image, pen_text.strip()[:12], include_key_text, include_subtitles, stroke_detail))
+    VOICE_QUEUE.put((job_id, script.strip(), style, reference_path, scenes_per_image, pen_text.strip()[:12], include_key_text, include_subtitles, stroke_detail, voice_mode))
     ensure_pipeline_workers()
     return job_snapshot(job_id)
 
@@ -2694,6 +2716,7 @@ def get_job_parameters(job_id: str) -> dict[str, Any]:
         "job_id": job_id,
         "source_job_id": source_id,
         "copy": str(source.get("copy") or ""),
+        "voice_mode": "uploaded" if source.get("voice_mode") == "uploaded" else "clone",
         "reference_mode": reference_mode,
         "style": str(source.get("style") or DEFAULT_STYLE),
         "scenes_per_image": max(1, min(4, int(source.get("scenes_per_image", 1)))),
@@ -2881,6 +2904,7 @@ def create_rerender(job_id: str, payload: dict[str, Any], request: Request) -> d
             "client_ip": request_client_ip(request),
             "job_type": "rerender", "rerender_of": job_id, "style": source.get("style", ""),
             "reference_mode": source.get("reference_mode", "standard"),
+            "voice_mode": source.get("voice_mode", "clone"),
             "pipeline_version": PIPELINE_VERSION if is_infographic_job(job_id) else source.get("pipeline_version", "standard_v1"),
             "task_name": task_name,
             "scenes_per_image": scenes_per_image, "pen_text": pen_text,
