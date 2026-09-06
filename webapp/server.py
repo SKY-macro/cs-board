@@ -370,9 +370,6 @@ def load_config() -> dict[str, Any]:
 
 def safe_config(data: dict[str, Any]) -> dict[str, Any]:
     result = data.copy()
-    for masked_key in ("api_key", "image_api_key"):
-        key = result.get(masked_key, "")
-        result[masked_key] = "" if not key else f"{key[:4]}••••{key[-4:]}"
     result["has_api_key"] = bool(data.get("api_key"))
     result["has_image_api_key"] = bool(data.get("image_api_key"))
     return result
@@ -792,7 +789,7 @@ def build_model_catalog(models: set[str], text_model: str, image_model: str) -> 
 
 
 def merged_provider_config(payload: dict[str, Any]) -> dict[str, Any]:
-    """Merge submitted settings with saved secrets hidden by the UI."""
+    """Merge submitted settings with the saved provider configuration."""
     config = load_config()
     for key, value in payload.items():
         if key not in DEFAULT_CONFIG or (key in ("api_key", "image_api_key") and isinstance(value, str) and "••••" in value):

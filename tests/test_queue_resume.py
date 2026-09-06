@@ -222,6 +222,11 @@ class QueueResumeTests(unittest.TestCase):
         self.assertEqual(payload["output_text"], "ok")
         self.assertEqual([call.args[1] for call in request.call_args_list], ["gpt-5.4", "gpt-4o"])
 
+    def test_config_returns_full_keys_for_plaintext_settings(self) -> None:
+        visible = SERVER.safe_config({"api_key": "text-secret", "image_api_key": "image-secret"})
+        self.assertEqual(visible["api_key"], "text-secret")
+        self.assertEqual(visible["image_api_key"], "image-secret")
+
     def test_scene_durations_fit_voice_track_exactly(self) -> None:
         scenes = [
             {"text": "短句", "duration_ms": 2000},
