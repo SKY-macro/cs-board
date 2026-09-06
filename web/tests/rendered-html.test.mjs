@@ -57,3 +57,22 @@ test("does not accumulate permanent new badges on style cards", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   assert.doesNotMatch(page, /badge:\s*"新增"/);
 });
+
+test("uses a modal API settings flow with debounced in-page autosave", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.match(page, /className="settingsOverlay"/);
+  assert.match(page, /className="settingsDialog panel"/);
+  assert.match(page, /aria-modal="true"/);
+  assert.match(page, /setTimeout\([^]*900\)/);
+  assert.match(page, /已自动保存/);
+  assert.doesNotMatch(page, /window\.confirm\("确认保存当前 API/);
+  assert.doesNotMatch(page, /window\.alert\("设置保存/);
+});
+
+test("auto-detects only the edited text or image relay model after saving", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.match(page, /detectChangedServiceModels/);
+  assert.match(page, /serviceSignature\(kind,node\)/);
+  assert.match(page, /void detectChangedServiceModels\(snapshot\)/);
+  assert.match(page, /图片节点.*已自动识别并更正|kind==="text"\?"文本":"图片"/);
+});
