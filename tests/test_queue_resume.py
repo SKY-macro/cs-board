@@ -119,6 +119,14 @@ class QueueResumeTests(unittest.TestCase):
         self.assertIn("干性彩铅笔触", recipe)
         self.assertIn("年龄特征必须服从分镜", recipe)
 
+    def test_clear_japanese_storybook_style_is_visual_only(self) -> None:
+        recipe = SERVER.style_recipe("清透日系生活绘本")
+        self.assertIn("黑灰墨线", recipe)
+        self.assertIn("透明水彩叠加轻薄彩铅", recipe)
+        self.assertIn("只能来自当前分镜", recipe)
+        self.assertNotIn("书包", recipe)
+        self.assertNotIn("玄关", recipe)
+
     def test_specialized_codex_review_model_is_not_a_text_candidate(self) -> None:
         catalog = SERVER.build_model_catalog(
             {"gpt-5.4", "codex-auto-review", "text-embedding-3-small", "gpt-image-2"},

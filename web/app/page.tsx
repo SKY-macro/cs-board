@@ -31,6 +31,7 @@ const styleOptions=[
  {name:"漫画墨线解释风",image:"/styles/oil-visual.png",desc:"漫画墨线 · 半调网点 · 概念机制",badge:"新增"},
  {name:"3D黏土趣味风",image:"/styles/clay-3d.webp",desc:"黏土材质 · 玩具比例 · 温暖可爱"},
  {name:"赛博霓虹漫画风",image:"/styles/cyber-neon.webp",desc:"霓虹青紫 · 漫画速度线 · 未来感"},
+ {name:"清透日系生活绘本",image:"/styles/clear-japanese-storybook.png",desc:"细墨线 · 柔和淡彩 · 日常留白",badge:"新增"},
  {name:"彩铅日记漫画（默认）",image:"/styles/story-handdrawn/01-colored-pencil-diary.png",desc:"笨拙墨线 · 低饱和彩铅 · 生活纪实",badge:"Skill"},
  {name:"极简黑白线条讲解",image:"/styles/story-handdrawn/02-minimal-line-explainer.png",desc:"细黑轮廓 · 火柴人 · 快速讲解",badge:"Skill"},
  {name:"五岁儿童蜡笔坏画",image:"/styles/story-handdrawn/03-kid-crayon.png",desc:"歪扭比例 · 越界涂色 · 天真粗糙",badge:"Skill"},
