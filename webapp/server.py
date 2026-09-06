@@ -1742,6 +1742,65 @@ def uploaded_narration_command(source: Path, target: Path) -> list[str]:
     ]
 
 
+def script_paced_duration(copy: str) -> float:
+    """Estimate a comfortable silent-video duration from visible script text."""
+    return max(8.0, len(normalized_semantic_text(copy)) / 4.0)
+
+
+def silent_narration_command(copy: str, target: Path) -> list[str]:
+    """Create an internal silent timing track so the render pipeline stays uniform."""
+    return [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "anullsrc=channel_layout=mono:sample_rate=44100",
+        "-t", f"{script_paced_duration(copy):.3f}", "-c:a", "pcm_s16le", str(target),
+    ]
+
+
+def narration_phrases(copy: str) -> list[str]:
+    """Use the same punctuation boundaries as the real-narration aligner."""
+    return [
+        value.strip()
+        for value in re.findall(r"《[^》]+》|[^，,。！？!?；;：:\n]+[，,。！？!?；;：:]?", copy)
+        if normalized_semantic_text(value)
+    ]
+
+
+def script_paced_phrase_timeline(copy: str, duration_ms: int, fps: int = 30) -> dict[str, Any]:
+    """Create an intentional script-paced timeline for videos without narration."""
+    phrases = narration_phrases(copy) or [copy.strip()]
+    weights = [max(1, len(normalized_semantic_text(text))) for text in phrases]
+    total_weight = sum(weights)
+    cursor_ms = 0
+    source_cursor = 0
+    items: list[dict[str, Any]] = []
+    normalized_source = normalized_semantic_text(copy)
+    cumulative_weight = 0
+    for index, (text, weight) in enumerate(zip(phrases, weights), 1):
+        cumulative_weight += weight
+        end_ms = duration_ms if index == len(phrases) else round(duration_ms * cumulative_weight / total_weight)
+        normalized = normalized_semantic_text(text)
+        source_start = normalized_source.find(normalized, source_cursor)
+        source_start = source_cursor if source_start < 0 else source_start
+        source_end = source_start + len(normalized)
+        items.append({
+            "id": f"p{index:03d}", "order": index, "text": text, "normalized_text": normalized,
+            "source_start": source_start, "source_end": source_end,
+            "spoken_start_ms": cursor_ms, "spoken_end_ms": end_ms,
+            "start_frame": math.ceil(cursor_ms * fps / 1000),
+            "end_frame": max(1, math.ceil(end_ms * fps / 1000)),
+            "alignment_coverage": 1.0, "alignment_confidence": 1.0,
+            "boundary_source": "script-paced-no-narration", "boundary_similarity": 1.0,
+            "neighbor_anchor_similarity": 1.0, "recognized_boundary_text": normalized,
+        })
+        cursor_ms = end_ms
+        source_cursor = source_end
+    return {
+        "schema_version": 2, "timing_source": "script-paced-no-narration",
+        "estimated_fallback_used": False, "fps": fps,
+        "audio_duration_ms": duration_ms, "source_coverage": 1.0, "phrases": items,
+    }
+
+
 def write_annotation(scene: dict[str, Any], image: Path, target: Path, index: int) -> None:
     from PIL import Image
 
@@ -2113,27 +2172,35 @@ def fail_job(job_id: str, stage: str, exc: Exception) -> None:
     update_job(job_id, status="error", stage=stage, error=str(exc))
 
 
-def voice_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_image: int, pen_text: str, include_key_text: bool, include_subtitles: bool, stroke_detail: str, voice_mode: str, tts_url: str, node_index: int) -> None:
+def voice_stage(job_id: str, copy: str, style: str, reference: Path | None, scenes_per_image: int, pen_text: str, include_key_text: bool, include_subtitles: bool, stroke_detail: str, voice_mode: str, tts_url: str, node_index: int) -> None:
     job_dir = JOBS_DIR / job_id
     try:
         config = load_config()
-        config["tts_url"] = tts_url
-        update_job(job_id, tts_node=tts_url, tts_node_index=node_index + 1)
+        if voice_mode == "clone":
+            config["tts_url"] = tts_url
+            update_job(job_id, tts_node=tts_url, tts_node_index=node_index + 1)
         direct_narration = voice_mode == "uploaded"
+        no_narration = voice_mode == "none"
         begin_phase(
             job_id,
             "voice",
-            "旁白处理" if direct_narration else "语音克隆",
-            "正在使用上传的完整旁白" if direct_narration else f"语音节点 {node_index + 1} 正在克隆声音",
+            "视频计时" if no_narration else "旁白处理" if direct_narration else "语音克隆",
+            "正在按文案建立无旁白时间轴" if no_narration else "正在使用上传的完整旁白" if direct_narration else f"语音节点 {node_index + 1} 正在克隆声音",
             8,
         )
         voice = job_dir / "voice.wav"
         if not valid_media_file(voice):
             partial_voice = job_dir / "voice.partial.wav"
             partial_voice.unlink(missing_ok=True)
-            if direct_narration:
+            if no_narration:
+                run(silent_narration_command(copy, partial_voice), job_id=job_id)
+            elif direct_narration:
+                if reference is None:
+                    raise RuntimeError("直接使用旁白模式缺少完整旁白音频")
                 run(uploaded_narration_command(reference, partial_voice), job_id=job_id)
             else:
+                if reference is None:
+                    raise RuntimeError("克隆音色模式缺少参考音频")
                 synthesize_voice(config, reference, copy, partial_voice)
             ensure_job_active(job_id)
             if not valid_media_file(partial_voice):
@@ -2145,10 +2212,10 @@ def voice_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
         MODEL_QUEUE.put((job_id, copy, style, reference, scenes_per_image, pen_text, include_key_text, include_subtitles, stroke_detail))
         ensure_pipeline_workers()
     except Exception as exc:
-        fail_job(job_id, "语音克隆失败", exc)
+        fail_job(job_id, "音频准备失败", exc)
 
 
-def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_image: int, pen_text: str, include_key_text: bool, include_subtitles: bool, stroke_detail: str) -> None:
+def model_stage(job_id: str, copy: str, style: str, reference: Path | None, scenes_per_image: int, pen_text: str, include_key_text: bool, include_subtitles: bool, stroke_detail: str) -> None:
     job_dir = JOBS_DIR / job_id
     try:
         # Models are resolved when settings are saved. Do not delay every job
@@ -2163,33 +2230,37 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
 
         phrase_timeline: dict[str, Any] | None = None
         if infographic:
-            begin_phase(job_id, "alignment", "短语时间表", "正在制作完整的短语—真实旁白时间 JSON", 16)
-            alignment_path = job_dir / "alignment.tokens.json"
-            desired_alignment_model = os.environ.get("INFOGRAPHIC_WHISPER_MODEL", "medium")
-            alignment_current = False
-            if alignment_path.exists():
+            no_narration = JOBS.get(job_id, {}).get("voice_mode") == "none"
+            begin_phase(job_id, "alignment", "短语时间表", "正在按文案节奏建立短语时间表" if no_narration else "正在制作完整的短语—真实旁白时间 JSON", 16)
+            if no_narration:
+                phrase_timeline = script_paced_phrase_timeline(copy, round(duration * 1000), fps=30)
+            else:
+                alignment_path = job_dir / "alignment.tokens.json"
+                desired_alignment_model = os.environ.get("INFOGRAPHIC_WHISPER_MODEL", "medium")
+                alignment_current = False
+                if alignment_path.exists():
+                    try:
+                        saved_alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+                        alignment_current = (
+                            str(saved_alignment.get("model") or "") == desired_alignment_model
+                            and saved_alignment.get("segmentation") == ALIGNMENT_SEGMENTATION
+                            and bool(saved_alignment.get("speechSegments"))
+                        )
+                    except (OSError, json.JSONDecodeError):
+                        alignment_current = False
+                if not alignment_current:
+                    run([
+                        str(NODE),
+                        str(REMOTION_RENDERER / "align.mjs"),
+                        str(voice),
+                        str(alignment_path),
+                    ], cwd=REMOTION_RENDERER, job_id=job_id)
                 try:
-                    saved_alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
-                    alignment_current = (
-                        str(saved_alignment.get("model") or "") == desired_alignment_model
-                        and saved_alignment.get("segmentation") == ALIGNMENT_SEGMENTATION
-                        and bool(saved_alignment.get("speechSegments"))
-                    )
-                except (OSError, json.JSONDecodeError):
-                    alignment_current = False
-            if not alignment_current:
-                run([
-                    str(NODE),
-                    str(REMOTION_RENDERER / "align.mjs"),
-                    str(voice),
-                    str(alignment_path),
-                ], cwd=REMOTION_RENDERER, job_id=job_id)
-            try:
-                alignment_payload = json.loads(alignment_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise RuntimeError("真实旁白 token 时间戳文件损坏，请删除后重试") from exc
-            from scripts.semantic_timeline import build_phrase_timeline
-            phrase_timeline = build_phrase_timeline(copy, alignment_payload, round(duration * 1000), fps=30)
+                    alignment_payload = json.loads(alignment_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise RuntimeError("真实旁白 token 时间戳文件损坏，请删除后重试") from exc
+                from scripts.semantic_timeline import build_phrase_timeline
+                phrase_timeline = build_phrase_timeline(copy, alignment_payload, round(duration * 1000), fps=30)
             atomic_write_json(job_dir / "phrase-timeline.json", phrase_timeline)
             update_job(job_id, checkpoint="phrase_timeline_done")
 
@@ -2528,31 +2599,32 @@ def rerender_job(job_id: str, scenes_per_image: int, pen_text: str, include_key_
 def voice_queue_worker(node_index: int) -> None:
     while True:
         nodes = configured_tts_nodes()
-        if node_index >= len(nodes):
-            time.sleep(1)
-            continue
         task = VOICE_QUEUE.get()
+        voice_mode = ""
         try:
             job_id = str(task[0])
             with LOCK:
                 should_run = JOBS.get(job_id, {}).get("status") in {"queued", "running"}
             if not should_run:
                 continue
+            voice_mode = str(task[-1])
             nodes = configured_tts_nodes()
-            if node_index >= len(nodes):
+            if voice_mode == "clone" and node_index >= len(nodes):
                 VOICE_QUEUE.put(task)
                 time.sleep(1)
                 continue
-            with VOICE_NODE_LOCK:
-                VOICE_NODE_JOBS[node_index] = str(task[0])
-            voice_stage(*task, nodes[node_index], node_index)
+            if voice_mode == "clone":
+                with VOICE_NODE_LOCK:
+                    VOICE_NODE_JOBS[node_index] = str(task[0])
+            voice_stage(*task, nodes[node_index] if voice_mode == "clone" else "", node_index if voice_mode == "clone" else -1)
         except Exception as exc:
             job_id = str(task[0])
             if job_id in JOBS:
                 fail_job(job_id, "语音队列异常", exc)
         finally:
-            with VOICE_NODE_LOCK:
-                VOICE_NODE_JOBS[node_index] = None
+            if voice_mode == "clone":
+                with VOICE_NODE_LOCK:
+                    VOICE_NODE_JOBS[node_index] = None
             VOICE_QUEUE.task_done()
 
 
@@ -2705,7 +2777,7 @@ def start_render_task(target: Any, *args: Any) -> None:
 
 def ensure_pipeline_workers() -> None:
     with WORKER_LOCK:
-        for index, _url in enumerate(configured_tts_nodes()):
+        for index in range(max(1, len(configured_tts_nodes()))):
             thread = VOICE_WORKER_THREADS.get(index)
             if thread is None or not thread.is_alive():
                 thread = threading.Thread(target=voice_queue_worker, args=(index,), name=f"voice-worker-{index + 1}", daemon=True)
@@ -2764,16 +2836,17 @@ def enqueue_job_from_checkpoint(job_id: str, item: dict[str, Any]) -> None:
     copy = str(item.get("copy", "")).strip()
     if not copy:
         raise RuntimeError("旧任务缺少可恢复的文案，请从历史记录重新提交")
-    reference = next(iter(sorted(job_dir.glob("reference.*"))), job_dir / "reference.wav")
-    voice_mode = "uploaded" if item.get("voice_mode") == "uploaded" else "clone"
+    reference = next(iter(sorted(job_dir.glob("reference.*"))), None)
+    voice_mode = str(item.get("voice_mode") or "clone")
+    voice_mode = voice_mode if voice_mode in {"none", "uploaded", "clone"} else "clone"
     task = (job_id, copy, str(item.get("style", DEFAULT_STYLE)), reference, scenes_per_image, pen_text, include_key_text, include_subtitles, stroke_detail)
     if valid_media_file(job_dir / "voice.wav"):
         queue_for_stage(job_id, "model", "已恢复配音，等待继续模型任务", max(14, int(item.get("progress", 14))))
         MODEL_QUEUE.put(task)
     else:
-        if not reference.exists():
+        if voice_mode != "none" and (reference is None or not reference.exists()):
             raise RuntimeError("任务缺少参考音频，无法从断点继续")
-        queue_for_stage(job_id, "voice", "等待恢复上传旁白" if voice_mode == "uploaded" else "等待恢复语音克隆", max(1, int(item.get("progress", 1))))
+        queue_for_stage(job_id, "voice", "等待恢复无旁白时间轴" if voice_mode == "none" else "等待恢复上传旁白" if voice_mode == "uploaded" else "等待恢复语音克隆", max(1, int(item.get("progress", 1))))
         VOICE_QUEUE.put((*task, voice_mode))
 
 
@@ -2939,7 +3012,7 @@ async def create_job(
     stroke_detail: str = Form("detailed"),
     presentation_mode: str = Form("whiteboard"),
     voice_mode: str = Form("clone"),
-    reference: UploadFile = File(...),
+    reference: UploadFile | None = File(None),
     reference_mode: str = Form("standard"),
     character_manifest: str = Form("[]"),
     style_reference: UploadFile | None = File(None),
@@ -2947,6 +3020,11 @@ async def create_job(
 ) -> dict[str, Any]:
     if len(script.strip()) < 10:
         raise HTTPException(400, "文案至少需要 10 个字")
+    voice_mode = voice_mode if voice_mode in {"none", "uploaded", "clone"} else "clone"
+    if voice_mode != "none" and reference is None:
+        raise HTTPException(400, "克隆音色需要参考音频" if voice_mode == "clone" else "直接使用旁白需要完整旁白音频")
+    if voice_mode == "clone" and not configured_tts_nodes():
+        raise HTTPException(400, "克隆音色需要先配置至少一个语音节点")
     with LOCK:
         pending = sum(1 for item in JOBS.values() if item.get("status") in {"queued", "running"})
     if pending >= MAX_ACTIVE_AND_QUEUED:
@@ -2954,12 +3032,13 @@ async def create_job(
     job_id = uuid.uuid4().hex[:12]
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    suffix = Path(reference.filename or "reference.wav").suffix or ".wav"
-    reference_path = job_dir / f"reference{suffix}"
-    with reference_path.open("wb") as target:
-        shutil.copyfileobj(reference.file, target)
+    reference_path: Path | None = None
+    if reference is not None:
+        suffix = Path(reference.filename or "reference.wav").suffix or ".wav"
+        reference_path = job_dir / f"reference{suffix}"
+        with reference_path.open("wb") as target:
+            shutil.copyfileobj(reference.file, target)
     reference_mode = reference_mode if reference_mode in {"custom", "infographic"} else "standard"
-    voice_mode = "uploaded" if voice_mode == "uploaded" else "clone"
     visual_references: dict[str, Any] = {}
     if reference_mode == "custom":
         uploads = character_references or []
@@ -3033,7 +3112,7 @@ async def create_job(
     now = time.time()
     with LOCK:
         JOBS[job_id] = {
-            "id": job_id, "status": "queued", "stage": "等待处理上传旁白" if voice_mode == "uploaded" else "等待语音克隆", "progress": 1,
+            "id": job_id, "status": "queued", "stage": "等待建立无旁白时间轴" if voice_mode == "none" else "等待处理上传旁白" if voice_mode == "uploaded" else "等待语音克隆", "progress": 1,
             "created_at": now, "started_at": now, "timings": {},
             "queue_stage": "voice", "queue_order": time.time_ns(),
             "client_ip": request_client_ip(request),
@@ -3152,7 +3231,7 @@ def get_job_parameters(job_id: str) -> dict[str, Any]:
         "job_id": job_id,
         "source_job_id": source_id,
         "copy": str(source.get("copy") or ""),
-        "voice_mode": "uploaded" if source.get("voice_mode") == "uploaded" else "clone",
+        "voice_mode": str(source.get("voice_mode")) if source.get("voice_mode") in {"none", "uploaded", "clone"} else "clone",
         "reference_mode": reference_mode,
         "style": str(source.get("style") or DEFAULT_STYLE),
         "scenes_per_image": max(1, min(4, int(source.get("scenes_per_image", 1)))),

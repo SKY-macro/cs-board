@@ -31,8 +31,10 @@ test("server-renders the whiteboard video application", async () => {
   const html = await response.text();
   assert.match(html, /<html lang="zh-CN">/i);
   assert.match(html, /<title>有温度出品<\/title>/i);
-  assert.match(html, /把你的表达，画成一支会说话的白板视频/);
-  assert.match(html, /上传参考音频/);
+  assert.match(html, /把你的表达，画成一支有节奏的白板视频/);
+  assert.match(html, /无旁白/);
+  assert.match(html, /上传克隆音色样本/);
+  assert.match(html, /直接使用旁白/);
   assert.match(html, /开始生成视频/);
   assert.match(html, /API 设置/);
   assert.doesNotMatch(html, /Your site is taking shape|Building your site/);
@@ -51,6 +53,17 @@ test("keeps public defaults portable and free of local configuration", async () 
   assert.match(layout, /title:\s*"有温度出品"/);
   assert.match(packageJson, /"build": "vinext build"/);
   assert.match(packageJson, /"test": "npm run build/);
+});
+
+test("offers three modular voice strategies and only uploads audio when selected", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.match(page, /type VoiceMode="none"\|"clone"\|"uploaded"/);
+  assert.match(page, /voiceMode!=="none"&&!reference/);
+  assert.match(page, /if\(reference\)body\.append\("reference",reference\)/);
+  assert.match(page, /className="noNarrationNotice"/);
+  assert.match(page, /与“直接使用旁白”相同/);
+  assert.match(page, /建立视频节奏/);
+  assert.match(page, /处理完整旁白/);
 });
 
 test("does not accumulate permanent new badges on style cards", async () => {

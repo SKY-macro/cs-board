@@ -9,6 +9,7 @@ import wave
 from pathlib import Path
 from unittest import mock
 
+from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 
@@ -383,6 +384,40 @@ class QueueResumeTests(unittest.TestCase):
         self.assertIn("narration.mp3", command)
         self.assertIn("pcm_s16le", command)
         self.assertEqual(command[-1], "voice.partial.wav")
+
+    def test_silent_mode_builds_an_internal_script_paced_track(self) -> None:
+        copy = "这是一段无需旁白的测试文案，用来验证画面会按照文字长度安排节奏。"
+        command = SERVER.silent_narration_command(copy, Path("voice.partial.wav"))
+        self.assertIn("anullsrc=channel_layout=mono:sample_rate=44100", command)
+        self.assertIn("-t", command)
+        self.assertGreaterEqual(SERVER.script_paced_duration(copy), 8.0)
+
+    def test_silent_mode_phrase_timeline_covers_the_whole_video(self) -> None:
+        timeline = SERVER.script_paced_phrase_timeline("先理解问题。再拆分步骤。最后完成验证。", 12000)
+        self.assertEqual(timeline["timing_source"], "script-paced-no-narration")
+        self.assertFalse(timeline["estimated_fallback_used"])
+        self.assertEqual(timeline["phrases"][0]["spoken_start_ms"], 0)
+        self.assertEqual(timeline["phrases"][-1]["spoken_end_ms"], 12000)
+        self.assertEqual([item["id"] for item in timeline["phrases"]], ["p001", "p002", "p003"])
+
+    def test_silent_mode_uses_the_same_clause_boundaries_as_direct_narration(self) -> None:
+        self.assertEqual(SERVER.narration_phrases("先观察，再判断：最后行动。"), ["先观察，", "再判断：", "最后行动。"])
+
+    def test_job_upload_is_optional_for_no_narration_mode(self) -> None:
+        parameter = inspect.signature(SERVER.create_job).parameters["reference"]
+        self.assertIsNone(parameter.default.default)
+
+    def test_no_narration_job_can_be_submitted_without_an_audio_part(self) -> None:
+        with TestClient(SERVER.app) as client:
+            response = client.post("/api/jobs", data={
+                "copy": "这是一段不上传任何音频也可以正常提交的视频测试文案。",
+                "voice_mode": "none",
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        job_id = response.json()["id"]
+        self.assertEqual(SERVER.JOBS[job_id]["voice_mode"], "none")
+        self.assertEqual(list((SERVER.JOBS_DIR / job_id).glob("reference.*")), [])
+        self.assertIsNone(SERVER.VOICE_QUEUE.get_nowait()[3])
 
     def test_model_catalog_classifies_and_selects_available_models(self) -> None:
         catalog = SERVER.build_model_catalog(
