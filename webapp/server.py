@@ -1796,16 +1796,21 @@ def make_branded_hand(text: str, target: Path) -> Path:
     return target
 
 
-def whiteboard_render_command(image: Path, annotation: Path, output: Path, stroke_detail: str, presentation_mode: str = "whiteboard") -> list[str]:
+def whiteboard_render_command(image: Path, annotation: Path, output: Path, stroke_detail: str, presentation_mode: str = "whiteboard", aspect_ratio: str = "16:9") -> list[str]:
     """Build a hand-free whiteboard reveal command."""
+    if normalize_presentation_mode(presentation_mode) == "story-color":
+        width, height = aspect_video_dimensions(aspect_ratio)
+        return [
+            str(PYTHON), str(ROOT / "scripts" / "render_story_color.py"),
+            str(image), str(annotation), str(output),
+            "--width", str(width), "--height", str(height),
+        ]
     command = [
         str(PYTHON), str(ROOT / "scripts" / "render_stream_whiteboard.py"),
         str(image), str(annotation), str(output),
         "--bare-tip", "--ink-path", "skeleton", "--stroke-detail", stroke_detail,
         "--color-fill", "contour-wipe",
     ]
-    if normalize_presentation_mode(presentation_mode) == "story-color":
-        command.append("--story-color")
     return command
 
 
@@ -2240,7 +2245,7 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
                 if not valid_image_file(partial_image):
                     raise RuntimeError(f"第 {i} 张分镜图连续 3 次生成无效：{last_image_error}")
                 partial_image.replace(source_image)
-            if include_key_text and not infographic:
+            if include_key_text and not infographic and presentation_mode != "story-color":
                 add_key_text(source_image, [str(scene.get("key_text", "")) for scene in board], image)
             else:
                 shutil.copy2(source_image, image)
@@ -2326,7 +2331,7 @@ def render_generated_job(job_id: str, scenes: list[dict[str, Any]], boards: list
                     partial_video = job_dir / f"{stem}.partial.mp4"
                     partial_video.unlink(missing_ok=True)
                     write_board_annotation(board, image, annotation, i, presentation_mode)
-                    run(whiteboard_render_command(image, annotation, partial_video, stroke_detail, presentation_mode), job_id=job_id)
+                    run(whiteboard_render_command(image, annotation, partial_video, stroke_detail, presentation_mode, JOBS.get(job_id, {}).get("aspect_ratio", "16:9")), job_id=job_id)
                     if not valid_media_file(partial_video):
                         raise RuntimeError(f"第 {i} 段手绘视频无效")
                     partial_video.replace(video)
@@ -2410,7 +2415,7 @@ def rerender_job(job_id: str, scenes_per_image: int, pen_text: str, include_key_
             annotation = job_dir / f"{stem}.annotation.json"
             video = job_dir / f"{stem}.mp4"
             if source_image.exists():
-                if include_key_text:
+                if include_key_text and presentation_mode != "story-color":
                     add_key_text(source_image, [str(scene.get("key_text", "")) for scene in board], image)
                 else:
                     shutil.copy2(source_image, image)
@@ -2422,7 +2427,7 @@ def rerender_job(job_id: str, scenes_per_image: int, pen_text: str, include_key_
                 video.unlink(missing_ok=True)
                 partial_video = job_dir / f"{stem}.partial.mp4"
                 partial_video.unlink(missing_ok=True)
-                run(whiteboard_render_command(image, annotation, partial_video, stroke_detail, presentation_mode), job_id=job_id)
+                run(whiteboard_render_command(image, annotation, partial_video, stroke_detail, presentation_mode, JOBS.get(job_id, {}).get("aspect_ratio", "16:9")), job_id=job_id)
                 if not valid_media_file(partial_video):
                     raise RuntimeError(f"第 {i} 段重新渲染视频无效")
                 partial_video.replace(video)
@@ -2966,6 +2971,11 @@ async def create_job(
     aspect_ratio = normalize_aspect_ratio(aspect_ratio)
     stroke_detail = stroke_detail if stroke_detail in {"light", "standard", "detailed", "full"} else "detailed"
     presentation_mode = normalize_presentation_mode(presentation_mode)
+    if presentation_mode == "story-color":
+        aspect_ratio = "3:4"
+        scenes_per_image = 1
+        include_key_text = False
+        include_subtitles = True
     task_name = normalized_task_name(task_name, script, job_id)
     now = time.time()
     with LOCK:
@@ -3262,6 +3272,10 @@ def create_rerender(job_id: str, payload: dict[str, Any], request: Request) -> d
     include_key_text = bool(payload.get("include_key_text", source.get("include_key_text", True)))
     include_subtitles = bool(payload.get("include_subtitles", source.get("include_subtitles", True)))
     presentation_mode = normalize_presentation_mode(payload.get("presentation_mode", source.get("presentation_mode")))
+    if presentation_mode == "story-color":
+        scenes_per_image = 1
+        include_key_text = False
+        include_subtitles = True
     new_id = uuid.uuid4().hex[:12]
     target_dir = JOBS_DIR / new_id
     target_dir.mkdir(parents=True, exist_ok=True)

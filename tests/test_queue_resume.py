@@ -449,8 +449,12 @@ class QueueResumeTests(unittest.TestCase):
         element = json.loads(annotation_path.read_text(encoding="utf-8"))["elements"][0]
         self.assertEqual(element["subtitle"], "那天我们第一次见面。")
         self.assertLess(element["captionRegion"]["y"], element["region"]["y"])
-        command = SERVER.whiteboard_render_command(image_path, annotation_path, Path("out.mp4"), "detailed", "story-color")
-        self.assertIn("--story-color", command)
+        command = SERVER.whiteboard_render_command(image_path, annotation_path, Path("out.mp4"), "detailed", "story-color", "3:4")
+        self.assertTrue(str(command[1]).endswith("render_story_color.py"))
+        self.assertNotIn("render_stream_whiteboard.py", " ".join(map(str, command)))
+        self.assertNotIn("--ink-path", command)
+        self.assertEqual(command[command.index("--width") + 1], "1080")
+        self.assertEqual(command[command.index("--height") + 1], "1440")
 
     def test_story_color_prompt_reserves_top_space_but_forbids_generated_text(self) -> None:
         prompt = SERVER.build_board_prompt(
