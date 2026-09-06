@@ -280,8 +280,8 @@ class QueueResumeTests(unittest.TestCase):
             resolved = SERVER.resolve_configured_models(config)
         self.assertEqual(resolved["text_model"], "gpt-5.5")
         self.assertEqual(resolved["image_model"], "gpt-image-2")
-        self.assertEqual(resolved["_text_models"][0], "gpt-5.5")
-        self.assertEqual(resolved["_image_models"][0], "gpt-image-2")
+        self.assertEqual(resolved["_text_models"], ["gpt-5.5"])
+        self.assertEqual(resolved["_image_models"], ["gpt-image-2"])
 
     def test_image_provider_uses_response_candidates_and_records_actual_model(self) -> None:
         unavailable = SERVER.ProviderHTTPError(503, "Service temporarily unavailable")

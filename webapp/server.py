@@ -883,14 +883,19 @@ def merged_provider_config(payload: dict[str, Any]) -> dict[str, Any]:
 def resolve_configured_models(config: dict[str, Any]) -> dict[str, Any]:
     """Refresh configured model names from provider catalogs when available."""
     resolved = dict(config)
+    # Candidate lists are runtime data. Never reuse a previously persisted
+    # multi-model queue: every refresh selects exactly one provider-advertised
+    # model for text and one for images.
+    resolved.pop("_text_models", None)
+    resolved.pop("_image_models", None)
     text_models: set[str] = set()
     try:
         text_models = provider_models(config)
         if text_models:
             catalog = build_model_catalog(text_models, str(config["text_model"]), str(config["image_model"]))
-            resolved["_text_models"] = [catalog["selected_text_model"], *(model for model in catalog["text_models"] if model != catalog["selected_text_model"])]
             if catalog["text_models"]:
                 resolved["text_model"] = catalog["selected_text_model"]
+                resolved["_text_models"] = [catalog["selected_text_model"]]
     except Exception:
         pass
     try:
@@ -900,7 +905,7 @@ def resolve_configured_models(config: dict[str, Any]) -> dict[str, Any]:
             catalog = build_model_catalog(image_models, str(resolved["text_model"]), str(config["image_model"]))
             if catalog["image_models"]:
                 resolved["image_model"] = catalog["selected_image_model"]
-                resolved["_image_models"] = [catalog["selected_image_model"], *(model for model in catalog["image_models"] if model != catalog["selected_image_model"])]
+                resolved["_image_models"] = [catalog["selected_image_model"]]
     except Exception:
         pass
     return resolved
