@@ -181,6 +181,36 @@ class QueueResumeTests(unittest.TestCase):
         self.assertIn("pcm_s16le", command)
         self.assertEqual(command[-1], "voice.partial.wav")
 
+    def test_model_catalog_classifies_and_selects_available_models(self) -> None:
+        catalog = SERVER.build_model_catalog(
+            {"gpt-4.1-mini", "text-embedding-3-small", "gpt-image-1", "dall-e-3"},
+            "gpt-5",
+            "gpt-image-2",
+        )
+        self.assertEqual(catalog["selected_text_model"], "gpt-4.1-mini")
+        self.assertEqual(catalog["selected_image_model"], "gpt-image-1")
+        self.assertNotIn("text-embedding-3-small", catalog["text_models"])
+        self.assertIn("dall-e-3", catalog["image_models"])
+
+    def test_model_catalog_keeps_configured_model_when_available(self) -> None:
+        catalog = SERVER.build_model_catalog(
+            {"claude-sonnet-4", "gpt-4.1-mini", "flux-1.1-pro"},
+            "claude-sonnet-4",
+            "flux-1.1-pro",
+        )
+        self.assertEqual(catalog["selected_text_model"], "claude-sonnet-4")
+        self.assertEqual(catalog["selected_image_model"], "flux-1.1-pro")
+
+    def test_invalid_image_provider_url_falls_back_to_shared_provider(self) -> None:
+        resolved = SERVER.image_provider_config({
+            "base_url": "https://relay.example/v1",
+            "api_key": "shared-key",
+            "image_base_url": "not-a-url",
+            "image_api_key": "",
+        })
+        self.assertEqual(resolved["base_url"], "https://relay.example/v1")
+        self.assertEqual(resolved["api_key"], "shared-key")
+
     def test_scene_durations_fit_voice_track_exactly(self) -> None:
         scenes = [
             {"text": "短句", "duration_ms": 2000},

@@ -656,7 +656,7 @@ def image_provider_config(config: dict[str, Any]) -> dict[str, Any]:
     resolved = dict(config)
     base_url = str(config.get("image_base_url") or "").strip()
     api_key = str(config.get("image_api_key") or "").strip()
-    if base_url:
+    if re.match(r"^https?://", base_url, flags=re.I):
         resolved["base_url"] = base_url
     if api_key:
         resolved["api_key"] = api_key
@@ -716,6 +716,8 @@ def provider_text(config: dict[str, Any], model: str, prompt: str, timeout: floa
 def provider_models(config: dict[str, Any], timeout: float = 30) -> set[str]:
     if not config.get("api_key"):
         raise RuntimeError("请先在 API 设置中填写 API Key")
+    if not re.match(r"^https?://", str(config.get("base_url") or ""), flags=re.I):
+        raise RuntimeError("接口地址必须以 http:// 或 https:// 开头")
     with httpx.Client(timeout=timeout) as client:
         response = client.get(
             f"{config['base_url'].rstrip('/')}/models",
@@ -729,6 +731,72 @@ def provider_models(config: dict[str, Any], timeout: float = 30) -> set[str]:
             raise ProviderHTTPError(response.status_code, f"模型列表读取失败：{response.status_code} {response.text[:800]}")
         payload = response.json()
     return {str(item.get("id")) for item in payload.get("data", []) if isinstance(item, dict) and item.get("id")}
+
+
+def _is_image_model(model: str) -> bool:
+    value = model.lower()
+    return any(token in value for token in ("gpt-image", "dall-e", "imagen", "flux", "stable-diffusion", "ideogram", "recraft"))
+
+
+def _is_text_model(model: str) -> bool:
+    value = model.lower()
+    excluded = ("embedding", "moderation", "whisper", "tts", "speech", "transcri", "rerank")
+    return not _is_image_model(model) and not any(token in value for token in excluded)
+
+
+def _preferred_model(models: list[str], configured: str, priorities: tuple[str, ...]) -> str:
+    if configured in models:
+        return configured
+    return next((model for token in priorities for model in models if token in model.lower()), models[0] if models else configured)
+
+
+def build_model_catalog(models: set[str], text_model: str, image_model: str) -> dict[str, Any]:
+    """Classify a provider's model list and choose usable defaults."""
+    text_models = sorted(model for model in models if _is_text_model(model))
+    image_models = sorted(model for model in models if _is_image_model(model))
+    return {
+        "text_models": text_models,
+        "image_models": image_models,
+        "selected_text_model": _preferred_model(text_models, text_model, ("gpt-5", "gpt-4.1", "claude", "gemini", "qwen", "deepseek", "glm")),
+        "selected_image_model": _preferred_model(image_models, image_model, ("gpt-image", "dall-e", "imagen", "flux", "recraft")),
+    }
+
+
+def merged_provider_config(payload: dict[str, Any]) -> dict[str, Any]:
+    """Merge submitted settings with saved secrets hidden by the UI."""
+    config = load_config()
+    for key, value in payload.items():
+        if key not in DEFAULT_CONFIG or (key in ("api_key", "image_api_key") and isinstance(value, str) and "••••" in value):
+            continue
+        if key in ("tts_url_2", "image_base_url", "image_api_key") and isinstance(value, str):
+            config[key] = value.strip()
+        elif value:
+            config[key] = value
+    return config
+
+
+def resolve_configured_models(config: dict[str, Any]) -> dict[str, Any]:
+    """Refresh configured model names from provider catalogs when available."""
+    resolved = dict(config)
+    text_models: set[str] = set()
+    try:
+        text_models = provider_models(config)
+        if text_models:
+            catalog = build_model_catalog(text_models, str(config["text_model"]), str(config["image_model"]))
+            if catalog["text_models"]:
+                resolved["text_model"] = catalog["selected_text_model"]
+    except Exception:
+        pass
+    try:
+        image_config = image_provider_config(config)
+        image_models = text_models if image_config.get("base_url") == config.get("base_url") and image_config.get("api_key") == config.get("api_key") else provider_models(image_config)
+        if image_models:
+            catalog = build_model_catalog(image_models, str(resolved["text_model"]), str(config["image_model"]))
+            if catalog["image_models"]:
+                resolved["image_model"] = catalog["selected_image_model"]
+    except Exception:
+        pass
+    return resolved
 
 
 def script_units(copy: str) -> list[str]:
@@ -1790,7 +1858,7 @@ def voice_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
 def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_image: int, pen_text: str, include_key_text: bool, include_subtitles: bool, stroke_detail: str) -> None:
     job_dir = JOBS_DIR / job_id
     try:
-        config = load_config()
+        config = resolve_configured_models(load_config())
         voice = job_dir / "voice.wav"
         duration = probe_duration(voice)
         reference_images, reference_instruction, character_context = custom_reference_context(job_id)
@@ -2430,22 +2498,35 @@ def save_config(payload: dict[str, Any]) -> dict[str, Any]:
             continue
         if value not in (None, ""):
             current[key] = value
+    current = resolve_configured_models(current)
     STATE_DIR.mkdir(exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
     ensure_pipeline_workers()
     return safe_config(current)
 
 
+@app.post("/api/config/models")
+def detect_models(payload: dict[str, Any]) -> dict[str, Any]:
+    config = merged_provider_config(payload)
+    text_models = provider_models(config)
+    image_config = image_provider_config(config)
+    if image_config.get("base_url") == config.get("base_url") and image_config.get("api_key") == config.get("api_key"):
+        image_models = text_models
+    else:
+        image_models = provider_models(image_config)
+    text_catalog = build_model_catalog(text_models, str(config["text_model"]), str(config["image_model"]))
+    image_catalog = build_model_catalog(image_models, str(config["text_model"]), str(config["image_model"]))
+    return {
+        "text_models": text_catalog["text_models"],
+        "image_models": image_catalog["image_models"],
+        "selected_text_model": text_catalog["selected_text_model"],
+        "selected_image_model": image_catalog["selected_image_model"],
+    }
+
+
 @app.post("/api/config/test")
 def test_config(payload: dict[str, Any]) -> dict[str, Any]:
-    config = load_config()
-    for key, value in payload.items():
-        if key not in DEFAULT_CONFIG or (key in ("api_key", "image_api_key") and isinstance(value, str) and "••••" in value):
-            continue
-        if key in ("tts_url_2", "image_base_url", "image_api_key") and isinstance(value, str):
-            config[key] = value.strip()
-        elif value:
-            config[key] = value
+    config = resolve_configured_models(merged_provider_config(payload))
     results: dict[str, Any] = {}
     try:
         provider_text(config, str(config["text_model"]), "只回复：连接成功", timeout=60)
