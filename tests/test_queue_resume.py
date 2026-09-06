@@ -1,4 +1,5 @@
 import importlib.util
+import inspect
 import json
 import queue
 import sys
@@ -99,22 +100,10 @@ class QueueResumeTests(unittest.TestCase):
         )
         self.assertEqual(catalog["text_models"], ["gpt-5.4"])
 
-    def test_preflight_selects_first_model_that_really_responds(self) -> None:
-        config = {
-            "api_key": "test-key",
-            "base_url": "https://relay.invalid/v1",
-            "text_model": "gpt-5.4",
-            "_text_models": ["gpt-5.4", "gpt-4.1", "codex-auto-review"],
-        }
-        with mock.patch.object(
-            SERVER,
-            "verify_text_model",
-            side_effect=[SERVER.ProviderHTTPError(429, "no available channel"), None],
-        ) as verify:
-            selected = SERVER.select_working_text_model(config)
-        self.assertEqual(selected, "gpt-4.1")
-        self.assertEqual(config["text_model"], "gpt-4.1")
-        self.assertEqual([call.args[1] for call in verify.call_args_list], ["gpt-5.4", "gpt-4.1"])
+    def test_model_stage_does_not_block_on_a_live_preflight_request(self) -> None:
+        source = inspect.getsource(SERVER.model_stage)
+        self.assertNotIn("verify_text_model", source)
+        self.assertNotIn("select_working_text_model", source)
 
     def test_snapshot_keeps_reference_summary_private(self) -> None:
         job_id = "reference-snapshot"

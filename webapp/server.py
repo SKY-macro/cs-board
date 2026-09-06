@@ -780,55 +780,6 @@ def _is_text_model(model: str) -> bool:
     return not _is_image_model(model) and not any(token in value for token in excluded)
 
 
-def verify_text_model(config: dict[str, Any], model: str, timeout: float = 20) -> None:
-    """Make one cheap live request without the normal retry/backoff delays."""
-    if not config.get("api_key"):
-        raise RuntimeError("请先在 API 设置中填写 API Key")
-    headers = {"Authorization": f"Bearer {config['api_key']}", "Content-Type": "application/json"}
-    base_url = str(config["base_url"]).rstrip("/")
-    attempts = (
-        ("responses", {"model": model, "input": "只回复 OK", "max_output_tokens": 8}),
-        ("chat/completions", {
-            "model": model,
-            "messages": [{"role": "user", "content": "只回复 OK"}],
-            "max_tokens": 8,
-        }),
-    )
-    with httpx.Client(timeout=timeout) as client:
-        for index, (endpoint, payload) in enumerate(attempts):
-            response = client.post(f"{base_url}/{endpoint}", headers=headers, json=payload)
-            if not response.is_error:
-                return
-            if index == 0 and response.status_code in {400, 404, 405, 501}:
-                continue
-            raise ProviderHTTPError(response.status_code, f"模型预检失败：{response.status_code} {response.text[:500]}")
-    raise RuntimeError(f"模型 {model} 不支持文本生成接口")
-
-
-def select_working_text_model(config: dict[str, Any], job_id: str | None = None) -> str:
-    """Select the first general text model that succeeds on a live request."""
-    advertised = [str(item) for item in config.get("_text_models", []) if _is_text_model(str(item))]
-    selected = str(config.get("text_model") or "")
-    candidates = [selected, *(item for item in advertised if item != selected)]
-    candidates = [item for item in candidates if item and _is_text_model(item)][:8]
-    if not candidates:
-        raise RuntimeError("接口没有识别到可用于内容生成的通用文本模型")
-    failures: list[str] = []
-    for index, candidate in enumerate(candidates, 1):
-        if job_id:
-            update_job(job_id, stage=f"正在预检文本模型 {index}/{len(candidates)}：{candidate}")
-        try:
-            verify_text_model(config, candidate)
-            config["text_model"] = candidate
-            config["_text_models"] = [candidate, *(item for item in advertised if item != candidate)]
-            if job_id:
-                update_job(job_id, text_model=candidate, stage=f"模型 {candidate} 预检通过")
-            return candidate
-        except (ProviderHTTPError, httpx.HTTPError, RuntimeError) as exc:
-            failures.append(f"{candidate}: {str(exc)[:120]}")
-    raise RuntimeError("所有候选文本模型均未通过实时预检：" + "；".join(failures))
-
-
 def _preferred_model(models: list[str], configured: str, priorities: tuple[str, ...]) -> str:
     if configured in models:
         return configured
@@ -1950,9 +1901,6 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
         reference_images, reference_instruction, character_context = custom_reference_context(job_id)
         infographic = is_infographic_job(job_id)
 
-        begin_phase(job_id, "preflight", "接口预检", "正在验证当前 API 的通用文本模型", 15)
-        select_working_text_model(config, job_id)
-
         phrase_timeline: dict[str, Any] | None = None
         if infographic:
             begin_phase(job_id, "alignment", "短语时间表", "正在制作完整的短语—真实旁白时间 JSON", 16)
@@ -2120,7 +2068,6 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
             "planning": "内容结构失败",
             "deck": "Remotion PPT 结构失败",
             "images": "PPT 插图生成失败",
-            "preflight": "API 模型预检失败",
         }.get(current_phase, "模型调用失败")
         fail_job(job_id, stage, exc)
 
