@@ -122,11 +122,24 @@ class QueueResumeTests(unittest.TestCase):
     def test_clear_japanese_storybook_style_is_visual_only(self) -> None:
         recipe = SERVER.style_recipe("清透日系生活绘本")
         self.assertIn("黑灰墨线", recipe)
-        self.assertIn("干净数字淡彩", recipe)
+        self.assertIn("极稀疏短斜线", recipe)
+        self.assertIn("不画虹膜渐变", recipe)
+        self.assertIn("禁止蜡笔颗粒", recipe)
         self.assertIn("禁止泛黄纸纹", recipe)
         self.assertIn("只能来自当前分镜", recipe)
         self.assertNotIn("书包", recipe)
         self.assertNotIn("玄关", recipe)
+
+    def test_clear_japanese_storybook_keeps_composition_scene_driven(self) -> None:
+        prompt = SERVER.build_board_prompt(
+            [{"title": "回家", "concept": "两人见面", "elements": ["两人站立交谈"], "text": "他终于回来了。"}],
+            "清透日系生活绘本",
+            aspect_ratio="9:16",
+            presentation_mode="story-color",
+        )
+        self.assertIn("人物位置、景别和构图服从当前剧情", prompt)
+        self.assertIn("两人站立交谈", prompt)
+        self.assertLessEqual(len(prompt), 1000)
 
     def test_specialized_codex_review_model_is_not_a_text_candidate(self) -> None:
         catalog = SERVER.build_model_catalog(
