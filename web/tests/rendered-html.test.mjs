@@ -52,3 +52,8 @@ test("keeps public defaults portable and free of local configuration", async () 
   assert.match(packageJson, /"build": "vinext build"/);
   assert.match(packageJson, /"test": "npm run build/);
 });
+
+test("does not accumulate permanent new badges on style cards", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.doesNotMatch(page, /badge:\s*"新增"/);
+});
