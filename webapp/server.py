@@ -750,11 +750,12 @@ def image_provider_config(config: dict[str, Any]) -> dict[str, Any]:
     return resolved
 
 
-def provider_post(config: dict[str, Any], endpoint: str, payload: dict[str, Any], timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
+def provider_post(config: dict[str, Any], endpoint: str, payload: dict[str, Any], timeout: float = 1800, job_id: str | None = None, attempts: int = 3) -> dict[str, Any]:
     if not config.get("api_key"):
         raise RuntimeError("请先在 API 设置中填写 API Key")
     last_error: Exception | None = None
-    for attempt in range(3):
+    attempts = max(1, attempts)
+    for attempt in range(attempts):
         try:
             with httpx.Client(timeout=timeout) as client:
                 response = client.post(
@@ -778,15 +779,15 @@ def provider_post(config: dict[str, Any], endpoint: str, payload: dict[str, Any]
                 "upstream rate limit", "model_not_found", "no available channel", "get_channel_failed",
             )):
                 retryable = False
-            if not retryable or attempt == 2:
+            if not retryable or attempt == attempts - 1:
                 raise
             if job_id and job_id in JOBS:
-                update_job(job_id, stage=f"模型服务暂时异常，正在自动重试 {attempt + 2}/3", model_retry_count=int(JOBS[job_id].get("model_retry_count", 0)) + 1)
+                update_job(job_id, stage=f"模型服务暂时异常，正在自动重试 {attempt + 2}/{attempts}", model_retry_count=int(JOBS[job_id].get("model_retry_count", 0)) + 1)
             time.sleep(provider_retry_delay(attempt))
     raise RuntimeError(f"模型服务重试失败：{last_error}")
 
 
-def provider_text_once(config: dict[str, Any], model: str, prompt: str, timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
+def provider_text_once(config: dict[str, Any], model: str, prompt: str, timeout: float = 1800, job_id: str | None = None, attempts: int = 3) -> dict[str, Any]:
     """Call either generation API used by OpenAI-compatible gateways.
 
     Newer providers expose ``/responses`` while many relay services only
@@ -794,7 +795,7 @@ def provider_text_once(config: dict[str, Any], model: str, prompt: str, timeout:
     back when that route is unsupported.
     """
     try:
-        return provider_post(config, "responses", {"model": model, "input": prompt}, timeout=timeout, job_id=job_id)
+        return provider_post(config, "responses", {"model": model, "input": prompt}, timeout=timeout, job_id=job_id, attempts=attempts)
     except ProviderHTTPError as exc:
         if exc.status_code not in {400, 404, 405, 501}:
             raise
@@ -804,17 +805,18 @@ def provider_text_once(config: dict[str, Any], model: str, prompt: str, timeout:
         {"model": model, "messages": [{"role": "user", "content": prompt}]},
         timeout=timeout,
         job_id=job_id,
+        attempts=attempts,
     )
 
 
-def provider_text_single(config: dict[str, Any], model: str, prompt: str, timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
+def provider_text_single(config: dict[str, Any], model: str, prompt: str, timeout: float = 1800, job_id: str | None = None, attempts: int = 3) -> dict[str, Any]:
     """Call text generation and fail over across models advertised by a relay."""
     advertised = [str(item) for item in config.get("_text_models", []) if str(item)]
     candidates = [model, *(item for item in advertised if item != model)]
     last_error: Exception | None = None
     for index, candidate in enumerate(candidates):
         try:
-            payload = provider_text_once(config, candidate, prompt, timeout=timeout, job_id=job_id)
+            payload = provider_text_once(config, candidate, prompt, timeout=timeout, job_id=job_id, attempts=attempts)
             actual_model = str(payload.get("model") or candidate)
             if job_id and job_id in JOBS:
                 update_job(job_id, text_model=actual_model)
@@ -830,22 +832,17 @@ def provider_text_single(config: dict[str, Any], model: str, prompt: str, timeou
 
 
 def provider_text(config: dict[str, Any], model: str, prompt: str, timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
-    services = text_provider_configs(config)
-    last_error: Exception | None = None
-    for index, service in enumerate(services):
-        selected = str(service.get("model") or model)
-        try:
-            if index and job_id and job_id in JOBS:
-                update_job(job_id, stage=f"正在切换文本中转站 {index + 1}/{len(services)}")
-            return provider_text_single(service, selected, prompt, timeout=timeout, job_id=job_id)
-        except Exception as exc:
-            last_error = exc
-            if index == len(services) - 1:
-                raise
-    raise RuntimeError(f"所有文本中转站均调用失败：{last_error}")
+    plan = provider_service_plan(config, "text")
+    attempts = 1 if plan["ready_count"] > 1 else 3
+    return provider_service_failover(
+        plan,
+        "文本中转站",
+        lambda service: provider_text_single(service, str(service.get("model") or model), prompt, timeout=timeout, job_id=job_id, attempts=attempts),
+        job_id=job_id,
+    )
 
 
-def provider_image_single(config: dict[str, Any], endpoint: str, payload: dict[str, Any], timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
+def provider_image_single(config: dict[str, Any], endpoint: str, payload: dict[str, Any], timeout: float = 1800, job_id: str | None = None, attempts: int = 3) -> dict[str, Any]:
     """Call an image endpoint using the candidates advertised by that image provider."""
     selected = str(payload.get("model") or config.get("image_model") or "")
     advertised = [str(item) for item in config.get("_image_models", []) if str(item)]
@@ -854,7 +851,7 @@ def provider_image_single(config: dict[str, Any], endpoint: str, payload: dict[s
     for index, candidate in enumerate(candidates):
         request_payload = {**payload, "model": candidate}
         try:
-            response_payload = provider_post(config, endpoint, request_payload, timeout=timeout, job_id=job_id)
+            response_payload = provider_post(config, endpoint, request_payload, timeout=timeout, job_id=job_id, attempts=attempts)
             actual_model = str(response_payload.get("model") or candidate)
             if job_id and job_id in JOBS:
                 update_job(job_id, image_model=actual_model)
@@ -870,19 +867,21 @@ def provider_image_single(config: dict[str, Any], endpoint: str, payload: dict[s
 
 
 def provider_image(config: dict[str, Any], endpoint: str, payload: dict[str, Any], timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
-    services = image_provider_configs(config)
-    last_error: Exception | None = None
-    for index, service in enumerate(services):
-        request_payload = {**payload, "model": str(service.get("model") or payload.get("model") or config.get("image_model") or "")}
-        try:
-            if index and job_id and job_id in JOBS:
-                update_job(job_id, stage=f"正在切换图片中转站 {index + 1}/{len(services)}")
-            return provider_image_single(service, endpoint, request_payload, timeout=timeout, job_id=job_id)
-        except Exception as exc:
-            last_error = exc
-            if index == len(services) - 1:
-                raise
-    raise RuntimeError(f"所有图片中转站均调用失败：{last_error}")
+    plan = provider_service_plan(config, "image")
+    attempts = 1 if plan["ready_count"] > 1 else 3
+    return provider_service_failover(
+        plan,
+        "图片中转站",
+        lambda service: provider_image_single(
+            service,
+            endpoint,
+            {**payload, "model": str(service.get("model") or payload.get("model") or config.get("image_model") or "")},
+            timeout=timeout,
+            job_id=job_id,
+            attempts=attempts,
+        ),
+        job_id=job_id,
+    )
 
 
 def provider_image_edit_once(config: dict[str, Any], form_data: dict[str, str], raw_files: list[tuple[str, bytes, str]], timeout: float = 1800) -> dict[str, Any]:
@@ -906,19 +905,18 @@ def provider_image_edit_once(config: dict[str, Any], form_data: dict[str, str], 
 
 
 def provider_image_edit(config: dict[str, Any], form_data: dict[str, str], raw_files: list[tuple[str, bytes, str]], timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
-    services = image_provider_configs(config)
-    last_error: Exception | None = None
-    for index, service in enumerate(services):
-        selected_form = {**form_data, "model": str(service.get("model") or form_data.get("model") or "")}
-        try:
-            if index and job_id and job_id in JOBS:
-                update_job(job_id, stage=f"正在切换参考图中转站 {index + 1}/{len(services)}")
-            return provider_image_edit_once(service, selected_form, raw_files, timeout=timeout)
-        except Exception as exc:
-            last_error = exc
-            if index == len(services) - 1:
-                raise
-    raise RuntimeError(f"所有参考图中转站均调用失败：{last_error}")
+    plan = provider_service_plan(config, "image")
+    return provider_service_failover(
+        plan,
+        "参考图中转站",
+        lambda service: provider_image_edit_once(
+            service,
+            {**form_data, "model": str(service.get("model") or form_data.get("model") or "")},
+            raw_files,
+            timeout=timeout,
+        ),
+        job_id=job_id,
+    )
 
 
 def provider_models(config: dict[str, Any], timeout: float = 30) -> set[str]:
@@ -1029,22 +1027,67 @@ def resolve_configured_models(config: dict[str, Any]) -> dict[str, Any]:
     return resolved
 
 
+def provider_service_plan(config: dict[str, Any], kind: str) -> dict[str, Any]:
+    """Describe every configured relay and retain original node positions."""
+    key = "text_services" if kind == "text" else "image_services"
+    raw_services = config.get(key)
+    if not isinstance(raw_services, list) or not raw_services:
+        fallback = dict(config) if kind == "text" else image_provider_config(config)
+        return {"configured_count": 1, "ready_count": 1, "ready": [{"position": 1, "service": fallback}], "skipped": []}
+
+    ready: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    services = [item for item in raw_services if isinstance(item, dict)]
+    for position, item in enumerate(services, 1):
+        if not item.get("enabled", True):
+            skipped.append({"position": position, "reason": "已停用"})
+            continue
+        missing: list[str] = []
+        if not str(item.get("base_url") or "").strip():
+            missing.append("接口地址")
+        if not str(item.get("api_key") or "").strip():
+            missing.append("API Key")
+        if not str(item.get("model") or "").strip():
+            missing.append("模型")
+        if missing:
+            skipped.append({"position": position, "reason": f"缺少 {'、'.join(missing)}"})
+            continue
+        ready.append({"position": position, "service": dict(item)})
+    return {"configured_count": len(services), "ready_count": len(ready), "ready": ready, "skipped": skipped}
+
+
+def provider_service_failover(plan: dict[str, Any], label: str, invoke: Any, job_id: str | None = None) -> dict[str, Any]:
+    """Run text and image relays with shared counting, status, and error reporting."""
+    configured = int(plan.get("configured_count") or 0)
+    ready = list(plan.get("ready") or [])
+    skipped = list(plan.get("skipped") or [])
+    skipped_text = "，".join(f"节点 {item['position']} {item['reason']}" for item in skipped)
+    if not ready:
+        detail = f"：{skipped_text}" if skipped_text else ""
+        raise RuntimeError(f"没有可调用的{label}{detail}")
+    errors: list[str] = []
+    for ready_index, item in enumerate(ready):
+        position = int(item["position"])
+        if ready_index and job_id and job_id in JOBS:
+            suffix = f"（{len(ready)} 个可调用"
+            if skipped_text:
+                suffix += f"，{skipped_text}"
+            suffix += "）"
+            update_job(job_id, stage=f"正在切换{label} {position}/{configured}{suffix}")
+        try:
+            return invoke(dict(item["service"]))
+        except Exception as exc:
+            status = f"{exc.status_code} " if isinstance(exc, ProviderHTTPError) else ""
+            errors.append(f"节点 {position}: {status}{exc}")
+    raise RuntimeError(f"所有可调用的{label}均失败（{len(ready)}/{configured}）：{'；'.join(errors)}")
+
+
 def text_provider_configs(config: dict[str, Any]) -> list[dict[str, Any]]:
-    services = config.get("text_services")
-    if isinstance(services, list):
-        enabled = [dict(item) for item in services if isinstance(item, dict) and item.get("enabled", True) and item.get("base_url") and item.get("api_key") and item.get("model")]
-        if enabled:
-            return enabled
-    return [dict(config)]
+    return [dict(item["service"]) for item in provider_service_plan(config, "text")["ready"]]
 
 
 def image_provider_configs(config: dict[str, Any]) -> list[dict[str, Any]]:
-    services = config.get("image_services")
-    if isinstance(services, list):
-        enabled = [dict(item) for item in services if isinstance(item, dict) and item.get("enabled", True) and item.get("base_url") and item.get("api_key") and item.get("model")]
-        if enabled:
-            return enabled
-    return [image_provider_config(config)]
+    return [dict(item["service"]) for item in provider_service_plan(config, "image")["ready"]]
 
 
 def script_units(copy: str) -> list[str]:

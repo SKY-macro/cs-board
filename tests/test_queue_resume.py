@@ -305,6 +305,71 @@ class QueueResumeTests(unittest.TestCase):
         self.assertEqual([call.args[0]["base_url"] for call in request.call_args_list], ["https://one.example/v1", "https://two.example/v1"])
         self.assertEqual([call.args[1]["model"] for call in request.call_args_list], ["gpt-image-1", "gpt-image-2"])
 
+    def test_relay_plan_reports_configured_ready_and_skipped_nodes(self) -> None:
+        config = {
+            "text_services": [
+                {"id": "first", "base_url": "https://one.example/v1", "api_key": "one", "model": "gpt-5.5", "enabled": True},
+                {"id": "second", "base_url": "https://two.example/v1", "api_key": "two", "model": "gpt-5.2", "enabled": True},
+                {"id": "third", "base_url": "https://three.example/v1", "api_key": "", "model": "gpt-5", "enabled": True},
+            ]
+        }
+        plan = SERVER.provider_service_plan(config, "text")
+        self.assertEqual(plan["configured_count"], 3)
+        self.assertEqual(plan["ready_count"], 2)
+        self.assertEqual([item["position"] for item in plan["ready"]], [1, 2])
+        self.assertEqual(plan["skipped"], [{"position": 3, "reason": "缺少 API Key"}])
+
+    def test_text_relay_switch_status_uses_total_configured_node_count(self) -> None:
+        unavailable = SERVER.ProviderHTTPError(503, "Service temporarily unavailable")
+        SERVER.JOBS["relay-status-job"] = self.job("relay-status-job")
+        config = {
+            "text_services": [
+                {"id": "first", "base_url": "https://one.example/v1", "api_key": "one", "model": "gpt-5.5", "enabled": True},
+                {"id": "second", "base_url": "https://two.example/v1", "api_key": "two", "model": "gpt-5.2", "enabled": True},
+                {"id": "third", "base_url": "https://three.example/v1", "api_key": "", "model": "gpt-5", "enabled": True},
+            ]
+        }
+        with mock.patch.object(SERVER, "provider_text_single", side_effect=[unavailable, {"output_text": "ok"}]):
+            SERVER.provider_text(config, "ignored", "hello", job_id="relay-status-job")
+        self.assertEqual(
+            SERVER.JOBS["relay-status-job"]["stage"],
+            "正在切换文本中转站 2/3（2 个可调用，节点 3 缺少 API Key）",
+        )
+
+    def test_image_relay_failure_lists_every_attempted_node(self) -> None:
+        config = {
+            "image_services": [
+                {"id": "first", "base_url": "https://one.example/v1", "api_key": "one", "model": "gpt-image-2", "enabled": True},
+                {"id": "second", "base_url": "https://two.example/v1", "api_key": "two", "model": "gpt-image-2", "enabled": True},
+            ]
+        }
+        with mock.patch.object(
+            SERVER,
+            "provider_image_single",
+            side_effect=[SERVER.ProviderHTTPError(429, "rate limited"), SERVER.ProviderHTTPError(503, "unavailable")],
+        ):
+            with self.assertRaisesRegex(RuntimeError, r"节点 1.*429.*节点 2.*503"):
+                SERVER.provider_image(config, "images/generations", {"prompt": "hello"})
+
+    def test_multiple_relays_switch_after_one_transient_attempt_per_node(self) -> None:
+        unavailable = SERVER.ProviderHTTPError(503, "unavailable")
+        config = {
+            "text_services": [
+                {"id": "first", "base_url": "https://one.example/v1", "api_key": "one", "model": "gpt-5.5", "enabled": True},
+                {"id": "second", "base_url": "https://two.example/v1", "api_key": "two", "model": "gpt-5.2", "enabled": True},
+            ],
+            "image_services": [
+                {"id": "first", "base_url": "https://one.example/v1", "api_key": "one", "model": "gpt-image-2", "enabled": True},
+                {"id": "second", "base_url": "https://two.example/v1", "api_key": "two", "model": "gpt-image-2", "enabled": True},
+            ],
+        }
+        with mock.patch.object(SERVER, "provider_text_single", side_effect=[unavailable, {"output_text": "ok"}]) as text_request:
+            SERVER.provider_text(config, "ignored", "hello")
+        with mock.patch.object(SERVER, "provider_image_single", side_effect=[unavailable, {"data": [{}]}]) as image_request:
+            SERVER.provider_image(config, "images/generations", {"prompt": "hello"})
+        self.assertEqual([call.kwargs["attempts"] for call in text_request.call_args_list], [1, 1])
+        self.assertEqual([call.kwargs["attempts"] for call in image_request.call_args_list], [1, 1])
+
     def test_whiteboard_render_command_hides_drawing_hand(self) -> None:
         command = SERVER.whiteboard_render_command(
             Path("board.png"), Path("board.annotation.json"), Path("board.partial.mp4"), "detailed"

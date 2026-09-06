@@ -83,3 +83,10 @@ test("creates text and image relay nodes without copying an existing endpoint", 
   assert.match(addService, /base_url:"",api_key:""/);
   assert.doesNotMatch(addService, /fallback/);
 });
+
+test("shows callable versus configured relay counts for text and images", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.match(page, /serviceAvailability/);
+  assert.match(page, /可调用 \{textAvailability\.ready\}\/\{textAvailability\.total\}/);
+  assert.match(page, /可调用 \{imageAvailability\.ready\}\/\{imageAvailability\.total\}/);
+});
