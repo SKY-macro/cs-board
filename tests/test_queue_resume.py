@@ -399,6 +399,45 @@ class QueueResumeTests(unittest.TestCase):
         self.assertEqual(sum(scene["duration_ms"] for scene in scenes), 5123)
         self.assertGreaterEqual(scenes[-1]["duration_ms"], 1000)
 
+    def test_aspect_ratio_presets_cover_common_creator_formats(self) -> None:
+        self.assertEqual(SERVER.normalize_aspect_ratio("3:4"), "3:4")
+        self.assertEqual(SERVER.normalize_aspect_ratio("invalid"), "16:9")
+        self.assertEqual(SERVER.aspect_video_dimensions("9:16"), (1080, 1920))
+        self.assertEqual(SERVER.aspect_image_dimensions("1:1"), (1024, 1024))
+        self.assertEqual(SERVER.aspect_api_size("3:4"), "1024x1536")
+
+    def test_generated_image_is_cropped_to_selected_aspect_ratio(self) -> None:
+        from PIL import Image
+
+        image_path = Path(self.temporary.name) / "generated.png"
+        Image.new("RGB", (1536, 1024), "white").save(image_path)
+        SERVER.normalize_generated_image_aspect(image_path, "1:1")
+        with Image.open(image_path) as result:
+            self.assertEqual(result.size, (1024, 1024))
+
+    def test_infographic_props_use_selected_video_dimensions(self) -> None:
+        scenes = [{
+            "start_frame": 0, "end_frame": 30, "timed_cues": [{
+                "id": "cue-1", "anchor_text": "测试", "start_frame": 0, "end_frame": 30,
+                "spoken_start_ms": 0, "spoken_end_ms": 1000, "enter_ids": ["page-title"],
+                "focus_id": "page-title", "alignment_coverage": 1.0, "alignment_confidence": 1.0,
+            }],
+        }]
+        props = SERVER.remotion_infographic_props(scenes, "极简粗线简笔白板风", 1000, False, "3:4")
+        self.assertEqual((props["width"], props["height"]), (1080, 1440))
+
+    def test_portrait_board_annotation_stacks_scenes_vertically(self) -> None:
+        from PIL import Image
+
+        image_path = Path(self.temporary.name) / "portrait.png"
+        annotation_path = Path(self.temporary.name) / "portrait.json"
+        Image.new("RGB", (864, 1536), "white").save(image_path)
+        scenes = [{"title": "上", "duration_ms": 1000}, {"title": "下", "duration_ms": 1000}]
+        SERVER.write_board_annotation(scenes, image_path, annotation_path, 1)
+        elements = json.loads(annotation_path.read_text(encoding="utf-8"))["elements"]
+        self.assertEqual(elements[0]["region"]["x"], elements[1]["region"]["x"])
+        self.assertLess(elements[0]["region"]["y"], elements[1]["region"]["y"])
+
     def test_two_minutes_allow_twenty_scenes(self) -> None:
         self.assertEqual(SERVER.scene_limit_for_duration(120), 20)
         self.assertEqual(SERVER.scene_limit_for_duration(180), 20)

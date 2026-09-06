@@ -51,7 +51,9 @@ def add_key_text(image_path: Path, phrases: Sequence[str], output_path: Path | N
     cleaned = [clean_key_text(value) for value in phrases]
     cleaned = [value or "本幕重点" for value in cleaned]
     count = max(1, len(cleaned))
-    panel_width = width / count
+    portrait = height > width and count > 1
+    panel_width = width if portrait else width / count
+    panel_height = height / count if portrait else height
     dark = _dark_background(image)
     text_fill = (255, 218, 103, 255) if dark else (39, 39, 34, 255)
     stroke_fill = (10, 12, 20, 235) if dark else (255, 251, 240, 235)
@@ -59,16 +61,17 @@ def add_key_text(image_path: Path, phrases: Sequence[str], output_path: Path | N
     draw = ImageDraw.Draw(image)
 
     for index, phrase in enumerate(cleaned):
-        max_size = round(height * 0.058)
+        max_size = round(panel_height * 0.058)
         fitted_size = round(panel_width * 0.76 / max(2, len(phrase)))
         font_size = max(24, min(max_size, fitted_size))
         font = _font(font_size)
         box = draw.textbbox((0, 0), phrase, font=font, stroke_width=max(1, font_size // 24))
         text_width = box[2] - box[0]
         text_height = box[3] - box[1]
-        center_x = panel_width * (index + 0.5)
+        center_x = width / 2 if portrait else panel_width * (index + 0.5)
         x = round(center_x - text_width / 2)
-        y = max(18, round(height * 0.055 - box[1]))
+        panel_top = panel_height * index if portrait else 0
+        y = max(18, round(panel_top + panel_height * 0.055 - box[1]))
         draw.text(
             (x, y), phrase, font=font, fill=text_fill,
             stroke_width=max(1, font_size // 24), stroke_fill=stroke_fill,

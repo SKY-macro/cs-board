@@ -1,5 +1,5 @@
 import React from 'react';
-import {AbsoluteFill, Img, Sequence, interpolate, staticFile, useCurrentFrame} from 'remotion';
+import {AbsoluteFill, Img, Sequence, interpolate, staticFile, useCurrentFrame, useVideoConfig} from 'remotion';
 import type {CSSProperties} from 'react';
 import type {InfographicPage, InfographicVideoProps, TimedCue} from './types';
 
@@ -186,17 +186,20 @@ const Layout:React.FC<{page:InfographicPage;frame:number;colors:Palette}> = ({pa
 
 const Page:React.FC<{page:InfographicPage;style:string;subtitlesEnabled:boolean}> = ({page,style,subtitlesEnabled}) => {
   const frame = useCurrentFrame();
+  const {width,height} = useVideoConfig();
+  const compactCanvas = width / height < 1.4;
+  const displayPage:InfographicPage = compactCanvas ? {...page,layoutType:'overview',composition:'top-bottom'} : page;
   const colors = palette(style);
   const oilVisual = style === '漫画墨线解释风';
-  const titleSize = page.layoutType === 'question' ? 68 : page.layoutType === 'principle' ? 60 : 54;
+  const titleSize = compactCanvas ? Math.max(40,Math.round(width*0.05)) : displayPage.layoutType === 'question' ? 68 : displayPage.layoutType === 'principle' ? 60 : 54;
   return <AbsoluteFill style={{backgroundColor:colors.paper,color:colors.ink,overflow:'hidden'}}>
     <div style={oilVisual?{position:'absolute',inset:0,backgroundImage:`radial-gradient(circle,${colors.ink} 0 1px,transparent 1.15px)`,backgroundSize:'11px 11px',opacity:0.08,WebkitMaskImage:'linear-gradient(125deg,#000 0 18%,transparent 42% 63%,#000 88%)',maskImage:'linear-gradient(125deg,#000 0 18%,transparent 42% 63%,#000 88%)'}:{position:'absolute',inset:0,background:`radial-gradient(circle at 22% 76%,${colors.line}22,transparent 27%),radial-gradient(circle at 82% 18%,${colors.second}12,transparent 23%)`}}/>
-    <Header page={page} frame={frame} colors={colors}/>
-    <div style={{position:'absolute',left:112,right:112,top:215,bottom:page.conclusion?(subtitlesEnabled?205:142):(subtitlesEnabled?132:76),display:'flex',flexDirection:'column',gap:24,minHeight:0}}>
-      <div style={{...elementMotion(page,'page-title',frame),fontFamily:'SimSun, Noto Serif SC, serif',fontSize:titleSize,fontWeight:750,lineHeight:1.18,textAlign:'center',color:colors.accent,maxWidth:1540,alignSelf:'center'}}>{page.pageTitle}</div>
-      <div style={{flex:1,minHeight:0}}><Layout page={page} frame={frame} colors={colors}/></div>
+    <Header page={displayPage} frame={frame} colors={colors}/>
+    <div style={{position:'absolute',left:compactCanvas?64:112,right:compactCanvas?64:112,top:215,bottom:displayPage.conclusion?(subtitlesEnabled?205:142):(subtitlesEnabled?132:76),display:'flex',flexDirection:'column',gap:24,minHeight:0}}>
+      <div style={{...elementMotion(displayPage,'page-title',frame),fontFamily:'SimSun, Noto Serif SC, serif',fontSize:titleSize,fontWeight:750,lineHeight:1.18,textAlign:'center',color:colors.accent,maxWidth:1540,alignSelf:'center'}}>{displayPage.pageTitle}</div>
+      <div style={{flex:1,minHeight:0}}><Layout page={displayPage} frame={frame} colors={colors}/></div>
     </div>
-    {page.conclusion?<div style={{...elementMotion(page,'conclusion',frame),position:'absolute',left:160,right:160,bottom:subtitlesEnabled?128:58,textAlign:'center',fontFamily:'SimSun, Noto Serif SC, serif',fontSize:33,fontWeight:750,color:colors.accent,borderTop:`1px solid ${colors.line}`,paddingTop:17}}>{page.conclusion}</div>:null}
+    {displayPage.conclusion?<div style={{...elementMotion(displayPage,'conclusion',frame),position:'absolute',left:compactCanvas?78:160,right:compactCanvas?78:160,bottom:subtitlesEnabled?128:58,textAlign:'center',fontFamily:'SimSun, Noto Serif SC, serif',fontSize:compactCanvas?28:33,fontWeight:750,color:colors.accent,borderTop:`1px solid ${colors.line}`,paddingTop:17}}>{displayPage.conclusion}</div>:null}
   </AbsoluteFill>;
 };
 

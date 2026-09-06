@@ -133,6 +133,31 @@ MODEL_CATALOG_CACHE_TTL_SECONDS = 300
 MODEL_CATALOG_CACHE: dict[tuple[str, str], tuple[float, set[str]]] = {}
 MODEL_CATALOG_CACHE_LOCK = threading.Lock()
 
+ASPECT_RATIO_PRESETS = {
+    "16:9": {"video": (1920, 1080), "image": (1536, 864), "api_size": "1536x1024"},
+    "9:16": {"video": (1080, 1920), "image": (864, 1536), "api_size": "1024x1536"},
+    "3:4": {"video": (1080, 1440), "image": (1024, 1366), "api_size": "1024x1536"},
+    "4:3": {"video": (1440, 1080), "image": (1536, 1152), "api_size": "1536x1024"},
+    "1:1": {"video": (1080, 1080), "image": (1024, 1024), "api_size": "1024x1024"},
+}
+
+
+def normalize_aspect_ratio(value: Any) -> str:
+    ratio = str(value or "16:9").strip()
+    return ratio if ratio in ASPECT_RATIO_PRESETS else "16:9"
+
+
+def aspect_video_dimensions(value: Any) -> tuple[int, int]:
+    return ASPECT_RATIO_PRESETS[normalize_aspect_ratio(value)]["video"]
+
+
+def aspect_image_dimensions(value: Any) -> tuple[int, int]:
+    return ASPECT_RATIO_PRESETS[normalize_aspect_ratio(value)]["image"]
+
+
+def aspect_api_size(value: Any) -> str:
+    return str(ASPECT_RATIO_PRESETS[normalize_aspect_ratio(value)]["api_size"])
+
 HANDDRAWN_STYLE_LIBRARY_PATH = ROOT / "assets" / "story-handdrawn" / "handdrawn-style-library.json"
 HANDDRAWN_VISUAL_RECIPES_PATH = ROOT / "assets" / "story-handdrawn" / "visual-style-recipes.json"
 
@@ -1406,7 +1431,7 @@ elements 必须是恰好 3 个具体可画的中文短语，按叙事顺序排�
     return scenes
 
 
-def build_image_prompt(scene: dict[str, Any], style: str) -> str:
+def build_image_prompt(scene: dict[str, Any], style: str, aspect_ratio: str = "16:9") -> str:
     labels = scene.get("elements") or [scene.get("title", "场景主体")]
     count = len(labels)
     lanes = "；".join(f"第{i + 1}区：{label}" for i, label in enumerate(labels))
@@ -1415,7 +1440,9 @@ def build_image_prompt(scene: dict[str, Any], style: str) -> str:
         if style == OIL_VISUAL_STYLE else
         "同一主角固定为：中国青年男性，短黑发，朴素深色上衣，普通人形象；不要改变年龄与外貌。"
     )
-    return f"""生成一张用于中文口播的 16:9 白板动画分镜原画。
+    aspect_ratio = normalize_aspect_ratio(aspect_ratio)
+    layout_direction = "从上到下" if aspect_ratio in {"9:16", "3:4"} else "从左到右"
+    return f"""生成一张用于中文口播的 {aspect_ratio} 白板动画分镜原画。
 风格名称：{style}。
 视觉配方：{style_recipe(style)}
 必须严格执行这套视觉配方，不得自动改回其他白板风格；人物、物体和配色都要让所选风格一眼可辨。
@@ -1424,18 +1451,20 @@ def build_image_prompt(scene: dict[str, Any], style: str) -> str:
 本幕原文：{scene.get('text', '')}
 必须严格表现本幕叙事，不得生成童年成长、旅行、花鸟、山水、宠物等无关意象。
 {character_instruction}
-构图必须从左到右平均分成 {count} 个互不重叠的独立小场景，每区主体居中，区间有明显留白：{lanes}。
+构图必须{layout_direction}平均分成 {count} 个互不重叠的独立小场景，每区主体居中，区间有明显留白：{lanes}。
 必须把上述每个元素都画出来，顺序不得改变；任何人物或物体不得跨越相邻区域。
 主体整体垂直居中并略微靠上，主要人物和物体中心位于画面高度 42%～48%，顶部不得出现大面积无意义空白。
 禁止任何文字、字母、数字、Logo、水印、边框、对话框和装饰性填充。画面底部保留约 16% 空白作为字幕安全区。"""
 
 
-def build_board_prompt(scenes: list[dict[str, Any]], style: str, reference_instruction: str = "", use_character_references: bool = False, infographic: bool = False) -> str:
+def build_board_prompt(scenes: list[dict[str, Any]], style: str, reference_instruction: str = "", use_character_references: bool = False, infographic: bool = False, aspect_ratio: str = "16:9") -> str:
+    aspect_ratio = normalize_aspect_ratio(aspect_ratio)
+    layout_direction = "从上到下" if aspect_ratio in {"9:16", "3:4"} else "从左到右"
     if infographic:
         scene = scenes[0]
         elements = "、".join(scene.get("illustration_elements") or scene.get("nodes") or [])
         reference_block = f"视觉参考使用规则：{reference_instruction}\n" if reference_instruction else ""
-        return f"""生成一张 16:9 中文知识解说视频的独立插画素材。
+        return f"""生成一张 {aspect_ratio} 中文知识解说视频的独立插画素材。
 所选画面风格：{style}。视觉配方：{style_recipe(style)}
 {reference_block}必须让画面在 3 秒内认出主体、10 秒内看懂观点证据；不是装饰性配图。
 画面只画以下具象内容：{elements}。对应观点：{scene.get('concept', '')}。
@@ -1470,25 +1499,33 @@ PPT 已确定的视觉策略：{scene.get('visual_strategy', '左侧文字，右
         "同一主角固定为：中国青年男性，短黑发，朴素深色上衣，普通人形象；所有分镜中的年龄与外貌保持一致。"
     )
     reference_block = f"参考图说明：\n{reference_instruction}\n" if reference_instruction else ""
-    return f"""{reference_block}生成一张用于中文口播的 16:9 白板动画原画，一张图承载 {len(scenes)} 个连续分镜。
+    return f"""{reference_block}生成一张用于中文口播的 {aspect_ratio} 白板动画原画，一张图承载 {len(scenes)} 个连续分镜。
 风格名称：{style}。
 {style_instruction}
 {character_instruction}
-画面必须从左到右平均分成 {len(scenes)} 个互不重叠的叙事区域，不画边框；每区内部可以组合人物、动作和关键物体，但不得跨区。
+画面必须{layout_direction}平均分成 {len(scenes)} 个互不重叠的叙事区域，不画边框；每区内部可以组合人物、动作和关键物体，但不得跨区。
 {panel_text}
 严格表现上述事件，不得生成原文没有的童年成长、旅行、花鸟、山水、宠物或装饰性意象。
 所有区域的主体垂直居中并略微靠上，主要人物和物体中心位于画面高度 42%～48%，顶部不得出现大面积无意义空白。
 禁止任何文字、字母、数字、Logo、水印、边框和对话框。画面底部保留约 16% 空白作为字幕安全区。"""
 
 
-def generate_image(config: dict[str, Any], prompt: str, target: Path, reference_images: list[Path] | None = None, job_id: str | None = None) -> None:
+def normalize_generated_image_aspect(path: Path, aspect_ratio: str) -> None:
+    from PIL import Image, ImageOps
+
+    with Image.open(path) as source:
+        normalized = ImageOps.fit(source.convert("RGB"), aspect_image_dimensions(aspect_ratio), method=Image.Resampling.LANCZOS, centering=(0.5, 0.46))
+        normalized.save(path, format="PNG", optimize=True)
+
+
+def generate_image(config: dict[str, Any], prompt: str, target: Path, reference_images: list[Path] | None = None, job_id: str | None = None, aspect_ratio: str = "16:9") -> None:
     # OpenLux documents a 1000-character limit for this GPT Image route.
     compact_prompt = prompt if len(prompt) <= 1000 else f"{prompt[:830]}\n{prompt[-160:]}"
     request_payload = {
         "model": config["image_model"],
         "prompt": compact_prompt,
         "n": 1,
-        "size": "1536x1024",
+        "size": aspect_api_size(aspect_ratio),
         "quality": "medium",
         "format": "png",
     }
@@ -1521,6 +1558,7 @@ def generate_image(config: dict[str, Any], prompt: str, target: Path, reference_
             target.write_bytes(response.content)
     else:
         raise RuntimeError("GPT Image 2 返回格式中没有 b64_json 或 url")
+    normalize_generated_image_aspect(target, aspect_ratio)
 
 
 def custom_reference_context(job_id: str) -> tuple[list[Path], str, str]:
@@ -1652,19 +1690,23 @@ def write_annotation(scene: dict[str, Any], image: Path, target: Path, index: in
     gap = 120
     usable = duration - 500 - gap * (count - 1)
     each = max(500, usable // count)
+    portrait = height > width and count > 1
     margin_x = max(10, width // 80)
-    band = (width - margin_x * 2) / count
+    margin_y = max(10, height // 100)
+    band = ((height - margin_y * 2) if portrait else (width - margin_x * 2)) / count
     elements = []
     for i, label in enumerate(labels):
-        x = round(margin_x + i * band)
-        x2 = round(margin_x + (i + 1) * band)
+        x = margin_x if portrait else round(margin_x + i * band)
+        x2 = width - margin_x if portrait else round(margin_x + (i + 1) * band)
+        y = round(margin_y + i * band) if portrait else round(height * 0.02)
+        y2 = round(margin_y + (i + 1) * band) if portrait else round(height * 0.82)
         start = 200 + i * (each + gap)
         elements.append({
             "id": f"part-{i+1}", "label": str(label), "sequence": i + 1,
             "narrativeRole": "按文案叙事顺序出现", "subtitle": scene.get("text", ""), "type": "concept",
-            "region": {"x": x, "y": round(height * 0.02), "width": x2 - x, "height": round(height * 0.80)},
-            "reveal": {"direction": "left_to_right", "startMs": start, "durationMs": each, "maskPaddingPx": 16, "protectedRegions": []},
-            "handPath": {"start": [x + 5, height // 2], "end": [x2 - 5, height // 2], "easing": "easeInOut"},
+            "region": {"x": x, "y": y, "width": x2 - x, "height": y2 - y},
+            "reveal": {"direction": "top_to_bottom" if portrait else "left_to_right", "startMs": start, "durationMs": each, "maskPaddingPx": 16, "protectedRegions": []},
+            "handPath": {"start": [width // 2, y + 5], "end": [width // 2, y2 - 5], "easing": "easeInOut"} if portrait else {"start": [x + 5, height // 2], "end": [x2 - 5, height // 2], "easing": "easeInOut"},
         })
     data = {
         "sceneId": f"scene-{index:02d}", "canvas": {"width": width, "height": height},
@@ -1680,21 +1722,25 @@ def write_board_annotation(scenes: list[dict[str, Any]], image: Path, target: Pa
     with Image.open(image) as im:
         width, height = im.size
     count = len(scenes)
+    portrait = height > width and count > 1
     margin_x = max(10, width // 100)
-    band = (width - margin_x * 2) / count
+    margin_y = max(10, height // 100)
+    band = ((height - margin_y * 2) if portrait else (width - margin_x * 2)) / count
     offset = 0
     elements = []
     for i, scene in enumerate(scenes):
-        x = round(margin_x + i * band)
-        x2 = round(margin_x + (i + 1) * band)
+        x = margin_x if portrait else round(margin_x + i * band)
+        x2 = width - margin_x if portrait else round(margin_x + (i + 1) * band)
+        y = round(margin_y + i * band) if portrait else round(height * 0.02)
+        y2 = round(margin_y + (i + 1) * band) if portrait else round(height * 0.82)
         duration = int(scene["duration_ms"])
         elements.append({
             "id": f"panel-{i + 1}", "label": scene.get("title", f"分镜{i + 1}"),
             "sequence": i + 1, "narrativeRole": scene.get("concept", "按原文叙事"),
             "subtitle": scene.get("text", ""), "type": "scene",
-            "region": {"x": x, "y": round(height * 0.02), "width": x2 - x, "height": round(height * 0.80)},
-            "reveal": {"direction": "left_to_right", "startMs": offset, "durationMs": duration, "maskPaddingPx": 14, "protectedRegions": []},
-            "handPath": {"start": [x + 5, height // 2], "end": [x2 - 5, height // 2], "easing": "easeInOut"},
+            "region": {"x": x, "y": y, "width": x2 - x, "height": y2 - y},
+            "reveal": {"direction": "top_to_bottom" if portrait else "left_to_right", "startMs": offset, "durationMs": duration, "maskPaddingPx": 14, "protectedRegions": []},
+            "handPath": {"start": [width // 2, y + 5], "end": [width // 2, y2 - 5], "easing": "easeInOut"} if portrait else {"start": [x + 5, height // 2], "end": [x2 - 5, height // 2], "easing": "easeInOut"},
         })
         offset += duration
     data = {
@@ -1935,7 +1981,7 @@ def _subtitle_video_input(video: Path, subtitles: Path, fallback_target: Path, j
     return fallback_target, None
 
 
-def remotion_infographic_props(scenes: list[dict[str, Any]], style: str, duration_ms: int, subtitles_enabled: bool = False) -> dict[str, Any]:
+def remotion_infographic_props(scenes: list[dict[str, Any]], style: str, duration_ms: int, subtitles_enabled: bool = False, aspect_ratio: str = "16:9") -> dict[str, Any]:
     pages: list[dict[str, Any]] = []
     for index, scene in enumerate(scenes, 1):
         timed_cues = scene.get("timed_cues")
@@ -1974,10 +2020,11 @@ def remotion_infographic_props(scenes: list[dict[str, Any]], style: str, duratio
                 "alignmentConfidence": float(cue["alignment_confidence"]),
             } for cue in timed_cues],
         })
+    width, height = aspect_video_dimensions(aspect_ratio)
     return {
         "fps": 30,
-        "width": 1920,
-        "height": 1080,
+        "width": width,
+        "height": height,
         "totalDurationMs": duration_ms,
         "totalDurationFrames": max(1, math.ceil(duration_ms * 30 / 1000)),
         "style": style,
@@ -2034,6 +2081,7 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
         # Models are resolved when settings are saved. Do not delay every job
         # by re-reading remote catalogs before the first generation request.
         config = load_config()
+        aspect_ratio = normalize_aspect_ratio(JOBS.get(job_id, {}).get("aspect_ratio"))
         voice = job_dir / "voice.wav"
         duration = probe_duration(voice)
         reference_images, reference_instruction, character_context = custom_reference_context(job_id)
@@ -2101,7 +2149,7 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
             )
             atomic_write_json(plan_path, scenes)
             atomic_write_json(job_dir / "alignment-report.json", alignment_report)
-            deck_spec = remotion_infographic_props(scenes, style, round(duration * 1000), include_subtitles)
+            deck_spec = remotion_infographic_props(scenes, style, round(duration * 1000), include_subtitles, aspect_ratio)
             atomic_write_json(job_dir / "deck-spec.json", deck_spec)
             atomic_write_json(job_dir / "content-timeline.json", {
                 "schema_version": 1,
@@ -2134,7 +2182,7 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
             elif style == OIL_VISUAL_STYLE and not board_images:
                 board_images, board_instruction = oil_visual_reference_context(board, infographic)
                 use_character_references = False
-            board_prompt = build_board_prompt(board, style, board_instruction, use_character_references, infographic)
+            board_prompt = build_board_prompt(board, style, board_instruction, use_character_references, infographic, aspect_ratio)
             board_specs.append((board_images, board_instruction, board_prompt))
         update_job(job_id, duration=duration, scenes=len(scenes), boards=len(boards), checkpoint="plan_done")
         atomic_write_json(job_dir / "boards.json", [
@@ -2158,7 +2206,7 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
                 for attempt in range(3):
                     partial_image.unlink(missing_ok=True)
                     try:
-                        generate_image(config, board_prompt, partial_image, board_images, job_id)
+                        generate_image(config, board_prompt, partial_image, board_images, job_id, aspect_ratio)
                         ensure_job_active(job_id)
                         if valid_image_file(partial_image):
                             break
@@ -2230,6 +2278,7 @@ def render_generated_job(job_id: str, scenes: list[dict[str, Any]], boards: list
                         str(JOBS.get(job_id, {}).get("style") or DEFAULT_STYLE),
                         duration_ms,
                         include_subtitles,
+                        normalize_aspect_ratio(JOBS.get(job_id, {}).get("aspect_ratio")),
                     ),
                 )
                 run([
@@ -2475,7 +2524,7 @@ def regenerate_board_image(job_id: str, page: int, prompt: str) -> None:
         for attempt in range(3):
             partial_image.unlink(missing_ok=True)
             try:
-                generate_image(config, prompt, partial_image, reference_images, job_id)
+                generate_image(config, prompt, partial_image, reference_images, job_id, normalize_aspect_ratio(source.get("aspect_ratio")))
                 ensure_job_active(job_id)
                 if valid_image_file(partial_image):
                     break
@@ -2806,6 +2855,7 @@ async def create_job(
     script: str = Form(..., alias="copy"),
     style: str = Form("极简粗线简笔白板风"),
     scenes_per_image: int = Form(1),
+    aspect_ratio: str = Form("16:9"),
     task_name: str = Form(""),
     pen_text: str = Form(""),
     include_key_text: bool = Form(True),
@@ -2894,6 +2944,7 @@ async def create_job(
             raise HTTPException(400, "风格参考图无效或超过 15MB")
         visual_references = {"style_image": style_path.name, "characters": saved_characters}
     scenes_per_image = max(1, min(4, scenes_per_image))
+    aspect_ratio = normalize_aspect_ratio(aspect_ratio)
     stroke_detail = stroke_detail if stroke_detail in {"light", "standard", "detailed", "full"} else "detailed"
     task_name = normalized_task_name(task_name, script, job_id)
     now = time.time()
@@ -2906,6 +2957,7 @@ async def create_job(
             "job_type": "infographic" if reference_mode == "infographic" else "generate", "style": style, "scenes_per_image": scenes_per_image,
             "pipeline_version": PIPELINE_VERSION if reference_mode == "infographic" else "standard_v1",
             "reference_mode": reference_mode, "character_count": len(visual_references.get("characters", [])),
+            "aspect_ratio": aspect_ratio,
             "visual_references": visual_references,
             "task_name": task_name,
             "voice_mode": voice_mode,
@@ -3021,6 +3073,7 @@ def get_job_parameters(job_id: str) -> dict[str, Any]:
         "reference_mode": reference_mode,
         "style": str(source.get("style") or DEFAULT_STYLE),
         "scenes_per_image": max(1, min(4, int(source.get("scenes_per_image", 1)))),
+        "aspect_ratio": normalize_aspect_ratio(source.get("aspect_ratio")),
         "task_name": str(selected.get("task_name") or source.get("task_name") or ""),
         "pen_text": str(selected.get("pen_text", source.get("pen_text", ""))),
         "include_key_text": bool(selected.get("include_key_text", source.get("include_key_text", True))),
@@ -3205,6 +3258,7 @@ def create_rerender(job_id: str, payload: dict[str, Any], request: Request) -> d
             "client_ip": request_client_ip(request),
             "job_type": "rerender", "rerender_of": job_id, "style": source.get("style", ""),
             "reference_mode": source.get("reference_mode", "standard"),
+            "aspect_ratio": normalize_aspect_ratio(source.get("aspect_ratio")),
             "voice_mode": source.get("voice_mode", "clone"),
             "pipeline_version": PIPELINE_VERSION if is_infographic_job(job_id) else source.get("pipeline_version", "standard_v1"),
             "task_name": task_name,
