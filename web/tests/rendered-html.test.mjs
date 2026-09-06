@@ -76,3 +76,10 @@ test("auto-detects only the edited text or image relay model after saving", asyn
   assert.match(page, /void detectChangedServiceModels\(snapshot\)/);
   assert.match(page, /图片节点.*已自动识别并更正|kind==="text"\?"文本":"图片"/);
 });
+
+test("creates text and image relay nodes without copying an existing endpoint", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const addService = page.match(/const addService=.*?;\r?\n/)?.[0] || "";
+  assert.match(addService, /base_url:"",api_key:""/);
+  assert.doesNotMatch(addService, /fallback/);
+});
