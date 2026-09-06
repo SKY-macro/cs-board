@@ -122,7 +122,8 @@ class QueueResumeTests(unittest.TestCase):
     def test_clear_japanese_storybook_style_is_visual_only(self) -> None:
         recipe = SERVER.style_recipe("清透日系生活绘本")
         self.assertIn("黑灰墨线", recipe)
-        self.assertIn("透明水彩叠加轻薄彩铅", recipe)
+        self.assertIn("干净数字淡彩", recipe)
+        self.assertIn("禁止泛黄纸纹", recipe)
         self.assertIn("只能来自当前分镜", recipe)
         self.assertNotIn("书包", recipe)
         self.assertNotIn("玄关", recipe)
