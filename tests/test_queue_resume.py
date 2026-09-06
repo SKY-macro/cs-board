@@ -88,7 +88,8 @@ class QueueResumeTests(unittest.TestCase):
             SERVER.PAPER_METAPHOR_STYLE,
             "输入图仅作为纸艺风格参考。",
         )
-        self.assertIn("动物、人物身份与年龄不得被替换", prompt)
+        self.assertIn("小猴低头道歉", prompt)
+        self.assertIn(SERVER.IDENTITY_PROMPTS["consistent"], prompt)
         self.assertNotIn("同一主角固定为：中国青年男性", prompt)
 
     def test_unknown_style_never_silently_falls_back(self) -> None:
@@ -130,10 +131,10 @@ class QueueResumeTests(unittest.TestCase):
         self.assertIn("颜色只用于人物服装和剧情核心道具", recipe)
         self.assertIn("背景建筑、家具、地面、天空和植物一律不着色", recipe)
         self.assertIn("纯白面积不少于 80%", recipe)
-        self.assertIn("禁止蜡笔颗粒", recipe)
-        self.assertIn("禁止泛黄纸纹", recipe)
+        self.assertIn("蜡笔或炭笔颗粒", recipe)
+        self.assertIn("泛黄纸纹", recipe)
         self.assertIn("禁止 Q 版", recipe)
-        self.assertIn("禁止风景绘本式铺满背景", recipe)
+        self.assertIn("风景绘本式铺满背景", recipe)
         self.assertIn("只能来自当前分镜", recipe)
         self.assertNotIn("偏大的圆头", recipe)
         self.assertNotIn("短而紧凑的身体", recipe)
@@ -147,8 +148,8 @@ class QueueResumeTests(unittest.TestCase):
             aspect_ratio="9:16",
             presentation_mode="story-color",
         )
-        self.assertIn("人物位置、景别和构图服从当前剧情", prompt)
-        self.assertIn("人物身份、数量、年龄和性别严格来自原文", prompt)
+        self.assertIn("构图服从剧情", prompt)
+        self.assertIn(SERVER.IDENTITY_PROMPTS["consistent"], prompt)
         self.assertNotIn("同一主角固定为：中国青年男性", prompt)
         self.assertIn("两人站立交谈", prompt)
         self.assertLessEqual(len(prompt), 1200)
@@ -157,9 +158,9 @@ class QueueResumeTests(unittest.TestCase):
         paths, instruction = SERVER.clear_storybook_reference_context()
         self.assertEqual(paths, [SERVER.CLEAR_STORYBOOK_REFERENCE_PATH])
         self.assertTrue(paths[0].is_file())
-        self.assertIn("人物造型语法", instruction)
+        self.assertIn("人物造型", instruction)
         self.assertIn("不得复制", instruction)
-        self.assertIn("身份、数量、服装、动作、道具和场景", instruction)
+        self.assertIn("身份、数量、服装、动作、道具、场景或构图", instruction)
 
         prompt = SERVER.build_board_prompt(
             [{
@@ -176,7 +177,34 @@ class QueueResumeTests(unittest.TestCase):
         self.assertLessEqual(len(prompt), 1000)
         self.assertEqual(prompt.count(instruction), 1)
         self.assertIn("爸爸背着风筝", prompt)
-        self.assertIn("人物身份、数量、年龄和性别严格来自原文", prompt)
+        self.assertIn(SERVER.IDENTITY_PROMPTS["consistent"], prompt)
+
+    def test_identity_modes_are_mutually_exclusive_in_image_prompts(self) -> None:
+        scene = [{"title": "相遇", "concept": "主角走进房间", "elements": ["主角推门"], "text": "主角回来了。"}]
+        prompts = {
+            mode: SERVER.build_board_prompt(scene, SERVER.DEFAULT_STYLE, identity_mode=mode)
+            for mode in ("consistent", "male", "female")
+        }
+        self.assertIn(SERVER.IDENTITY_PROMPTS["consistent"], prompts["consistent"])
+        self.assertIn(SERVER.IDENTITY_PROMPTS["male"], prompts["male"])
+        self.assertIn(SERVER.IDENTITY_PROMPTS["female"], prompts["female"])
+        for mode, prompt in prompts.items():
+            for other_mode, other_prompt in SERVER.IDENTITY_PROMPTS.items():
+                if other_mode != mode:
+                    self.assertNotIn(other_prompt, prompt)
+
+    def test_identity_mode_defaults_to_consistent_and_persists_in_job_parameters(self) -> None:
+        with TestClient(SERVER.app) as client:
+            response = client.post("/api/jobs", data={
+                "copy": "这是一段用来验证默认人物身份策略的完整测试文案。",
+                "voice_mode": "none",
+            })
+            self.assertEqual(response.status_code, 200, response.text)
+            job_id = response.json()["id"]
+            self.assertEqual(SERVER.JOBS[job_id]["identity_mode"], "consistent")
+            parameters = client.get(f"/api/jobs/{job_id}/parameters")
+        self.assertEqual(parameters.status_code, 200, parameters.text)
+        self.assertEqual(parameters.json()["identity_mode"], "consistent")
 
     def test_specialized_codex_review_model_is_not_a_text_candidate(self) -> None:
         catalog = SERVER.build_model_catalog(

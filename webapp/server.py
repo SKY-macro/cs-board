@@ -57,6 +57,16 @@ DEFAULT_CONFIG = {
 DEFAULT_STYLE = "极简粗线简笔白板风"
 INFOGRAPHIC_STYLE = "国风动态信息图"
 CLEAR_STORYBOOK_STYLE = "清透日系生活绘本"
+DEFAULT_IDENTITY_MODE = "consistent"
+IDENTITY_PROMPTS = {
+    "consistent": (
+        "同一角色跨分镜保持身份、基础脸型、眼睛形状、发色和标志性特征一致。"
+        "年龄、身高、体型、发型、服装和当前状态默认延续上一分镜；只有原文明示或剧情必然包含时间跳跃、成长、衰老、换装、受伤等变化时才允许更新。"
+        "发生变化时，只改变剧情要求改变的属性，其余身份锚点必须保留，确保仍能一眼认出是同一个人。不得因为地点、动作或镜头变化而重新设计角色。"
+    ),
+    "male": "同一主角固定为：中国青年男性，短黑发，朴素深色上衣，普通人形象；所有分镜中的年龄与外貌保持一致。",
+    "female": "同一主角固定为：中国青年女性，自然黑色齐肩发，朴素深色上衣，普通人形象；所有分镜中的年龄与外貌保持一致。",
+}
 STYLE_PRESETS = {
     INFOGRAPHIC_STYLE: (
         "暖米白宣纸背景，深灰正文与朱红重点，低饱和靛青辅助色；"
@@ -131,12 +141,12 @@ STYLE_PRESETS = {
     CLEAR_STORYBOOK_STYLE: (
         "纯白无纸纹数字页；纤细清晰、略有手绘起伏的黑灰墨线，外轮廓克制，内部仅少量发丝、衣褶和接地线。"
         "人物为自然纤细的现代生活绘本比例：成年人约 5～6 头身，儿童约 4～5 头身；头部仅轻度放大，肩颈、手脚和四肢完整，绝不短胖幼态。"
-        "柔和短椭圆脸并保留宽阔面部空白；小型黑色竖椭圆或圆点眼，一笔短鼻，细小嘴眉；无彩色虹膜、闪亮大眼、浓睫毛和尖下巴。"
+        "柔和短椭圆脸、大面积面部留白；小型黑色竖椭圆或圆点眼，一笔短鼻、细小嘴眉；无彩色虹膜、大眼、浓睫毛和尖下巴。"
         "头发为轮廓明确的深色块面，以少量细碎发束收边，不画蓬松尖刺发型。肤色极淡，腮红近乎不可见。"
         "颜色只用于人物服装和剧情核心道具：整洁的低饱和哑光平涂、局部极淡排线；无水彩、颗粒和体积光。"
-        "人物位置、景别和构图服从当前剧情；优先完整全身或四分之三身平视群像。背景建筑、家具、地面、天空和植物一律不着色，仅留必要黑灰细线；纯白面积不少于 80%。"
+        "构图服从剧情，优先完整全身或四分之三身平视群像。背景建筑、家具、地面、天空和植物一律不着色，仅留黑灰细线；纯白面积不少于 80%。"
         "人物场景内容只能来自当前分镜，不继承风格图内容。"
-        "禁止 Q 版、chibi、婴儿肥和短粗身体；不默认背影视角或电影运镜。禁止风景绘本式铺满背景、繁茂植物、空气透视、柔焦、渐变；禁止泛黄纸纹、禁止蜡笔颗粒、炭笔噪点、强光影、3D、写实摄影、文字和水印。"
+        "禁止 Q 版、chibi、短胖身体、默认背影、电影运镜、风景绘本式铺满背景、空气透视、柔焦、渐变、泛黄纸纹、蜡笔或炭笔颗粒、强光影、3D、写实摄影、文字和水印。"
     ),
 }
 
@@ -161,6 +171,15 @@ def normalize_aspect_ratio(value: Any) -> str:
 def normalize_presentation_mode(value: Any) -> str:
     mode = str(value or "whiteboard").strip()
     return mode if mode in {"whiteboard", "story-color"} else "whiteboard"
+
+
+def normalize_identity_mode(value: Any) -> str:
+    mode = str(value or DEFAULT_IDENTITY_MODE).strip().lower()
+    return mode if mode in IDENTITY_PROMPTS else DEFAULT_IDENTITY_MODE
+
+
+def identity_prompt(value: Any) -> str:
+    return IDENTITY_PROMPTS[normalize_identity_mode(value)]
 
 
 def aspect_video_dimensions(value: Any) -> tuple[int, int]:
@@ -309,9 +328,8 @@ def clear_storybook_reference_context() -> tuple[list[Path], str]:
     if not valid_image_file(CLEAR_STORYBOOK_REFERENCE_PATH):
         raise RuntimeError("清透日系生活绘本的本地风格参考图缺失")
     instruction = (
-        "输入图仅定义清透日系生活绘本的视觉语法，重点迁移人物造型语法、自然头身比例、小型克制五官、"
-        "纤细黑灰线、人物和核心道具的低饱和平涂、背景纯线稿。"
-        "当前分镜决定全部内容；不得复制参考图中的人物身份、数量、服装、动作、道具和场景，也不得固定成家庭或门口构图。"
+        "输入图只定义人物造型、头身、五官、线条、人物与核心道具配色及背景纯线稿；"
+        "当前分镜决定内容，不得复制图中人物身份、数量、服装、动作、道具、场景或构图。"
     )
     return [CLEAR_STORYBOOK_REFERENCE_PATH], instruction
 
@@ -1377,6 +1395,7 @@ def make_plan(
     job_id: str | None = None,
     infographic: bool = False,
     phrase_timeline: dict[str, Any] | None = None,
+    identity_mode: str = DEFAULT_IDENTITY_MODE,
 ) -> list[dict[str, Any]]:
     # The copy decides how many meaningful scenes exist. Duration only caps
     # their density so short narration never receives too many images.
@@ -1390,15 +1409,7 @@ def make_plan(
     fixed_segments = "\n".join(f"第{i + 1}幕原文：{text}" for i, text in enumerate(segments))
     character_rule = (
         f"可用人物如下：{character_context}。根据原文语义选择出场人物，并在 title、concept 和 elements 中写明人物名称；不得改变人物身份与外观。"
-        if character_context else
-        "原文指定的人物或动物身份必须优先保持；没有指定身份且确实需要讲解角色时，使用戴细圆框眼镜的圆头极简线人。"
-        "暖黄色边牧只在陪伴、协作或生活化角色场景中出现，抽象机制页不要强塞人物或宠物。同一角色外观保持一致。"
-        if style == OIL_VISUAL_STYLE else
-        "主角必须严格来自原文；原文是动物就保持该动物，原文没有指定身份时才使用普通中国青年。所有分镜中的同一角色外观保持一致。"
-        if style == PAPER_METAPHOR_STYLE else
-        "人物身份、数量、年龄和性别严格来自原文，不得擅自替换成固定青年男性；成年人、儿童和老人必须保持各自年龄比例，同一角色跨分镜保持外貌与服装一致。"
-        if style == CLEAR_STORYBOOK_STYLE else
-        "同一位主角始终是“中国青年男性，短黑发，朴素深色上衣”，人物外观必须保持一致。"
+        if character_context else identity_prompt(identity_mode)
     )
     paper_rule = (
         "额外为每幕输出 visual_structure 和 metaphor：visual_structure 只能从定义、流程、对比、层级、因果、清单、时间、矩阵中选择一项；"
@@ -1418,6 +1429,7 @@ def make_plan(
         )
         prompt = f"""你是中文口播动态 PPT 的内容编辑。短语与真实音频时间已经在上一步确定；你只梳理页面结构，不得重新估算时间。
 总口播时长约 {duration:.1f} 秒，最多 {requested_count} 页。画面风格和插图在后续步骤处理。
+人物身份策略：{character_rule}
 
 分页原则：
 1. 一般用本页第一条短语作为中心句的依据，浓缩为 page_title；关键词只辅助中心句，不得抢成另一套观点。
@@ -1504,58 +1516,56 @@ elements 必须是恰好 3 个具体可画的中文短语，按叙事顺序排�
     return scenes
 
 
-def build_image_prompt(scene: dict[str, Any], style: str, aspect_ratio: str = "16:9") -> str:
+def build_image_prompt(scene: dict[str, Any], style: str, aspect_ratio: str = "16:9", identity_mode: str = DEFAULT_IDENTITY_MODE) -> str:
     labels = scene.get("elements") or [scene.get("title", "场景主体")]
     count = len(labels)
     lanes = "；".join(f"第{i + 1}区：{label}" for i, label in enumerate(labels))
-    character_instruction = (
-        "原文指定的人物或动物身份优先；没有指定身份且确实需要通用讲解角色时，才使用戴细圆框眼镜的圆头极简线人。暖黄边牧仅在语义合适时陪伴，不强制出现。"
-        if style == OIL_VISUAL_STYLE else
-        "人物身份、数量、年龄和性别严格来自原文；所有人物都执行视觉配方中的自然头身、小型五官和深色块面头发，同一角色的脸型、发型、年龄与服装保持一致。"
-        if style == CLEAR_STORYBOOK_STYLE else
-        "同一主角固定为：中国青年男性，短黑发，朴素深色上衣，普通人形象；不要改变年龄与外貌。"
-    )
+    character_instruction = identity_prompt(identity_mode)
     aspect_ratio = normalize_aspect_ratio(aspect_ratio)
     layout_direction = "从上到下" if aspect_ratio in {"9:16", "3:4"} else "从左到右"
     return f"""生成一张用于中文口播的 {aspect_ratio} 白板动画分镜原画。
 风格名称：{style}。
+{character_instruction}
 视觉配方：{style_recipe(style)}
 必须严格执行这套视觉配方，不得自动改回其他白板风格；人物、物体和配色都要让所选风格一眼可辨。
 本幕标题：{scene.get('title', '')}
 本幕叙事：{scene.get('concept', '')}
 本幕原文：{scene.get('text', '')}
 必须严格表现本幕叙事，不得生成童年成长、旅行、花鸟、山水、宠物等无关意象。
-{character_instruction}
 构图必须{layout_direction}平均分成 {count} 个互不重叠的独立小场景，每区主体居中，区间有明显留白：{lanes}。
 必须把上述每个元素都画出来，顺序不得改变；任何人物或物体不得跨越相邻区域。
 主体整体垂直居中并略微靠上，主要人物和物体中心位于画面高度 42%～48%，顶部不得出现大面积无意义空白。
 禁止任何文字、字母、数字、Logo、水印、边框、对话框和装饰性填充。画面底部保留约 16% 空白作为字幕安全区。"""
 
 
-def build_board_prompt(scenes: list[dict[str, Any]], style: str, reference_instruction: str = "", use_character_references: bool = False, infographic: bool = False, aspect_ratio: str = "16:9", presentation_mode: str = "whiteboard") -> str:
+def build_board_prompt(scenes: list[dict[str, Any]], style: str, reference_instruction: str = "", use_character_references: bool = False, infographic: bool = False, aspect_ratio: str = "16:9", presentation_mode: str = "whiteboard", identity_mode: str = DEFAULT_IDENTITY_MODE) -> str:
     aspect_ratio = normalize_aspect_ratio(aspect_ratio)
     layout_direction = "从上到下" if aspect_ratio in {"9:16", "3:4"} else "从左到右"
     if infographic:
         scene = scenes[0]
         elements = "、".join(scene.get("illustration_elements") or scene.get("nodes") or [])
         reference_block = f"视觉参考使用规则：{reference_instruction}\n" if reference_instruction else ""
+        character_instruction = identity_prompt(identity_mode)
         return f"""生成一张 {aspect_ratio} 中文知识解说视频的独立插画素材。
 所选画面风格：{style}。视觉配方：{style_recipe(style)}
+人物身份策略：{character_instruction}
 {reference_block}必须让画面在 3 秒内认出主体、10 秒内看懂观点证据；不是装饰性配图。
 画面只画以下具象内容：{elements}。对应观点：{scene.get('concept', '')}。
 PPT 已确定的视觉策略：{scene.get('visual_strategy', '左侧文字，右侧主题插图')}。
 插图槽位类型：{scene.get('layout_type', 'focus')} / {scene.get('composition', 'split-right')}。主体比例应适应该槽位；横向通栏可画并列主体，中心舞台突出单一隐喻，分栏槽位保持竖向紧凑。
-插画必须是独立、自然融入背景的视觉证据，不画圆角卡片、照片框、界面面板；不要强制添加讲解者或青年男性。
+插画必须是独立、自然融入背景的视觉证据，不画圆角卡片、照片框、界面面板。
 这张图只填入 Remotion PPT 已经确定的插图区域，不负责表达页面结构。禁止箭头、连接线、流程线、项目符号和图表关系。
 画面四周保留充足留白，主体不要贴边。禁止任何文字、字母、数字、Logo、水印、边框、字幕和 UI；只有原文确实需要人物时才画人物。"""
     panels: list[str] = []
     for i, scene in enumerate(scenes, 1):
         elements = "、".join(scene.get("elements") or [])
-        panels.append(
-            f"第{i}区｜标题：{scene.get('title', '')}｜事件：{scene.get('concept', '')}｜"
-            f"主结构：{scene.get('visual_structure', '')}｜核心隐喻：{scene.get('metaphor', '')}｜"
-            f"必须包含：{elements}｜对应原文：{scene.get('text', '')}"
-        )
+        fields = [f"第{i}区｜事件：{scene.get('concept', '')}"]
+        if scene.get("visual_structure"):
+            fields.append(f"主结构：{scene['visual_structure']}")
+        if scene.get("metaphor"):
+            fields.append(f"核心隐喻：{scene['metaphor']}")
+        fields.extend((f"必须包含：{elements}", f"对应原文：{scene.get('text', '')}"))
+        panels.append("｜".join(fields))
     panel_text = "\n".join(panels)
     style_instruction = (
         f"视觉配方：{style_recipe(style)}"
@@ -1566,18 +1576,11 @@ PPT 已确定的视觉策略：{scene.get('visual_strategy', '左侧文字，右
     )
     character_instruction = (
         "只使用人物参考组中定义的角色；人物出现时必须保持对应参考图的脸型、发型、年龄、服装和标志性特征一致。"
-        if use_character_references else
-        "原文指定的人物或动物身份优先；未指定身份且确实需要通用角色时才使用戴细圆框眼镜的圆头极简线人，暖黄边牧仅在语义合适时作为陪伴角色。"
-        if style == OIL_VISUAL_STYLE else
-        "主角必须严格来自原文；动物、人物身份与年龄不得被替换，同一角色在所有分镜中保持一致。"
-        if style == PAPER_METAPHOR_STYLE else
-        "人物身份、数量、年龄和性别严格来自原文；同一角色跨分镜保持脸型、发型、年龄与服装一致。"
-        if style == CLEAR_STORYBOOK_STYLE else
-        "同一主角固定为：中国青年男性，短黑发，朴素深色上衣，普通人形象；所有分镜中的年龄与外貌保持一致。"
+        if use_character_references else identity_prompt(identity_mode)
     )
     reference_block = f"参考图说明：\n{reference_instruction}\n" if reference_instruction else ""
     region_rule = (
-        "画面是一个完整场景，不分栏、不画边框。"
+        "完整场景，不分栏、不画边框。"
         if len(scenes) == 1 else
         f"画面必须{layout_direction}平均分成 {len(scenes)} 个互不重叠的叙事区域，不画边框；每区内部可以组合人物、动作和关键物体，但不得跨区。"
     )
@@ -1587,8 +1590,8 @@ PPT 已确定的视觉策略：{scene.get('visual_strategy', '左侧文字，右
         layout_rule = "所有区域的主体垂直居中并略微靠上，主要人物和物体中心位于画面高度 42%～48%，顶部不得出现大面积无意义空白。画面底部保留约 16% 空白作为字幕安全区。"
     return f"""{reference_block}生成一张用于中文口播的 {aspect_ratio} 白板动画原画，一张图承载 {len(scenes)} 个连续分镜。
 风格名称：{style}。
-{style_instruction}
 {character_instruction}
+{style_instruction}
 {region_rule}
 {panel_text}
 严格表现上述事件，不得生成原文没有的童年成长、旅行、花鸟、山水、宠物或装饰性意象。
@@ -2250,6 +2253,7 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path | None, scen
         reference_images, reference_instruction, character_context = custom_reference_context(job_id)
         infographic = is_infographic_job(job_id)
         presentation_mode = normalize_presentation_mode(JOBS.get(job_id, {}).get("presentation_mode"))
+        identity_mode = normalize_identity_mode(JOBS.get(job_id, {}).get("identity_mode"))
 
         phrase_timeline: dict[str, Any] | None = None
         if infographic:
@@ -2300,7 +2304,7 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path | None, scen
                 scenes = []
         if not scenes:
             begin_phase(job_id, "planning", "内容结构", "正在浓缩中心句、列出关键词并规划 PPT 页面", 25)
-            scenes = make_plan(config, copy, duration, style, character_context, job_id, infographic, phrase_timeline)
+            scenes = make_plan(config, copy, duration, style, character_context, job_id, infographic, phrase_timeline, identity_mode)
             ensure_job_active(job_id)
             atomic_write_json(plan_path, scenes)
         else:
@@ -2353,7 +2357,7 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path | None, scen
             elif style == CLEAR_STORYBOOK_STYLE and not board_images:
                 board_images, board_instruction = clear_storybook_reference_context()
                 use_character_references = False
-            board_prompt = build_board_prompt(board, style, board_instruction, use_character_references, infographic, aspect_ratio, presentation_mode)
+            board_prompt = build_board_prompt(board, style, board_instruction, use_character_references, infographic, aspect_ratio, presentation_mode, identity_mode)
             board_specs.append((board_images, board_instruction, board_prompt))
         update_job(job_id, duration=duration, scenes=len(scenes), boards=len(boards), checkpoint="plan_done")
         atomic_write_json(job_dir / "boards.json", [
@@ -3039,6 +3043,7 @@ async def create_job(
     include_subtitles: bool = Form(True),
     stroke_detail: str = Form("detailed"),
     presentation_mode: str = Form("whiteboard"),
+    identity_mode: str = Form(DEFAULT_IDENTITY_MODE),
     voice_mode: str = Form("clone"),
     reference: UploadFile | None = File(None),
     reference_mode: str = Form("standard"),
@@ -3131,6 +3136,7 @@ async def create_job(
     aspect_ratio = normalize_aspect_ratio(aspect_ratio)
     stroke_detail = stroke_detail if stroke_detail in {"light", "standard", "detailed", "full"} else "detailed"
     presentation_mode = normalize_presentation_mode(presentation_mode)
+    identity_mode = normalize_identity_mode(identity_mode)
     if presentation_mode == "story-color":
         aspect_ratio = "3:4"
         scenes_per_image = 1
@@ -3151,6 +3157,7 @@ async def create_job(
             "visual_references": visual_references,
             "task_name": task_name,
             "voice_mode": voice_mode,
+            "identity_mode": identity_mode,
             "copy": script.strip(),
             "pen_text": pen_text.strip()[:12], "include_key_text": include_key_text,
             "include_subtitles": include_subtitles,
@@ -3270,6 +3277,7 @@ def get_job_parameters(job_id: str) -> dict[str, Any]:
         "include_subtitles": bool(selected.get("include_subtitles", source.get("include_subtitles", True))),
         "stroke_detail": str(selected.get("stroke_detail", source.get("stroke_detail", "detailed"))),
         "presentation_mode": normalize_presentation_mode(selected.get("presentation_mode", source.get("presentation_mode"))),
+        "identity_mode": normalize_identity_mode(source.get("identity_mode")),
         "reference": asset_descriptor(source_id, reference.name if reference else None),
         "style_reference": asset_descriptor(source_id, style_filename),
         "characters": characters,

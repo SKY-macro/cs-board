@@ -103,3 +103,13 @@ test("shows callable versus configured relay counts for text and images", async 
   assert.match(page, /可调用 \{textAvailability\.ready\}\/\{textAvailability\.total\}/);
   assert.match(page, /可调用 \{imageAvailability\.ready\}\/\{imageAvailability\.total\}/);
 });
+
+test("offers three mutually exclusive identity prompt modes and persists the choice", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.match(page, /type IdentityMode="consistent"\|"male"\|"female"/);
+  assert.match(page, /身份一致（默认）/);
+  assert.match(page, /默认男主角/);
+  assert.match(page, /默认女主角/);
+  assert.match(page, /body\.append\("identity_mode",identityMode\)/);
+  assert.match(page, /setIdentityMode\(normalizeIdentityMode\(data\.identity_mode\)\)/);
+});
