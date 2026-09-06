@@ -773,18 +773,43 @@ def provider_text(config: dict[str, Any], model: str, prompt: str, timeout: floa
     last_error: Exception | None = None
     for index, candidate in enumerate(candidates):
         try:
-            return provider_text_once(config, candidate, prompt, timeout=timeout, job_id=job_id)
+            payload = provider_text_once(config, candidate, prompt, timeout=timeout, job_id=job_id)
+            actual_model = str(payload.get("model") or candidate)
+            if job_id and job_id in JOBS:
+                update_job(job_id, text_model=actual_model)
+            return payload
         except ProviderHTTPError as exc:
             last_error = exc
-            message = str(exc).lower()
-            unavailable = exc.status_code in {429, 500, 502, 503, 504} and any(token in message for token in (
-                "rate limit", "rate_limit", "model_not_found", "no available channel", "get_channel_failed", "upstream",
-            ))
+            unavailable = exc.status_code in {429, 500, 502, 503, 504}
             if not unavailable or index == len(candidates) - 1:
                 raise
             if job_id and job_id in JOBS:
                 update_job(job_id, stage=f"模型 {candidate} 暂不可用，自动切换到 {candidates[index + 1]}")
     raise RuntimeError(f"没有可用的文本模型：{last_error}")
+
+
+def provider_image(config: dict[str, Any], endpoint: str, payload: dict[str, Any], timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
+    """Call an image endpoint using the candidates advertised by that image provider."""
+    selected = str(payload.get("model") or config.get("image_model") or "")
+    advertised = [str(item) for item in config.get("_image_models", []) if str(item)]
+    candidates = [selected, *(item for item in advertised if item != selected)]
+    last_error: Exception | None = None
+    for index, candidate in enumerate(candidates):
+        request_payload = {**payload, "model": candidate}
+        try:
+            response_payload = provider_post(config, endpoint, request_payload, timeout=timeout, job_id=job_id)
+            actual_model = str(response_payload.get("model") or candidate)
+            if job_id and job_id in JOBS:
+                update_job(job_id, image_model=actual_model)
+            return response_payload
+        except ProviderHTTPError as exc:
+            last_error = exc
+            unavailable = exc.status_code in {429, 500, 502, 503, 504}
+            if not unavailable or index == len(candidates) - 1:
+                raise
+            if job_id and job_id in JOBS:
+                update_job(job_id, stage=f"图片模型 {candidate} 暂不可用，自动切换到 {candidates[index + 1]}")
+    raise RuntimeError(f"没有可用的图片模型：{last_error}")
 
 
 def provider_models(config: dict[str, Any], timeout: float = 30) -> set[str]:
@@ -875,6 +900,7 @@ def resolve_configured_models(config: dict[str, Any]) -> dict[str, Any]:
             catalog = build_model_catalog(image_models, str(resolved["text_model"]), str(config["image_model"]))
             if catalog["image_models"]:
                 resolved["image_model"] = catalog["selected_image_model"]
+                resolved["_image_models"] = [catalog["selected_image_model"], *(model for model in catalog["image_models"] if model != catalog["selected_image_model"])]
     except Exception:
         pass
     return resolved
@@ -1406,12 +1432,12 @@ def generate_image(config: dict[str, Any], prompt: str, target: Path, reference_
         payload = response.json()
     else:
         try:
-            payload = provider_post(config, "images/generations", request_payload, timeout=1800, job_id=job_id)
+            payload = provider_image(config, "images/generations", request_payload, timeout=1800, job_id=job_id)
         except ProviderHTTPError as exc:
             if exc.status_code not in {404, 405}:
                 raise
             # OpenLux currently also documents GPT Image 2 creation on this route.
-            payload = provider_post(config, "images/edits", request_payload, timeout=1800, job_id=job_id)
+            payload = provider_image(config, "images/edits", request_payload, timeout=1800, job_id=job_id)
     candidates = payload.get("data") or payload.get("choices") or []
     if not candidates:
         raise RuntimeError("GPT Image 2 没有返回图像数据")

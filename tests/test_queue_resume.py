@@ -252,6 +252,51 @@ class QueueResumeTests(unittest.TestCase):
         self.assertEqual(payload["output_text"], "ok")
         self.assertEqual([call.args[1] for call in request.call_args_list], ["gpt-5.4", "gpt-4o"])
 
+    def test_text_provider_falls_back_on_generic_service_unavailable(self) -> None:
+        unavailable = SERVER.ProviderHTTPError(503, "Service temporarily unavailable")
+        with mock.patch.object(SERVER, "provider_text_once", side_effect=[unavailable, {"model": "gpt-5.5", "output_text": "ok"}]) as request:
+            payload = SERVER.provider_text(
+                {"api_key": "test", "base_url": "https://relay.example/v1", "_text_models": ["gpt-5.4", "gpt-5.5"]},
+                "gpt-5.4",
+                "hello",
+            )
+        self.assertEqual(payload["output_text"], "ok")
+        self.assertEqual([call.args[1] for call in request.call_args_list], ["gpt-5.4", "gpt-5.5"])
+
+    def test_resolved_models_follow_each_provider_response(self) -> None:
+        config = {
+            "api_key": "text-key",
+            "base_url": "https://text.example/v1",
+            "text_model": "manual-text-model",
+            "image_api_key": "image-key",
+            "image_base_url": "https://image.example/v1",
+            "image_model": "manual-image-model",
+        }
+        with mock.patch.object(
+            SERVER,
+            "provider_models",
+            side_effect=[{"gpt-5.5", "text-embedding-3-small"}, {"gpt-image-2", "dall-e-3"}],
+        ):
+            resolved = SERVER.resolve_configured_models(config)
+        self.assertEqual(resolved["text_model"], "gpt-5.5")
+        self.assertEqual(resolved["image_model"], "gpt-image-2")
+        self.assertEqual(resolved["_text_models"][0], "gpt-5.5")
+        self.assertEqual(resolved["_image_models"][0], "gpt-image-2")
+
+    def test_image_provider_uses_response_candidates_and_records_actual_model(self) -> None:
+        unavailable = SERVER.ProviderHTTPError(503, "Service temporarily unavailable")
+        SERVER.JOBS["image-job"] = self.job("image-job")
+        with mock.patch.object(SERVER, "provider_post", side_effect=[unavailable, {"model": "gpt-image-2-live", "data": [{}]}]) as request:
+            payload = SERVER.provider_image(
+                {"api_key": "test", "base_url": "https://relay.example/v1", "image_model": "gpt-image-1", "_image_models": ["gpt-image-1", "gpt-image-2"]},
+                "images/generations",
+                {"model": "gpt-image-1", "prompt": "hello"},
+                job_id="image-job",
+            )
+        self.assertEqual(payload["model"], "gpt-image-2-live")
+        self.assertEqual([call.args[2]["model"] for call in request.call_args_list], ["gpt-image-1", "gpt-image-2"])
+        self.assertEqual(SERVER.JOBS["image-job"]["image_model"], "gpt-image-2-live")
+
     def test_config_returns_full_keys_for_plaintext_settings(self) -> None:
         visible = SERVER.safe_config({"api_key": "text-secret", "image_api_key": "image-secret"})
         self.assertEqual(visible["api_key"], "text-secret")
