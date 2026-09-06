@@ -113,3 +113,17 @@ test("offers three mutually exclusive identity prompt modes and persists the cho
   assert.match(page, /body\.append\("identity_mode",identityMode\)/);
   assert.match(page, /setIdentityMode\(normalizeIdentityMode\(data\.identity_mode\)\)/);
 });
+
+test("keeps prompt editing inside task details and separates select from zoom", async () => {
+  const [page, css] = await Promise.all([
+    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/brand.css", import.meta.url), "utf8"),
+  ]);
+  assert.match(page, /onClick=\{\(\)=>selectGalleryPrompt\(image\)\}/);
+  assert.match(page, /onDoubleClick=\{\(\)=>setPreviewImage\(image\)\}/);
+  assert.match(page, /className="galleryExpand"/);
+  assert.match(page, /className="promptEditorEmbedded"/);
+  assert.doesNotMatch(page, /className="promptEditorPanel"/);
+  assert.match(css, /\.taskDetailDialog\s*\{[^}]*font-size:\s*15px/s);
+  assert.match(css, /\.galleryExpand\s*\{/);
+});
