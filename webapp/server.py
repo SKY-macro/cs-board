@@ -47,6 +47,8 @@ DEFAULT_CONFIG = {
     "image_model": "gpt-image-2",
     "image_base_url": "",
     "image_api_key": "",
+    "text_services": [],
+    "image_services": [],
     "tts_url": "http://127.0.0.1:7860",
     "tts_url_2": "",
     "tts_mode": "gradio",
@@ -126,6 +128,10 @@ STYLE_PRESETS = {
         "同时确保人物面部和关键物体清楚可读。"
     ),
 }
+
+MODEL_CATALOG_CACHE_TTL_SECONDS = 300
+MODEL_CATALOG_CACHE: dict[tuple[str, str], tuple[float, set[str]]] = {}
+MODEL_CATALOG_CACHE_LOCK = threading.Lock()
 
 HANDDRAWN_STYLE_LIBRARY_PATH = ROOT / "assets" / "story-handdrawn" / "handdrawn-style-library.json"
 HANDDRAWN_VISUAL_RECIPES_PATH = ROOT / "assets" / "story-handdrawn" / "visual-style-recipes.json"
@@ -724,6 +730,8 @@ def provider_post(config: dict[str, Any], endpoint: str, payload: dict[str, Any]
         except (httpx.TimeoutException, httpx.TransportError, ProviderHTTPError) as exc:
             last_error = exc
             retryable = not isinstance(exc, ProviderHTTPError) or exc.status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+            if isinstance(exc, ProviderHTTPError) and exc.status_code == 429:
+                retryable = False
             message = str(exc).lower()
             if isinstance(exc, ProviderHTTPError) and any(token in message for token in (
                 "upstream rate limit", "model_not_found", "no available channel", "get_channel_failed",
@@ -758,7 +766,7 @@ def provider_text_once(config: dict[str, Any], model: str, prompt: str, timeout:
     )
 
 
-def provider_text(config: dict[str, Any], model: str, prompt: str, timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
+def provider_text_single(config: dict[str, Any], model: str, prompt: str, timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
     """Call text generation and fail over across models advertised by a relay."""
     advertised = [str(item) for item in config.get("_text_models", []) if str(item)]
     candidates = [model, *(item for item in advertised if item != model)]
@@ -780,7 +788,23 @@ def provider_text(config: dict[str, Any], model: str, prompt: str, timeout: floa
     raise RuntimeError(f"没有可用的文本模型：{last_error}")
 
 
-def provider_image(config: dict[str, Any], endpoint: str, payload: dict[str, Any], timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
+def provider_text(config: dict[str, Any], model: str, prompt: str, timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
+    services = text_provider_configs(config)
+    last_error: Exception | None = None
+    for index, service in enumerate(services):
+        selected = str(service.get("model") or model)
+        try:
+            if index and job_id and job_id in JOBS:
+                update_job(job_id, stage=f"正在切换文本中转站 {index + 1}/{len(services)}")
+            return provider_text_single(service, selected, prompt, timeout=timeout, job_id=job_id)
+        except Exception as exc:
+            last_error = exc
+            if index == len(services) - 1:
+                raise
+    raise RuntimeError(f"所有文本中转站均调用失败：{last_error}")
+
+
+def provider_image_single(config: dict[str, Any], endpoint: str, payload: dict[str, Any], timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
     """Call an image endpoint using the candidates advertised by that image provider."""
     selected = str(payload.get("model") or config.get("image_model") or "")
     advertised = [str(item) for item in config.get("_image_models", []) if str(item)]
@@ -804,11 +828,69 @@ def provider_image(config: dict[str, Any], endpoint: str, payload: dict[str, Any
     raise RuntimeError(f"没有可用的图片模型：{last_error}")
 
 
+def provider_image(config: dict[str, Any], endpoint: str, payload: dict[str, Any], timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
+    services = image_provider_configs(config)
+    last_error: Exception | None = None
+    for index, service in enumerate(services):
+        request_payload = {**payload, "model": str(service.get("model") or payload.get("model") or config.get("image_model") or "")}
+        try:
+            if index and job_id and job_id in JOBS:
+                update_job(job_id, stage=f"正在切换图片中转站 {index + 1}/{len(services)}")
+            return provider_image_single(service, endpoint, request_payload, timeout=timeout, job_id=job_id)
+        except Exception as exc:
+            last_error = exc
+            if index == len(services) - 1:
+                raise
+    raise RuntimeError(f"所有图片中转站均调用失败：{last_error}")
+
+
+def provider_image_edit_once(config: dict[str, Any], form_data: dict[str, str], raw_files: list[tuple[str, bytes, str]], timeout: float = 1800) -> dict[str, Any]:
+    response: httpx.Response | None = None
+    with httpx.Client(timeout=timeout) as client:
+        for field_name in ("image", "image[]"):
+            files = [(field_name, (name, content, mime)) for name, content, mime in raw_files]
+            response = client.post(
+                f"{config['base_url'].rstrip('/')}/images/edits",
+                headers={"Authorization": f"Bearer {config['api_key']}"},
+                data=form_data,
+                files=files,
+            )
+            if not response.is_error or response.status_code not in {400, 422}:
+                break
+    if response is None or response.is_error:
+        status = response.status_code if response is not None else 500
+        detail = response.text[:800] if response is not None else "没有响应"
+        raise ProviderHTTPError(status, f"参考图调用失败：{status} {detail}")
+    return response.json()
+
+
+def provider_image_edit(config: dict[str, Any], form_data: dict[str, str], raw_files: list[tuple[str, bytes, str]], timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
+    services = image_provider_configs(config)
+    last_error: Exception | None = None
+    for index, service in enumerate(services):
+        selected_form = {**form_data, "model": str(service.get("model") or form_data.get("model") or "")}
+        try:
+            if index and job_id and job_id in JOBS:
+                update_job(job_id, stage=f"正在切换参考图中转站 {index + 1}/{len(services)}")
+            return provider_image_edit_once(service, selected_form, raw_files, timeout=timeout)
+        except Exception as exc:
+            last_error = exc
+            if index == len(services) - 1:
+                raise
+    raise RuntimeError(f"所有参考图中转站均调用失败：{last_error}")
+
+
 def provider_models(config: dict[str, Any], timeout: float = 30) -> set[str]:
     if not config.get("api_key"):
         raise RuntimeError("请先在 API 设置中填写 API Key")
     if not re.match(r"^https?://", str(config.get("base_url") or ""), flags=re.I):
         raise RuntimeError("接口地址必须以 http:// 或 https:// 开头")
+    cache_key = (str(config["base_url"]).rstrip("/"), str(config["api_key"]))
+    now = time.monotonic()
+    with MODEL_CATALOG_CACHE_LOCK:
+        cached = MODEL_CATALOG_CACHE.get(cache_key)
+        if cached and now - cached[0] < MODEL_CATALOG_CACHE_TTL_SECONDS:
+            return set(cached[1])
     with httpx.Client(timeout=timeout) as client:
         response = client.get(
             f"{config['base_url'].rstrip('/')}/models",
@@ -824,7 +906,10 @@ def provider_models(config: dict[str, Any], timeout: float = 30) -> set[str]:
             payload = response.json()
         except ValueError as exc:
             raise RuntimeError("模型列表接口没有返回有效 JSON，请检查接口地址是否包含正确的 /v1 路径") from exc
-    return {str(item.get("id")) for item in payload.get("data", []) if isinstance(item, dict) and item.get("id")}
+    models = {str(item.get("id")) for item in payload.get("data", []) if isinstance(item, dict) and item.get("id")}
+    with MODEL_CATALOG_CACHE_LOCK:
+        MODEL_CATALOG_CACHE[cache_key] = (time.monotonic(), set(models))
+    return models
 
 
 def _is_image_model(model: str) -> bool:
@@ -901,6 +986,24 @@ def resolve_configured_models(config: dict[str, Any]) -> dict[str, Any]:
     except Exception:
         pass
     return resolved
+
+
+def text_provider_configs(config: dict[str, Any]) -> list[dict[str, Any]]:
+    services = config.get("text_services")
+    if isinstance(services, list):
+        enabled = [dict(item) for item in services if isinstance(item, dict) and item.get("enabled", True) and item.get("base_url") and item.get("api_key") and item.get("model")]
+        if enabled:
+            return enabled
+    return [dict(config)]
+
+
+def image_provider_configs(config: dict[str, Any]) -> list[dict[str, Any]]:
+    services = config.get("image_services")
+    if isinstance(services, list):
+        enabled = [dict(item) for item in services if isinstance(item, dict) and item.get("enabled", True) and item.get("base_url") and item.get("api_key") and item.get("model")]
+        if enabled:
+            return enabled
+    return [image_provider_config(config)]
 
 
 def script_units(copy: str) -> list[str]:
@@ -989,8 +1092,8 @@ def split_script(copy: str, target_count: int) -> list[str]:
 
 
 def scene_limit_for_duration(duration: float) -> int:
-    """Duration is a ceiling only: never exceed eight scenes per minute."""
-    return max(1, int(max(0.0, duration) * 8 / 60))
+    """Allow up to ten scenes per minute, capped at twenty per task."""
+    return max(1, min(20, math.ceil(max(0.0, duration) * 10 / 60)))
 
 
 def numbered_section_topics(copy: str) -> list[str]:
@@ -1380,7 +1483,6 @@ PPT 已确定的视觉策略：{scene.get('visual_strategy', '左侧文字，右
 
 def generate_image(config: dict[str, Any], prompt: str, target: Path, reference_images: list[Path] | None = None, job_id: str | None = None) -> None:
     # OpenLux documents a 1000-character limit for this GPT Image route.
-    config = image_provider_config(config)
     compact_prompt = prompt if len(prompt) <= 1000 else f"{prompt[:830]}\n{prompt[-160:]}"
     request_payload = {
         "model": config["image_model"],
@@ -1391,42 +1493,9 @@ def generate_image(config: dict[str, Any], prompt: str, target: Path, reference_
         "format": "png",
     }
     if reference_images:
-        if not config.get("api_key"):
-            raise RuntimeError("请先在 API 设置中填写 OpenLux API Key")
         form_data = {key: str(value) for key, value in request_payload.items()}
         raw_files = [(path.name, path.read_bytes(), mimetypes.guess_type(path.name)[0] or "image/png") for path in reference_images]
-        response = None
-        last_transport_error: Exception | None = None
-        for attempt in range(3):
-            try:
-                with httpx.Client(timeout=1800) as client:
-                    for field_name in ("image", "image[]"):
-                        files = [(field_name, (name, content, mime)) for name, content, mime in raw_files]
-                        response = client.post(
-                            f"{config['base_url'].rstrip('/')}/images/edits",
-                            headers={"Authorization": f"Bearer {config['api_key']}"},
-                            data=form_data,
-                            files=files,
-                        )
-                        if not response.is_error or response.status_code not in {400, 422}:
-                            break
-                if response is not None and not response.is_error:
-                    break
-                retryable = response is not None and response.status_code in {408, 409, 425, 429, 500, 502, 503, 504}
-                if not retryable or attempt == 2:
-                    break
-            except (httpx.TimeoutException, httpx.TransportError) as exc:
-                last_transport_error = exc
-                if attempt == 2:
-                    raise
-            if job_id and job_id in JOBS:
-                update_job(job_id, stage=f"参考图模型暂时异常，正在自动重试 {attempt + 2}/3", model_retry_count=int(JOBS[job_id].get("model_retry_count", 0)) + 1)
-            time.sleep(provider_retry_delay(attempt))
-        if response is None or response.is_error:
-            status = response.status_code if response is not None else 500
-            detail = response.text[:800] if response is not None else str(last_transport_error or "没有响应")
-            raise ProviderHTTPError(status, f"OpenLux 参考图调用失败：{status} {detail}")
-        payload = response.json()
+        payload = provider_image_edit(config, form_data, raw_files, timeout=1800, job_id=job_id)
     else:
         try:
             payload = provider_image(config, "images/generations", request_payload, timeout=1800, job_id=job_id)
@@ -1962,7 +2031,9 @@ def voice_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_
 def model_stage(job_id: str, copy: str, style: str, reference: Path, scenes_per_image: int, pen_text: str, include_key_text: bool, include_subtitles: bool, stroke_detail: str) -> None:
     job_dir = JOBS_DIR / job_id
     try:
-        config = resolve_configured_models(load_config())
+        # Models are resolved when settings are saved. Do not delay every job
+        # by re-reading remote catalogs before the first generation request.
+        config = load_config()
         voice = job_dir / "voice.wav"
         duration = probe_duration(voice)
         reference_images, reference_instruction, character_context = custom_reference_context(job_id)
@@ -2650,12 +2721,17 @@ def save_config(payload: dict[str, Any]) -> dict[str, Any]:
 @app.post("/api/config/models")
 def detect_models(payload: dict[str, Any]) -> dict[str, Any]:
     config = merged_provider_config(payload)
-    text_models = provider_models(config)
     image_config = image_provider_config(config)
-    if image_config.get("base_url") == config.get("base_url") and image_config.get("api_key") == config.get("api_key"):
+    same_provider = image_config.get("base_url") == config.get("base_url") and image_config.get("api_key") == config.get("api_key")
+    if same_provider:
+        text_models = provider_models(config, timeout=8)
         image_models = text_models
     else:
-        image_models = provider_models(image_config)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            text_future = executor.submit(provider_models, config, 8)
+            image_future = executor.submit(provider_models, image_config, 8)
+            text_models = text_future.result()
+            image_models = image_future.result()
     text_catalog = build_model_catalog(text_models, str(config["text_model"]), str(config["image_model"]))
     image_catalog = build_model_catalog(image_models, str(config["text_model"]), str(config["image_model"]))
     selected_text_model = str(text_catalog["selected_text_model"] or "")

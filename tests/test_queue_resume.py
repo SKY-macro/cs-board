@@ -28,6 +28,8 @@ class QueueResumeTests(unittest.TestCase):
         SERVER.VOICE_QUEUE = queue.Queue()
         SERVER.MODEL_QUEUE = queue.Queue()
         SERVER.ensure_pipeline_workers = lambda: None
+        if hasattr(SERVER, "MODEL_CATALOG_CACHE"):
+            SERVER.MODEL_CATALOG_CACHE.clear()
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -178,6 +180,16 @@ class QueueResumeTests(unittest.TestCase):
         self.assertEqual(payload["output_text"], "ok")
         self.assertEqual(client.__enter__.return_value.post.call_count, 3)
 
+    def test_provider_does_not_retry_rate_limited_node(self) -> None:
+        limited = mock.Mock(is_error=True, status_code=429, text="rate limit")
+        client = mock.MagicMock()
+        client.__enter__.return_value.post.return_value = limited
+        with mock.patch.object(SERVER.httpx, "Client", return_value=client), mock.patch.object(SERVER.time, "sleep") as sleep:
+            with self.assertRaises(SERVER.ProviderHTTPError):
+                SERVER.provider_post({"api_key": "test", "base_url": "https://example.test"}, "responses", {"model": "test"})
+        self.assertEqual(client.__enter__.return_value.post.call_count, 1)
+        sleep.assert_not_called()
+
     def test_text_provider_falls_back_to_chat_completions(self) -> None:
         unsupported = mock.Mock(is_error=True, status_code=404, text="responses endpoint not found")
         succeeded = mock.Mock(is_error=False, status_code=200)
@@ -206,15 +218,70 @@ class QueueResumeTests(unittest.TestCase):
                 set(),
             )
 
+    def test_provider_models_reuses_recent_catalog_without_second_network_call(self) -> None:
+        response = mock.Mock(is_error=False)
+        response.json.return_value = {"data": [{"id": "gpt-5.4"}, {"id": "gpt-image-2"}]}
+        client = mock.MagicMock()
+        client.__enter__.return_value.get.return_value = response
+        config = {"api_key": "test", "base_url": "https://relay.example/v1"}
+        with mock.patch.object(SERVER.httpx, "Client", return_value=client):
+            first = SERVER.provider_models(config)
+            second = SERVER.provider_models(config)
+        self.assertEqual(first, {"gpt-5.4", "gpt-image-2"})
+        self.assertEqual(second, first)
+        self.assertEqual(client.__enter__.return_value.get.call_count, 1)
+
     def test_detect_models_reads_catalog_without_sending_generation_probe(self) -> None:
         with mock.patch.object(SERVER, "provider_models", return_value={"gpt-5.4", "gpt-5.5"}) as models, mock.patch.object(
             SERVER, "provider_text_once"
         ) as generate:
-            catalog = SERVER.detect_models({"api_key": "test", "base_url": "https://relay.example/v1"})
+            catalog = SERVER.detect_models({"api_key": "test", "base_url": "https://relay.example/v1", "text_model": "gpt-5.4"})
         self.assertEqual(catalog["text_models"], ["gpt-5.4"])
         self.assertEqual(catalog["selected_text_model"], "gpt-5.4")
         self.assertGreaterEqual(models.call_count, 1)
         generate.assert_not_called()
+
+    def test_text_provider_switches_to_next_enabled_relay_after_rate_limit(self) -> None:
+        limited = SERVER.ProviderHTTPError(429, "Upstream rate limit exceeded")
+        config = {
+            "text_services": [
+                {"id": "first", "base_url": "https://one.example/v1", "api_key": "one", "model": "gpt-5.4", "enabled": True},
+                {"id": "second", "base_url": "https://two.example/v1", "api_key": "two", "model": "gpt-5.6-luna", "enabled": True},
+            ]
+        }
+        with mock.patch.object(SERVER, "provider_text_once", side_effect=[limited, {"model": "gpt-5.6-luna", "output_text": "OK"}]) as request:
+            result = SERVER.provider_text(config, "ignored", "hello")
+        self.assertEqual(result["output_text"], "OK")
+        self.assertEqual([call.args[0]["base_url"] for call in request.call_args_list], ["https://one.example/v1", "https://two.example/v1"])
+        self.assertEqual([call.args[1] for call in request.call_args_list], ["gpt-5.4", "gpt-5.6-luna"])
+
+    def test_image_provider_switches_to_next_enabled_relay_after_failure(self) -> None:
+        unavailable = SERVER.ProviderHTTPError(503, "Service temporarily unavailable")
+        config = {
+            "image_services": [
+                {"id": "first", "base_url": "https://one.example/v1", "api_key": "one", "model": "gpt-image-1", "enabled": True},
+                {"id": "second", "base_url": "https://two.example/v1", "api_key": "two", "model": "gpt-image-2", "enabled": True},
+            ]
+        }
+        with mock.patch.object(SERVER, "provider_image_single", side_effect=[unavailable, {"data": [{"url": "ok"}]}]) as request:
+            result = SERVER.provider_image(config, "images/generations", {"prompt": "hello"})
+        self.assertEqual(result["data"][0]["url"], "ok")
+        self.assertEqual([call.args[0]["base_url"] for call in request.call_args_list], ["https://one.example/v1", "https://two.example/v1"])
+        self.assertEqual([call.args[2]["model"] for call in request.call_args_list], ["gpt-image-1", "gpt-image-2"])
+
+    def test_reference_image_provider_switches_to_next_enabled_relay(self) -> None:
+        unavailable = SERVER.ProviderHTTPError(503, "Service temporarily unavailable")
+        config = {
+            "image_services": [
+                {"id": "first", "base_url": "https://one.example/v1", "api_key": "one", "model": "gpt-image-1", "enabled": True},
+                {"id": "second", "base_url": "https://two.example/v1", "api_key": "two", "model": "gpt-image-2", "enabled": True},
+            ]
+        }
+        with mock.patch.object(SERVER, "provider_image_edit_once", side_effect=[unavailable, {"data": [{"url": "ok"}]}]) as request:
+            result = SERVER.provider_image_edit(config, {"model": "ignored", "prompt": "hello"}, [("ref.png", b"png", "image/png")])
+        self.assertEqual(result["data"][0]["url"], "ok")
+        self.assertEqual([call.args[0]["base_url"] for call in request.call_args_list], ["https://one.example/v1", "https://two.example/v1"])
+        self.assertEqual([call.args[1]["model"] for call in request.call_args_list], ["gpt-image-1", "gpt-image-2"])
 
     def test_whiteboard_render_command_hides_drawing_hand(self) -> None:
         command = SERVER.whiteboard_render_command(
@@ -331,6 +398,10 @@ class QueueResumeTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(sum(scene["duration_ms"] for scene in scenes), 5123)
         self.assertGreaterEqual(scenes[-1]["duration_ms"], 1000)
+
+    def test_two_minutes_allow_twenty_scenes(self) -> None:
+        self.assertEqual(SERVER.scene_limit_for_duration(120), 20)
+        self.assertEqual(SERVER.scene_limit_for_duration(180), 20)
 
     def test_old_scene_clip_with_extra_half_second_is_rejected(self) -> None:
         with mock.patch.object(SERVER, "valid_media_file", return_value=True), mock.patch.object(SERVER, "probe_duration", return_value=2.5):
