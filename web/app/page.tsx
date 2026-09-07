@@ -11,6 +11,7 @@ type ServiceNode = {
   rpm_limit?: number;
   rpd_limit?: number;
   utilization_percent?: number;
+  max_input_images?: number;
 };
 type Config = {
   api_key: string;
@@ -70,6 +71,24 @@ type CharacterReference = {
   description: string;
   files: File[];
 };
+type CharacterAsset = {
+  id: string;
+  style: string;
+  label: string;
+  description: string;
+  status: "queued" | "review" | "approved" | "rejected" | "error";
+  image_url?: string | null;
+  error?: string | null;
+};
+type CharacterBinding = {
+  role_id: string;
+  story_name: string;
+  gender: string;
+  age_group: string;
+  description: string;
+  asset_id: string | null;
+  asset_image_url?: string | null;
+};
 type InputAsset = { name: string; url: string; content_type: string };
 type VoiceMode = "none" | "clone" | "uploaded";
 type IdentityMode = "consistent" | "male" | "female";
@@ -90,6 +109,7 @@ type JobParameters = {
   reference: InputAsset | null;
   style_reference: InputAsset | null;
   characters: { name: string; description: string; images: InputAsset[] }[];
+  character_bindings?: CharacterBinding[];
 };
 type GalleryItem = {
   name: string;
@@ -241,6 +261,7 @@ const normalizeConfig = (data: Config): Config => ({
     rpm_limit: normalizeRpmLimit(node.rpm_limit),
     rpd_limit: clampNumber(node.rpd_limit, 0, 100000, 0),
     utilization_percent: clampNumber(node.utilization_percent, 10, 100, 80),
+    max_input_images: clampNumber(node.max_input_images, 1, 32, 4),
   })),
 });
 const providerPayloadFor = (source: Config) => {
@@ -463,6 +484,15 @@ export default function Home() {
   const [pageMode, setPageMode] = useState<"standard" | "custom" | "infographic">("standard");
   const [styleReference, setStyleReference] = useState<File | null>(null);
   const [characters, setCharacters] = useState<CharacterReference[]>([{ id: "character-1", name: "人物 1", description: "", files: [] }]);
+  const [characterLibraryOpen, setCharacterLibraryOpen] = useState(false);
+  const [characterAssets, setCharacterAssets] = useState<CharacterAsset[]>([]);
+  const [characterBindings, setCharacterBindings] = useState<CharacterBinding[]>([]);
+  const [characterMatchReady, setCharacterMatchReady] = useState(false);
+  const [characterBusy, setCharacterBusy] = useState(false);
+  const [drawLabel, setDrawLabel] = useState("角色候选");
+  const [drawDescription, setDrawDescription] = useState("");
+  const [drawCount, setDrawCount] = useState(1);
+  const [characterMessage, setCharacterMessage] = useState("");
   const [sharedJob, setSharedJob] = useState<Job | null>(null);
   const [modelCatalog, setModelCatalog] = useState<Record<string, string[]>>({});
   const [modelLoading, setModelLoading] = useState<Record<string, boolean>>({});
@@ -645,6 +675,89 @@ export default function Home() {
       if (healthResponse.ok) setHealth(await healthResponse.json());
     } catch {}
   };
+  const loadCharacterAssets = async () => {
+    try {
+      const response = await fetch(`${API}/api/character-assets?style=${encodeURIComponent(style)}`);
+      if (response.ok) setCharacterAssets((await response.json()).items || []);
+    } catch {}
+  };
+  useEffect(() => {
+    setCharacterMatchReady(false);
+    setCharacterBindings([]);
+  }, [copy, style]);
+  useEffect(() => {
+    if (!characterLibraryOpen) return;
+    loadCharacterAssets();
+    const id = setInterval(loadCharacterAssets, 2200);
+    return () => clearInterval(id);
+  }, [characterLibraryOpen, style]);
+  const matchCharacters = async () => {
+    if (copy.trim().length < 10) return setMessage("请先填写至少 10 个字的文案，再分析角色");
+    setCharacterBusy(true);
+    setCharacterMessage("AI 正在分析文案并匹配当前画风的角色资产…");
+    try {
+      const response = await fetch(`${API}/api/character-matches`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ copy, style }),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "角色匹配失败");
+      const bindings: CharacterBinding[] = payload.bindings || [];
+      setCharacterBindings(bindings);
+      setCharacterMatchReady(true);
+      const missing = bindings.filter((item) => !item.asset_id);
+      if (missing.length) {
+        setDrawLabel(missing[0].story_name || "角色候选");
+        setDrawDescription(missing[0].description || "");
+        setCharacterMessage(`有 ${missing.length} 个角色没有合适资产，已为你准备抽卡条件；审核保存后再点一次匹配。`);
+        setCharacterLibraryOpen(true);
+      } else {
+        setCharacterMessage(bindings.length ? `已匹配 ${bindings.length} 个角色；生成时会按分镜只上传实际出镜角色。` : "文案中没有需要固定形象的出镜角色，可直接生成。");
+      }
+    } catch (error) {
+      setCharacterMessage(error instanceof Error ? error.message : "角色匹配失败");
+    } finally {
+      setCharacterBusy(false);
+    }
+  };
+  const drawCharacterAssets = async () => {
+    setCharacterBusy(true);
+    setCharacterMessage("已提交角色抽卡，生成完成后会出现在审核区…");
+    try {
+      const response = await fetch(`${API}/api/character-assets/draw`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ style, label: drawLabel, description: drawDescription, count: drawCount }),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "抽卡失败");
+      await loadCharacterAssets();
+    } catch (error) {
+      setCharacterMessage(error instanceof Error ? error.message : "抽卡失败");
+    } finally {
+      setCharacterBusy(false);
+    }
+  };
+  const reviewCharacterAsset = async (asset: CharacterAsset, status: "approved" | "rejected") => {
+    const response = await fetch(`${API}/api/character-assets/${asset.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status }),
+    });
+    const payload = await response.json();
+    if (!response.ok) return setCharacterMessage(payload.detail || "审核失败");
+    setCharacterMessage(status === "approved" ? "已保存到该画风的公共角色资产库；返回标准制作后请重新匹配。" : "已标记为不采用。");
+    loadCharacterAssets();
+  };
+  const deleteCharacterAsset = async (asset: CharacterAsset) => {
+    if (!window.confirm(`确定删除角色资产“${asset.label}”吗？已提交任务中的冻结副本不会受影响。`)) return;
+    const response = await fetch(`${API}/api/character-assets/${asset.id}`, { method: "DELETE" });
+    const payload = await response.json();
+    if (!response.ok) return setCharacterMessage(payload.detail || "删除失败");
+    setCharacterMessage("角色资产已删除；历史任务里的冻结副本仍然保留。");
+    loadCharacterAssets();
+  };
   const onFile = (e: ChangeEvent<HTMLInputElement>) => setReference(e.target.files?.[0] || null);
   const updateCharacter = (id: string, patch: Partial<CharacterReference>) => setCharacters((items) => items.map((item) => (item.id === id ? { ...item, ...patch } : item)));
   const addCharacter = () =>
@@ -683,7 +796,7 @@ export default function Home() {
             api_key: "",
             model: kind === "text" ? "gpt-5" : "gpt-image-2",
             enabled: true,
-            ...(kind === "image" ? { rpm_limit: 40, rpd_limit: 600, utilization_percent: 80 } : {}),
+            ...(kind === "image" ? { rpm_limit: 40, rpd_limit: 600, utilization_percent: 80, max_input_images: 4 } : {}),
           },
         ],
       };
@@ -800,6 +913,8 @@ export default function Home() {
     const readyCharacters = characters.filter((item) => item.name.trim() && item.files.length);
     if (pageMode === "custom" && !styleReference) return setMessage("请上传一张画面风格参考图");
     if (pageMode === "custom" && !readyCharacters.length) return setMessage("请至少添加一个带参考图片的人物");
+    if (pageMode === "standard" && !characterMatchReady) return setMessage("请先点击“AI 分析并挑选角色”，确认当前文案的人物资产");
+    if (pageMode === "standard" && characterBindings.some((item) => !item.asset_id)) return setMessage("仍有角色没有资产，请先到抽卡区生成、审核并重新匹配");
     const body = new FormData();
     body.append("copy", copy);
     body.append("voice_mode", voiceMode);
@@ -814,6 +929,7 @@ export default function Home() {
     body.append("include_key_text", String(presentationMode === "story-color" ? false : includeKeyText));
     body.append("stroke_detail", strokeDetail);
     body.append("include_subtitles", String(presentationMode === "story-color" ? true : includeSubtitles));
+    if (pageMode === "standard") body.append("character_bindings", JSON.stringify(characterBindings));
     if (reference) body.append("reference", reference);
     if (pageMode === "custom" && styleReference) {
       body.append("style_reference", styleReference);
@@ -1115,6 +1231,8 @@ export default function Home() {
       setIncludeSubtitles(data.include_subtitles);
       setStrokeDetail(data.stroke_detail);
       setStyleReference(restoredStyle);
+      setCharacterBindings(data.character_bindings || []);
+      setCharacterMatchReady(data.reference_mode === "standard");
       setCharacters(
         restoredCharacters.length
           ? restoredCharacters
@@ -1258,6 +1376,9 @@ export default function Home() {
           </button>
           <button type="button" className={pageMode === "infographic" ? "active infographicActive" : ""} onClick={() => setPageMode("infographic")}>
             动态信息图
+          </button>
+          <button type="button" onClick={() => setCharacterLibraryOpen(true)}>
+            角色抽卡库
           </button>
         </nav>
         <button type="button" className="ghost" aria-haspopup="dialog" aria-expanded={settingsOpen} onClick={() => setSettingsOpen(true)}>
@@ -1544,6 +1665,17 @@ export default function Home() {
                               <option value={100}>100%（贴线）</option>
                             </select>
                           </label>
+                          <label>
+                            单次参考图上限
+                            <input
+                              type="number"
+                              min={1}
+                              max={32}
+                              value={clampNumber(node.max_input_images, 1, 32, 4)}
+                              onChange={(e) => updateService("image", node.id, { max_input_images: clampNumber(e.target.value, 1, 32, 4) })}
+                            />
+                            <small>接口实测容量；未检测节点保守按 4 张</small>
+                          </label>
                           <button type="button" className="detectModel" disabled={modelLoading[key] || !node.base_url || !node.api_key} onClick={() => detectService("image", node)}>
                             {modelLoading[key] ? "读取中…" : "识别节点模型"}
                           </button>
@@ -1631,6 +1763,43 @@ export default function Home() {
                 {connectionMessage}
               </div>
             )}
+          </section>
+        </div>
+      )}
+      {characterLibraryOpen && (
+        <div className="settingsOverlay" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setCharacterLibraryOpen(false)}>
+          <section className="characterLibraryDialog panel" role="dialog" aria-modal="true" aria-label="角色抽卡资产库">
+            <header className="settingsModalHeader">
+              <Title n="角色" title="公共角色抽卡库" note="独立于任务 · 按画面风格长期复用" />
+              <button type="button" className="settingsClose" onClick={() => setCharacterLibraryOpen(false)}>返回制作</button>
+            </header>
+            <div className="characterLibraryBody">
+              <section className="characterDrawPanel">
+                <label>角色所属画风<select value={style} onChange={(e) => setStyle(e.target.value)}>{styleOptions.map((item) => <option key={item.name}>{item.name}</option>)}</select></label>
+                <label>资产名称<input value={drawLabel} maxLength={30} onChange={(e) => setDrawLabel(e.target.value)} placeholder="例如：青年母亲候选" /></label>
+                <label>详细外观说明<textarea value={drawDescription} maxLength={300} onChange={(e) => setDrawDescription(e.target.value)} placeholder="年龄、脸型、眼睛、发型发色、体型、服装和标志特征" /></label>
+                <label>候选数量<select value={drawCount} onChange={(e) => setDrawCount(Number(e.target.value))}><option value={1}>1 张</option><option value={2}>2 张</option><option value={3}>3 张</option><option value={4}>4 张</option></select></label>
+                <button type="button" className="primary" disabled={characterBusy || drawDescription.trim().length < 4} onClick={drawCharacterAssets}>{characterBusy ? "处理中…" : "开始针对性抽卡"}</button>
+                <p>每张候选图包含同一角色的正面、四分之三侧面、纯侧面和全身视图；审核通过后才进入公共资产库。</p>
+              </section>
+              <section className="characterAssetGrid">
+                {characterAssets.length ? characterAssets.map((asset) => (
+                  <article key={asset.id} className={`characterAssetCard ${asset.status}`}>
+                    {asset.image_url ? <img src={`${API}${asset.image_url}`} alt={`${asset.label}角色设定图`} /> : <div className="characterAssetWaiting">{asset.status === "error" ? "生成失败" : "正在生成角色设定图…"}</div>}
+                    <strong>{asset.label}</strong>
+                    <span>{asset.description}</span>
+                    <small>{asset.status === "approved" ? "已审核，可被任务匹配" : asset.status === "review" ? "待你审核" : asset.status === "error" ? asset.error : "生成队列中"}</small>
+                    <div>
+                      {asset.status === "review" && <><button type="button" className="approveAsset" onClick={() => reviewCharacterAsset(asset, "approved")}>审核并保存</button><button type="button" onClick={() => reviewCharacterAsset(asset, "rejected")}>不采用</button></>}
+                      {asset.status === "approved" && <button type="button" onClick={() => reviewCharacterAsset(asset, "rejected")}>停用</button>}
+                      {asset.status === "rejected" && <button type="button" className="approveAsset" onClick={() => reviewCharacterAsset(asset, "approved")}>重新启用</button>}
+                      {asset.status !== "queued" && <button type="button" onClick={() => deleteCharacterAsset(asset)}>删除</button>}
+                    </div>
+                  </article>
+                )) : <div className="characterAssetEmpty">当前画风还没有角色资产。填写左侧外观说明开始抽卡。</div>}
+              </section>
+            </div>
+            {characterMessage && <div className="characterMessage">{characterMessage}</div>}
           </section>
         </div>
       )}
@@ -1754,6 +1923,15 @@ export default function Home() {
                   </button>
                 ))}
               </div>
+              <section className="taskCharacterMatcher">
+                <div><strong>本任务角色资产</strong><span>AI 只匹配“{style}”的已审核角色；每个分镜只上传本幕实际出镜人物。</span></div>
+                <div className="taskCharacterActions">
+                  <button type="button" className="secondary" disabled={characterBusy || copy.trim().length < 10} onClick={matchCharacters}>{characterBusy ? "分析中…" : characterMatchReady ? "重新分析并匹配" : "AI 分析并挑选角色"}</button>
+                  <button type="button" className="secondary" onClick={() => setCharacterLibraryOpen(true)}>打开角色抽卡库</button>
+                </div>
+                {characterBindings.length > 0 && <div className="taskCharacterBindings">{characterBindings.map((binding) => <article key={binding.role_id} className={binding.asset_id ? "matched" : "missing"}>{binding.asset_image_url ? <img src={`${API}${binding.asset_image_url}`} alt="" /> : <span>缺</span>}<div><b>{binding.story_name}</b><small>{binding.age_group} · {binding.gender}</small><p>{binding.description}</p></div><em>{binding.asset_id ? "已匹配" : "需抽卡"}</em></article>)}</div>}
+                {characterMessage && <p className="characterMessage">{characterMessage}</p>}
+              </section>
             </>
           ) : (
             <section className="referenceBuilder">

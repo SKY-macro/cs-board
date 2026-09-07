@@ -31,6 +31,7 @@ from urllib.parse import quote
 ROOT = Path(__file__).resolve().parents[1]
 STATE_DIR = ROOT / ".webapp"
 JOBS_DIR = STATE_DIR / "jobs"
+CHARACTER_LIBRARY_DIR = STATE_DIR / "character-library"
 CONFIG_PATH = STATE_DIR / "config.json"
 PREFERENCES_PATH = STATE_DIR / "preferences.json"
 IMAGE_NODE_STATS_PATH = STATE_DIR / "image-node-stats.json"
@@ -38,7 +39,7 @@ PYTHON = Path(sys.executable)
 NODE = shutil.which("node") or "node"
 REMOTION_RENDERER = ROOT / "video_renderer"
 HAND = ROOT / "assets" / "drawing-hand-clean.png"
-PIPELINE_VERSION = "narrated_deck_v16_concise_storybook_reference"
+PIPELINE_VERSION = "narrated_deck_v20_character_draw_recovery"
 ALIGNMENT_SEGMENTATION = "word-boundary-dtw-audio-v2"
 SUBTITLE_FONT = os.environ.get(
     "CS_BOARD_SUBTITLE_FONT",
@@ -429,6 +430,60 @@ def atomic_write_json(target: Path, value: Any) -> None:
     temporary = target.with_suffix(target.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(target)
+
+
+def character_style_key(style: str) -> str:
+    """Keep the public character library path stable without trusting a style as a path."""
+    return hashlib.sha256(style.strip().encode("utf-8")).hexdigest()[:16]
+
+
+def character_asset_records(style: str | None = None, include_unapproved: bool = True) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    if not CHARACTER_LIBRARY_DIR.exists():
+        return records
+    roots = [CHARACTER_LIBRARY_DIR / character_style_key(style)] if style else [path for path in CHARACTER_LIBRARY_DIR.iterdir() if path.is_dir()]
+    for root in roots:
+        if not root.exists():
+            continue
+        for manifest_path in root.glob("*/asset.json"):
+            try:
+                item = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(item, dict) or (style and item.get("style") != style):
+                continue
+            if not include_unapproved and item.get("status") != "approved":
+                continue
+            item = dict(item)
+            item["image_url"] = f"/api/character-assets/{item.get('id')}/image" if item.get("image") else None
+            records.append(item)
+    return sorted(records, key=lambda item: float(item.get("created_at") or 0), reverse=True)
+
+
+def character_asset_record(asset_id: str) -> tuple[Path, dict[str, Any]]:
+    if not re.fullmatch(r"[a-f0-9]{12}", asset_id):
+        raise HTTPException(404, "角色资产不存在")
+    matches = list(CHARACTER_LIBRARY_DIR.glob(f"*/{asset_id}/asset.json")) if CHARACTER_LIBRARY_DIR.exists() else []
+    if not matches:
+        raise HTTPException(404, "角色资产不存在")
+    manifest_path = matches[0]
+    try:
+        item = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(500, "角色资产记录损坏") from exc
+    return manifest_path, item
+
+
+def style_only_reference_context(style: str) -> tuple[list[Path], str]:
+    """Return at most one style-only input for a character-sheet draw."""
+    if style == CLEAR_STORYBOOK_STYLE:
+        return clear_storybook_reference_context()
+    if style == OIL_VISUAL_STYLE:
+        return oil_visual_reference_context([], False)
+    if style == PAPER_METAPHOR_STYLE:
+        paths, instruction = paper_metaphor_reference_context([])
+        return paths[:1], instruction
+    return [], ""
 
 
 class ImageNodeCoolingDown(RuntimeError):
@@ -1626,6 +1681,53 @@ def provider_image_single(config: dict[str, Any], endpoint: str, payload: dict[s
     return response_payload
 
 
+def provider_image_affinity_call(ready: list[dict[str, Any]], invoke: Any, job_id: str | None) -> dict[str, Any]:
+    """Keep one episode on one relay, but fail over when that relay errors."""
+    if not job_id:
+        return IMAGE_NODE_POOL.call_any(ready, invoke, job_id=job_id)
+    if len(ready) == 1:
+        with LOCK:
+            job = JOBS.get(job_id)
+            if job is not None:
+                job["image_affinity_node_id"] = str(ready[0].get("id") or "")
+                _persist_job_locked(job_id)
+        return IMAGE_NODE_POOL.call_any(ready, invoke, job_id=job_id)
+    with LOCK:
+        job = JOBS.get(job_id)
+        current = str(job.get("image_affinity_node_id") or "") if job else ""
+        compatible_ids = {str(item.get("id") or "") for item in ready}
+        if current not in compatible_ids:
+            selected = ready[int(hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:8], 16) % len(ready)]
+            current = str(selected.get("id") or "")
+            if job is not None:
+                job["image_affinity_node_id"] = current
+                _persist_job_locked(job_id)
+    preferred = next((item for item in ready if str(item.get("id") or "") == current), ready[0])
+    alternatives = [item for item in ready if IMAGE_NODE_POOL.node_key(item) != IMAGE_NODE_POOL.node_key(preferred)]
+    try:
+        return IMAGE_NODE_POOL.call(preferred, lambda: invoke(preferred), retry_rate_limit=False, skip_cooldown=True, job_id=job_id)
+    except JobCancelled:
+        raise
+    except Exception:
+        if not alternatives:
+            raise
+    used: dict[str, str] = {}
+
+    def invoke_alternative(service: dict[str, Any]) -> dict[str, Any]:
+        result = invoke(service)
+        used["id"] = str(service.get("id") or "")
+        return result
+
+    result = IMAGE_NODE_POOL.call_any(alternatives, invoke_alternative, job_id=job_id)
+    with LOCK:
+        job = JOBS.get(job_id)
+        if job is not None and used.get("id"):
+            job["image_affinity_node_id"] = used["id"]
+            job["image_affinity_failovers"] = int(job.get("image_affinity_failovers") or 0) + 1
+            _persist_job_locked(job_id)
+    return result
+
+
 def provider_image(config: dict[str, Any], endpoint: str, payload: dict[str, Any], timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
     plan = provider_service_plan(config, "image")
     ready = [dict(item["service"], _position=int(item["position"])) for item in plan["ready"]]
@@ -1638,6 +1740,12 @@ def provider_image(config: dict[str, Any], endpoint: str, payload: dict[str, Any
     attempts = 1
     if len(ready) == 1:
         service = ready[0]
+        if job_id:
+            with LOCK:
+                job = JOBS.get(job_id)
+                if job is not None:
+                    job["image_affinity_node_id"] = str(service.get("id") or "")
+                    _persist_job_locked(job_id)
         return IMAGE_NODE_POOL.call(
             service,
             lambda: provider_image_single(
@@ -1652,7 +1760,7 @@ def provider_image(config: dict[str, Any], endpoint: str, payload: dict[str, Any
             skip_cooldown=False,
             job_id=job_id,
         )
-    return IMAGE_NODE_POOL.call_any(
+    return provider_image_affinity_call(
         ready,
         lambda service: provider_image_single(
                 service,
@@ -1662,7 +1770,7 @@ def provider_image(config: dict[str, Any], endpoint: str, payload: dict[str, Any
                 job_id=job_id,
                 attempts=attempts,
         ),
-        job_id=job_id,
+        job_id,
     )
 
 
@@ -1688,12 +1796,31 @@ def provider_image_edit_once(config: dict[str, Any], form_data: dict[str, str], 
 
 def provider_image_edit(config: dict[str, Any], form_data: dict[str, str], raw_files: list[tuple[str, bytes, str]], timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
     plan = provider_service_plan(config, "image")
-    ready = [dict(item["service"], _position=int(item["position"])) for item in plan["ready"]]
+    reference_count = len(raw_files)
+    ready = [
+        dict(item["service"], _position=int(item["position"]))
+        for item in plan["ready"]
+        if max(1, int(item["service"].get("max_input_images") or 4)) >= reference_count
+    ]
     if not ready:
-        skipped = "，".join(f"节点 {item['position']} {item['reason']}" for item in plan["skipped"])
+        capacity_skipped = [
+            f"节点 {item['position']} 最多 {max(1, int(item['service'].get('max_input_images') or 4))} 张"
+            for item in plan["ready"]
+            if max(1, int(item["service"].get("max_input_images") or 4)) < reference_count
+        ]
+        skipped = "，".join([
+            *(f"节点 {item['position']} {item['reason']}" for item in plan["skipped"]),
+            *capacity_skipped,
+        ])
         raise RuntimeError(f"没有可调用的参考图中转站{'：' + skipped if skipped else ''}")
     if len(ready) == 1:
         service = ready[0]
+        if job_id:
+            with LOCK:
+                job = JOBS.get(job_id)
+                if job is not None:
+                    job["image_affinity_node_id"] = str(service.get("id") or "")
+                    _persist_job_locked(job_id)
         return IMAGE_NODE_POOL.call(
             service,
             lambda: provider_image_edit_once(
@@ -1706,7 +1833,7 @@ def provider_image_edit(config: dict[str, Any], form_data: dict[str, str], raw_f
             skip_cooldown=False,
             job_id=job_id,
         )
-    return IMAGE_NODE_POOL.call_any(
+    return provider_image_affinity_call(
         ready,
         lambda service: provider_image_edit_once(
                 service,
@@ -1714,7 +1841,7 @@ def provider_image_edit(config: dict[str, Any], form_data: dict[str, str], raw_f
                 raw_files,
                 timeout=timeout,
         ),
-        job_id=job_id,
+        job_id,
     )
 
 
@@ -1841,6 +1968,7 @@ def provider_service_plan(config: dict[str, Any], kind: str) -> dict[str, Any]:
             fallback["rpm_limit"] = max(1, min(IMAGE_GENERATION_MAX_RPM, int(fallback.get("rpm_limit") or 10)))
             fallback["rpd_limit"] = max(0, min(100000, int(fallback.get("rpd_limit") or 0)))
             fallback["utilization_percent"] = max(10, min(100, int(fallback.get("utilization_percent") or 80)))
+            fallback["max_input_images"] = max(1, min(32, int(fallback.get("max_input_images") or 4)))
         return {"configured_count": 1, "ready_count": 1, "ready": [{"position": 1, "service": fallback}], "skipped": []}
 
     ready: list[dict[str, Any]] = []
@@ -1874,6 +2002,10 @@ def provider_service_plan(config: dict[str, Any], kind: str) -> dict[str, Any]:
                 service["utilization_percent"] = max(10, min(100, int(service.get("utilization_percent") or 80)))
             except (TypeError, ValueError):
                 service["utilization_percent"] = 80
+            try:
+                service["max_input_images"] = max(1, min(32, int(service.get("max_input_images") or 4)))
+            except (TypeError, ValueError):
+                service["max_input_images"] = 4
         ready.append({"position": position, "service": service})
     return {"configured_count": len(services), "ready_count": len(ready), "ready": ready, "skipped": skipped}
 
@@ -2200,7 +2332,8 @@ def make_plan(
     scene_count = len(segments)
     fixed_segments = "\n".join(f"第{i + 1}幕原文：{text}" for i, text in enumerate(segments))
     character_rule = (
-        f"可用人物如下：{character_context}。根据原文语义选择出场人物，并在 title、concept 和 elements 中写明人物名称；不得改变人物身份与外观。"
+        f"可用人物如下：{character_context}。根据原文语义选择出场人物；每幕必须额外输出 cast_ids 数组，只填写本幕真正出镜人物的角色ID。"
+        "不得添加未列出的人物，不得把未出镜人物写入 cast_ids；并在 title、concept 和 elements 中使用对应人物名称，不得改变身份与外观。"
         if character_context else identity_prompt(identity_mode)
     )
     paper_rule = (
@@ -2305,6 +2438,16 @@ elements 必须是恰好 3 个具体可画的中文短语，按叙事顺序排�
         if len(labels) < 2:
             labels = [scene.get("title", "口播主角"), scene.get("concept", "核心事件")]
         scene["elements"] = labels
+        if character_context:
+            allowed_ids = set(re.findall(r"(role_\d+)=", character_context))
+            raw_cast = scene.get("cast_ids") if isinstance(scene.get("cast_ids"), list) else []
+            cast_ids = [str(value) for value in raw_cast if str(value) in allowed_ids]
+            if not cast_ids:
+                searchable = " ".join(str(scene.get(key) or "") for key in ("title", "concept", "text", "elements"))
+                for role_id, name in re.findall(r"(role_\d+)=([^（；]+)", character_context):
+                    if role_id in allowed_ids and name.strip() and name.strip() in searchable:
+                        cast_ids.append(role_id)
+            scene["cast_ids"] = list(dict.fromkeys(cast_ids))
     return scenes
 
 
@@ -2382,12 +2525,14 @@ PPT 已确定的视觉策略：{scene.get('visual_strategy', '左侧文字，右
         layout_rule = "每个叙事区域上方保留约 25% 的纯净留白供程序后期排版手写字幕；插画主体集中在中下部。"
     else:
         layout_rule = "所有区域的主体垂直居中并略微靠上，主要人物和物体中心位于画面高度 42%～48%，顶部不得出现大面积无意义空白。画面底部保留约 16% 空白作为字幕安全区。"
-    return f"""{reference_block}生成一张用于中文口播的 {aspect_ratio} 白板动画原画，一张图承载 {len(scenes)} 个连续分镜。
+    return f"""生成一张用于中文口播的 {aspect_ratio} 白板动画原画，一张图承载 {len(scenes)} 个连续分镜。
+当前分镜内容（须完整表现，优先级高于风格修饰）：
+{panel_text}
+{reference_block}输入图职责以说明为准，不得混用或复制其事件构图。
 风格名称：{style}。
 {character_instruction}
 {style_instruction}
 {region_rule}
-{panel_text}
 严格表现上述事件，不得生成原文没有的童年成长、旅行、花鸟、山水、宠物或装饰性意象。
 {layout_rule}
 禁止任何文字、字母、数字、Logo、水印、边框和对话框；字幕由程序后期准确添加，图片模型不得写字。"""
@@ -2484,6 +2629,61 @@ def custom_reference_context(job_id: str) -> tuple[list[Path], str, str]:
     if not character_descriptions:
         raise RuntimeError("没有可用的人物参考图")
     return paths, "\n".join(lines), "；".join(character_descriptions)
+
+
+def task_character_reference_context(
+    job_id: str,
+    scenes: list[dict[str, Any]] | None = None,
+    input_offset: int = 0,
+) -> tuple[list[Path], str, str]:
+    """Select only task-library characters used by the current board.
+
+    ``cast_ids`` is authoritative. Name matching is retained as a defensive
+    fallback for plans created by older text models or resumed old jobs.
+    """
+    with LOCK:
+        job = JOBS.get(job_id, {}).copy()
+    bindings = [item for item in (job.get("character_bindings") or []) if isinstance(item, dict)]
+    if not bindings:
+        return [], "", ""
+    board_scenes = scenes or []
+    cast_ids = {
+        str(role_id)
+        for scene in board_scenes
+        if isinstance(scene, dict)
+        for role_id in (scene.get("cast_ids") or [])
+        if str(role_id)
+    }
+    searchable = " ".join(
+        str(scene.get(key) or "")
+        for scene in board_scenes
+        if isinstance(scene, dict)
+        for key in ("title", "concept", "text", "elements")
+    )
+    selected = [item for item in bindings if str(item.get("role_id") or "") in cast_ids]
+    if not selected and searchable:
+        selected = [item for item in bindings if str(item.get("story_name") or "") in searchable]
+    paths: list[Path] = []
+    lines: list[str] = []
+    job_dir = JOBS_DIR / job_id
+    for item in selected:
+        filename = str(item.get("image") or "")
+        path = job_dir / filename
+        if not filename or not valid_image_file(path):
+            continue
+        paths.append(path)
+        image_number = input_offset + len(paths)
+        name = str(item.get("story_name") or item.get("role_id") or "人物")[:20]
+        description = str(item.get("description") or "以角色设定图外观为准")[:80]
+        role_id = str(item.get("role_id") or "")
+        lines.append(f"输入图{image_number}定义人物“{name}”（{role_id}）：{description}。")
+    if lines:
+        lines.append("人物图只锁定身份、脸型、眼睛、发型发色、年龄体型、服装与标志特征；姿势、背景和构图必须服从当前分镜。")
+    context = "；".join(
+        f"{str(item.get('role_id') or '')}={str(item.get('story_name') or '')}（{str(item.get('description') or '')}）"
+        for item in bindings
+    )
+    return paths, "\n".join(lines), context
 
 
 def _synthesize_voice_once(config: dict[str, Any], reference: Path, copy: str, target: Path) -> None:
@@ -3053,6 +3253,8 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path | None, scen
         voice = job_dir / "voice.wav"
         duration = probe_duration(voice)
         reference_images, reference_instruction, character_context = custom_reference_context(job_id)
+        if not character_context:
+            _task_paths, _task_instruction, character_context = task_character_reference_context(job_id)
         infographic = is_infographic_job(job_id)
         presentation_mode = normalize_presentation_mode(JOBS.get(job_id, {}).get("presentation_mode"))
         identity_mode = normalize_identity_mode(JOBS.get(job_id, {}).get("identity_mode"))
@@ -3100,6 +3302,8 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path | None, scen
                 saved_plan = json.loads(plan_path.read_text(encoding="utf-8"))
                 valid_modes = {"narrated_deck_v4", "narrated_deck_v4_timed"}
                 valid_mode = not infographic or all(scene.get("_plan_mode") in valid_modes for scene in saved_plan if isinstance(scene, dict))
+                if character_context and not infographic:
+                    valid_mode = valid_mode and all(isinstance(scene.get("cast_ids"), list) for scene in saved_plan if isinstance(scene, dict))
                 if isinstance(saved_plan, list) and saved_plan and all(isinstance(scene, dict) for scene in saved_plan) and valid_mode:
                     scenes = saved_plan
             except (OSError, json.JSONDecodeError):
@@ -3147,7 +3351,7 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path | None, scen
         boards = [scenes[i:i + scenes_per_image] for i in range(0, len(scenes), scenes_per_image)]
         board_specs: list[tuple[list[Path], str, str]] = []
         for board in boards:
-            board_images = reference_images
+            board_images = list(reference_images)
             board_instruction = reference_instruction
             use_character_references = bool(character_context)
             if style == PAPER_METAPHOR_STYLE and not board_images:
@@ -3159,11 +3363,22 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path | None, scen
             elif style == CLEAR_STORYBOOK_STYLE and not board_images:
                 board_images, board_instruction = clear_storybook_reference_context()
                 use_character_references = False
+            if not reference_images:
+                character_images, character_instruction, _context = task_character_reference_context(job_id, board, len(board_images))
+                if character_images:
+                    board_images = [*board_images, *character_images]
+                    board_instruction = "\n".join(value for value in (board_instruction, character_instruction) if value)
+                    use_character_references = True
             board_prompt = build_board_prompt(board, style, board_instruction, use_character_references, infographic, aspect_ratio, presentation_mode, identity_mode)
             board_specs.append((board_images, board_instruction, board_prompt))
         update_job(job_id, duration=duration, scenes=len(scenes), boards=len(boards), checkpoint="plan_done")
         atomic_write_json(job_dir / "boards.json", [
-            {"scene_numbers": list(range(i * scenes_per_image + 1, i * scenes_per_image + len(board) + 1)), "image_prompt": board_specs[i][2]}
+            {
+                "scene_numbers": list(range(i * scenes_per_image + 1, i * scenes_per_image + len(board) + 1)),
+                "cast_ids": list(dict.fromkeys(str(role_id) for scene in board for role_id in (scene.get("cast_ids") or []))),
+                "reference_images": [path.name for path in board_specs[i][0]],
+                "image_prompt": board_specs[i][2],
+            }
             for i, board in enumerate(boards)
         ])
         from scripts.add_key_text import add_key_text
@@ -3186,6 +3401,17 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path | None, scen
                         generate_image(config, board_prompt, partial_image, board_images, job_id, aspect_ratio)
                         ensure_job_active(job_id)
                         if valid_image_file(partial_image):
+                            with LOCK:
+                                job = JOBS.get(job_id)
+                                if job is not None:
+                                    audit = job.setdefault("image_generation_audit", {})
+                                    audit[stem] = {
+                                        "node_id": str(job.get("image_affinity_node_id") or ""),
+                                        "model": str(job.get("image_model") or config.get("image_model") or ""),
+                                        "reference_images": [path.name for path in board_images],
+                                        "generated_at": time.time(),
+                                    }
+                                    _persist_job_locked(job_id)
                             break
                         raise RuntimeError("模型返回的图片文件无效")
                     except JobCancelled:
@@ -3931,6 +4157,191 @@ def test_config(payload: dict[str, Any]) -> dict[str, Any]:
     return results
 
 
+def draw_character_asset(asset_id: str) -> None:
+    """Generate one reviewable, reusable character sheet outside any video job."""
+    try:
+        manifest_path, item = character_asset_record(asset_id)
+        style = str(item.get("style") or DEFAULT_STYLE)
+        asset_dir = manifest_path.parent
+        output = asset_dir / "character-sheet.png"
+        references, reference_instruction = style_only_reference_context(style)
+        reference_block = f"参考图规则：{reference_instruction}\n" if reference_instruction else ""
+        prompt = compact_image_prompt(f"""生成一张 3:4 的可复用角色设定图，不是故事分镜。
+画面风格：{style}。视觉配方：{style_recipe(style)}
+{reference_block}角色要求：{str(item.get('description') or '')[:260]}
+同一角色在一张白底设定页中重复出现四次：正面半身、四分之三侧面半身、纯侧面半身、正面全身。四个视图必须是同一身份、同一年龄、同一脸型、同一眼睛、同一发型发色、同一服装与标志特征；比例和画风完全一致。
+画面只包含这个角色，姿势中性，表情自然，视图彼此分开且无遮挡。禁止场景、道具、其他人物、文字、字母、数字、Logo、水印、边框、表格线和摄影写实。""")
+        partial = asset_dir / "character-sheet.partial.png"
+        partial.unlink(missing_ok=True)
+        generate_image(load_config(), prompt, partial, references, None, "3:4")
+        if not valid_image_file(partial):
+            raise RuntimeError("角色设定图文件无效")
+        partial.replace(output)
+        item.update(status="review", image=output.name, finished_at=time.time(), error=None)
+        atomic_write_json(manifest_path, item)
+    except Exception as exc:
+        try:
+            manifest_path, item = character_asset_record(asset_id)
+            item.update(status="error", error=str(exc)[:800], finished_at=time.time())
+            atomic_write_json(manifest_path, item)
+        except Exception:
+            pass
+
+
+def recover_interrupted_character_draws() -> None:
+    """Expose daemon-thread interruptions instead of leaving eternal queued cards."""
+    for item in character_asset_records(include_unapproved=True):
+        if item.get("status") != "queued":
+            continue
+        try:
+            manifest_path, stored = character_asset_record(str(item.get("id") or ""))
+            stored.update(
+                status="error",
+                error="角色设定图生成被后台重启中断，请删除后重新抽卡。",
+                finished_at=time.time(),
+                updated_at=time.time(),
+            )
+            atomic_write_json(manifest_path, stored)
+        except Exception:
+            continue
+
+
+recover_interrupted_character_draws()
+
+
+@app.get("/api/character-assets")
+def list_character_assets(style: str = "", approved_only: bool = False) -> dict[str, Any]:
+    return {"items": character_asset_records(style.strip() or None, not approved_only)}
+
+
+@app.post("/api/character-assets/draw")
+def create_character_draw(payload: dict[str, Any]) -> dict[str, Any]:
+    style = str(payload.get("style") or DEFAULT_STYLE).strip()
+    if style not in STYLE_PRESETS or style == INFOGRAPHIC_STYLE:
+        raise HTTPException(400, "未知画面风格")
+    description = re.sub(r"\s+", " ", str(payload.get("description") or "")).strip()
+    if len(description) < 4:
+        raise HTTPException(400, "请填写至少 4 个字的人物外观描述")
+    count = max(1, min(4, int(payload.get("count") or 1)))
+    label = re.sub(r"\s+", " ", str(payload.get("label") or "角色候选")).strip()[:30] or "角色候选"
+    created: list[dict[str, Any]] = []
+    for _ in range(count):
+        asset_id = uuid.uuid4().hex[:12]
+        asset_dir = CHARACTER_LIBRARY_DIR / character_style_key(style) / asset_id
+        asset_dir.mkdir(parents=True, exist_ok=False)
+        item = {
+            "id": asset_id,
+            "style": style,
+            "label": label,
+            "description": description[:300],
+            "status": "queued",
+            "image": None,
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "error": None,
+        }
+        atomic_write_json(asset_dir / "asset.json", item)
+        threading.Thread(target=draw_character_asset, args=(asset_id,), daemon=True, name=f"character-draw-{asset_id}").start()
+        created.append({**item, "image_url": None})
+    return {"items": created}
+
+
+@app.patch("/api/character-assets/{asset_id}")
+def update_character_asset(asset_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    manifest_path, item = character_asset_record(asset_id)
+    if "label" in payload:
+        item["label"] = re.sub(r"\s+", " ", str(payload.get("label") or "")).strip()[:30] or item.get("label")
+    if "description" in payload:
+        description = re.sub(r"\s+", " ", str(payload.get("description") or "")).strip()
+        if len(description) < 4:
+            raise HTTPException(400, "人物外观描述至少需要 4 个字")
+        item["description"] = description[:300]
+    if "status" in payload:
+        status = str(payload.get("status") or "")
+        if status not in {"review", "approved", "rejected"}:
+            raise HTTPException(400, "不支持的审核状态")
+        image_path = manifest_path.parent / str(item.get("image") or "")
+        if status == "approved" and not valid_image_file(image_path):
+            raise HTTPException(400, "角色设定图尚未生成成功")
+        item["status"] = status
+    item["updated_at"] = time.time()
+    atomic_write_json(manifest_path, item)
+    return {**item, "image_url": f"/api/character-assets/{asset_id}/image" if item.get("image") else None}
+
+
+@app.delete("/api/character-assets/{asset_id}")
+def delete_character_asset(asset_id: str) -> dict[str, Any]:
+    manifest_path, _item = character_asset_record(asset_id)
+    target = manifest_path.parent.resolve()
+    library_root = CHARACTER_LIBRARY_DIR.resolve()
+    if library_root not in target.parents:
+        raise HTTPException(400, "拒绝删除角色资产库以外的目录")
+    shutil.rmtree(target)
+    return {"ok": True, "id": asset_id}
+
+
+@app.get("/api/character-assets/{asset_id}/image")
+def get_character_asset_image(asset_id: str) -> FileResponse:
+    manifest_path, item = character_asset_record(asset_id)
+    image_path = manifest_path.parent / str(item.get("image") or "")
+    if not valid_image_file(image_path):
+        raise HTTPException(404, "角色设定图尚不可用")
+    return FileResponse(image_path)
+
+
+@app.post("/api/character-matches")
+def match_character_assets(payload: dict[str, Any]) -> dict[str, Any]:
+    copy = str(payload.get("copy") or "").strip()
+    style = str(payload.get("style") or DEFAULT_STYLE).strip()
+    if len(copy) < 10:
+        raise HTTPException(400, "文案至少需要 10 个字")
+    if style not in STYLE_PRESETS or style == INFOGRAPHIC_STYLE:
+        raise HTTPException(400, "未知画面风格")
+    assets = character_asset_records(style, include_unapproved=False)
+    catalog = "\n".join(
+        f"- asset_id={item['id']}｜{item.get('label', '')}｜{item.get('description', '')}"
+        for item in assets
+    ) or "（当前风格没有已审核角色资产）"
+    prompt = f"""你是视频角色统筹。分析文案里真正会以人物形象出镜的角色；群体、机构、作者引用、比喻对象和只被提及但不出镜的人不算角色。
+为每个角色建立稳定的 role_id（role_01 起）、story_name（沿用文案称呼，没有姓名时用身份称呼）、gender、age_group、description。
+description 用 25～80 个汉字写身份、年龄段、脸型、眼睛、发型发色、体型、服装和标志特征，不写姿势、场景和构图。
+从下方“{style}”专属资产中为每个角色选择最相符的一项；只有性别、年龄段和核心外观都合理才填 asset_id，否则必须填 null，禁止勉强匹配。一个资产可以被一个角色使用，不能同时分配给两个角色。
+只返回 JSON 数组，每项字段固定为 role_id、story_name、gender、age_group、description、asset_id。
+
+可用资产：
+{catalog}
+
+文案：
+{copy[:12000]}"""
+    try:
+        result = parse_json_block(extract_response_text(provider_text(load_config(), str(load_config()["text_model"]), prompt)))
+    except Exception as exc:
+        raise HTTPException(502, f"角色分析失败：{exc}") from exc
+    if not isinstance(result, list):
+        raise HTTPException(502, "角色分析没有返回有效数组")
+    asset_map = {str(item["id"]): item for item in assets}
+    bindings: list[dict[str, Any]] = []
+    used_assets: set[str] = set()
+    for index, raw in enumerate(result[:8], 1):
+        if not isinstance(raw, dict):
+            continue
+        asset_id = str(raw.get("asset_id") or "")
+        if asset_id not in asset_map or asset_id in used_assets:
+            asset_id = ""
+        if asset_id:
+            used_assets.add(asset_id)
+        bindings.append({
+            "role_id": f"role_{index:02d}",
+            "story_name": str(raw.get("story_name") or f"人物{index}").strip()[:30],
+            "gender": str(raw.get("gender") or "未知").strip()[:12],
+            "age_group": str(raw.get("age_group") or "未知").strip()[:20],
+            "description": str(raw.get("description") or "普通人物形象").strip()[:300],
+            "asset_id": asset_id or None,
+            "asset_image_url": f"/api/character-assets/{asset_id}/image" if asset_id else None,
+        })
+    return {"bindings": bindings, "missing_roles": [item for item in bindings if not item.get("asset_id")], "style": style}
+
+
 @app.get("/api/preferences")
 def get_preferences() -> dict[str, Any]:
     if not PREFERENCES_PATH.exists():
@@ -3973,6 +4384,7 @@ async def create_job(
     reference: UploadFile | None = File(None),
     reference_mode: str = Form("standard"),
     character_manifest: str = Form("[]"),
+    character_bindings: str = Form("[]"),
     style_reference: UploadFile | None = File(None),
     character_references: list[UploadFile] | None = File(None),
 ) -> dict[str, Any]:
@@ -3998,6 +4410,7 @@ async def create_job(
             shutil.copyfileobj(reference.file, target)
     reference_mode = reference_mode if reference_mode in {"custom", "infographic"} else "standard"
     visual_references: dict[str, Any] = {}
+    saved_character_bindings: list[dict[str, Any]] = []
     if reference_mode == "custom":
         uploads = character_references or []
         try:
@@ -4057,6 +4470,48 @@ async def create_job(
             shutil.rmtree(job_dir, ignore_errors=True)
             raise HTTPException(400, "风格参考图无效或超过 15MB")
         visual_references = {"style_image": style_path.name, "characters": saved_characters}
+    elif reference_mode == "standard":
+        try:
+            submitted_bindings = json.loads(character_bindings)
+        except json.JSONDecodeError as exc:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise HTTPException(400, "角色绑定信息格式无效") from exc
+        if not isinstance(submitted_bindings, list) or len(submitted_bindings) > 8:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise HTTPException(400, "角色绑定信息无效")
+        seen_role_ids: set[str] = set()
+        for index, binding in enumerate(submitted_bindings, 1):
+            if not isinstance(binding, dict):
+                continue
+            role_id = str(binding.get("role_id") or f"role_{index:02d}").strip()
+            asset_id = str(binding.get("asset_id") or "").strip()
+            if not asset_id:
+                shutil.rmtree(job_dir, ignore_errors=True)
+                raise HTTPException(400, "存在尚未匹配角色资产的人物，请先前往抽卡区生成并审核")
+            if role_id in seen_role_ids:
+                shutil.rmtree(job_dir, ignore_errors=True)
+                raise HTTPException(400, "角色 ID 重复")
+            manifest_path, asset = character_asset_record(asset_id)
+            if asset.get("status") != "approved" or asset.get("style") != style:
+                shutil.rmtree(job_dir, ignore_errors=True)
+                raise HTTPException(400, "角色资产未审核或不属于当前画面风格")
+            source = manifest_path.parent / str(asset.get("image") or "")
+            if not valid_image_file(source):
+                shutil.rmtree(job_dir, ignore_errors=True)
+                raise HTTPException(400, "角色设定图缺失或无效")
+            suffix = source.suffix.lower() if source.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"} else ".png"
+            filename = f"library-character-{index:02d}{suffix}"
+            shutil.copy2(source, job_dir / filename)
+            seen_role_ids.add(role_id)
+            saved_character_bindings.append({
+                "role_id": role_id[:30],
+                "story_name": str(binding.get("story_name") or asset.get("label") or f"人物{index}").strip()[:30],
+                "description": str(binding.get("description") or asset.get("description") or "").strip()[:300],
+                "gender": str(binding.get("gender") or "").strip()[:12],
+                "age_group": str(binding.get("age_group") or "").strip()[:20],
+                "asset_id": asset_id,
+                "image": filename,
+            })
     scenes_per_image = max(1, min(4, scenes_per_image))
     aspect_ratio = normalize_aspect_ratio(aspect_ratio)
     stroke_detail = stroke_detail if stroke_detail in {"light", "standard", "detailed", "full"} else "detailed"
@@ -4076,10 +4531,12 @@ async def create_job(
             "queue_stage": "voice", "queue_order": time.time_ns(),
             "client_ip": request_client_ip(request),
             "job_type": "infographic" if reference_mode == "infographic" else "generate", "style": style, "scenes_per_image": scenes_per_image,
-            "pipeline_version": PIPELINE_VERSION if reference_mode == "infographic" else "standard_v1",
-            "reference_mode": reference_mode, "character_count": len(visual_references.get("characters", [])),
+            "pipeline_version": PIPELINE_VERSION if reference_mode == "infographic" else "standard_v2_character_assets",
+            "reference_mode": reference_mode,
             "aspect_ratio": aspect_ratio,
             "visual_references": visual_references,
+            "character_bindings": saved_character_bindings,
+            "character_count": len(saved_character_bindings) if reference_mode == "standard" else len(visual_references.get("characters", [])),
             "task_name": task_name,
             "voice_mode": voice_mode,
             "identity_mode": identity_mode,
@@ -4199,6 +4656,14 @@ def get_job_parameters(job_id: str) -> dict[str, Any]:
             "description": str(raw.get("description") or ""),
             "images": images,
         })
+    character_bindings = []
+    for raw in source.get("character_bindings") or []:
+        if not isinstance(raw, dict):
+            continue
+        character_bindings.append({
+            **{key: raw.get(key) for key in ("role_id", "story_name", "gender", "age_group", "description", "asset_id")},
+            "asset_image_url": (asset_descriptor(source_id, str(raw.get("image") or "")) or {}).get("url"),
+        })
     reference_mode = str(source.get("reference_mode") or "standard")
     if reference_mode not in {"standard", "custom", "infographic"}:
         reference_mode = "custom" if visual_references else "standard"
@@ -4221,6 +4686,7 @@ def get_job_parameters(job_id: str) -> dict[str, Any]:
         "reference": asset_descriptor(source_id, reference.name if reference else None),
         "style_reference": asset_descriptor(source_id, style_filename),
         "characters": characters,
+        "character_bindings": character_bindings,
     }
 
 
@@ -4240,6 +4706,9 @@ def get_job_input_asset(job_id: str, filename: str) -> FileResponse:
     for character in visual_references.get("characters") or []:
         if isinstance(character, dict):
             allowed.update(str(name) for name in character.get("images") or [])
+    for binding in item.get("character_bindings") or []:
+        if isinstance(binding, dict) and binding.get("image"):
+            allowed.add(str(binding["image"]))
     if filename not in allowed:
         raise HTTPException(404, "素材不存在")
     path = JOBS_DIR / job_id / filename

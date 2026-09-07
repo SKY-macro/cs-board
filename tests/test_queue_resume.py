@@ -29,6 +29,7 @@ class QueueResumeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         SERVER.JOBS_DIR = Path(self.temporary.name)
+        SERVER.CHARACTER_LIBRARY_DIR = Path(self.temporary.name) / "character-library"
         SERVER.JOBS = {}
         SERVER.VOICE_QUEUE = queue.Queue()
         SERVER.MODEL_QUEUE = queue.Queue()
@@ -129,6 +130,8 @@ class QueueResumeTests(unittest.TestCase):
         self.assertIn("人物“小昌”", prompt)
         self.assertIn("人物“小林”", prompt)
         self.assertNotIn("同一主角固定为：中国青年男性", prompt)
+        self.assertIn("小昌挥手", prompt)
+        self.assertLessEqual(len(prompt), 1200)
 
     def test_paper_metaphor_routes_process_copy_to_machine_reference(self) -> None:
         paths, instruction = SERVER.paper_metaphor_reference_context([
@@ -233,8 +236,182 @@ class QueueResumeTests(unittest.TestCase):
         self.assertIn("构图服从剧情", prompt)
         self.assertIn(SERVER.IDENTITY_PROMPTS["consistent"], prompt)
         self.assertNotIn("同一主角固定为：中国青年男性", prompt)
-        self.assertIn("两人站立交谈", prompt)
-        self.assertLessEqual(len(prompt), 1200)
+
+    def test_standard_character_bindings_select_only_current_scene_cast(self) -> None:
+        from PIL import Image
+
+        job_id = "library-cast"
+        job_dir = SERVER.JOBS_DIR / job_id
+        job_dir.mkdir(parents=True)
+        for index in range(1, 4):
+            Image.effect_noise((128, 128), 20 + index).convert("RGB").save(job_dir / f"library-character-{index:02d}.png")
+        SERVER.JOBS[job_id] = {
+            **self.job(job_id),
+            "style": "复古报纸拼贴风",
+            "character_bindings": [
+                {"role_id": "role_01", "story_name": "小满", "description": "8岁短发女孩", "image": "library-character-01.png"},
+                {"role_id": "role_02", "story_name": "妈妈", "description": "低发髻青年女性", "image": "library-character-02.png"},
+                {"role_id": "role_03", "story_name": "老师", "description": "戴眼镜中年女性", "image": "library-character-03.png"},
+            ],
+        }
+        paths, instruction, context = SERVER.task_character_reference_context(
+            job_id,
+            [{"cast_ids": ["role_01", "role_02"], "concept": "小满和妈妈吃饭"}],
+            input_offset=1,
+        )
+        self.assertEqual([path.name for path in paths], ["library-character-01.png", "library-character-02.png"])
+        self.assertIn("输入图2定义人物“小满”", instruction)
+        self.assertIn("输入图3定义人物“妈妈”", instruction)
+        self.assertNotIn("老师", instruction)
+        self.assertIn("role_01=小满", context)
+
+    def test_character_prompt_compaction_keeps_current_scene_before_long_reference_manifest(self) -> None:
+        reference = "\n".join(
+            f"输入图{index + 1}定义人物‘角色{index}’：" + ("稳定身份特征" * 12)
+            for index in range(8)
+        )
+        prompt = SERVER.build_board_prompt(
+            [{"concept": "小满推门进入教室并向老师问好", "elements": ["小满推门", "老师回头"], "text": "第二天，小满走进教室。"}],
+            SERVER.DEFAULT_STYLE,
+            reference_instruction=reference,
+            use_character_references=True,
+            aspect_ratio="3:4",
+        )
+        compact = SERVER.compact_image_prompt(prompt)
+        self.assertGreater(len(prompt), SERVER.IMAGE_PROMPT_LIMIT)
+        self.assertIn("小满推门进入教室并向老师问好", compact)
+        self.assertIn("第二天，小满走进教室", compact)
+
+    def test_character_reference_selection_falls_back_to_names_when_cast_ids_missing(self) -> None:
+        from PIL import Image
+
+        job_id = "library-name-fallback"
+        job_dir = SERVER.JOBS_DIR / job_id
+        job_dir.mkdir(parents=True)
+        Image.effect_noise((128, 128), 20).convert("RGB").save(job_dir / "library-character-01.png")
+        Image.effect_noise((128, 128), 30).convert("RGB").save(job_dir / "library-character-02.png")
+        SERVER.JOBS[job_id] = {
+            **self.job(job_id),
+            "character_bindings": [
+                {"role_id": "role_01", "story_name": "小满", "description": "女孩", "image": "library-character-01.png"},
+                {"role_id": "role_02", "story_name": "妈妈", "description": "女性", "image": "library-character-02.png"},
+            ],
+        }
+        paths, _instruction, _context = SERVER.task_character_reference_context(
+            job_id,
+            [{"concept": "妈妈独自回到家", "elements": ["妈妈推门"]}],
+        )
+        self.assertEqual([path.name for path in paths], ["library-character-02.png"])
+
+    def test_reference_image_nodes_are_filtered_by_verified_capacity(self) -> None:
+        plan = {
+            "configured_count": 2,
+            "ready_count": 2,
+            "ready": [
+                {"position": 1, "service": {"id": "small", "max_input_images": 4}},
+                {"position": 2, "service": {"id": "large", "max_input_images": 16}},
+            ],
+            "skipped": [],
+        }
+        with mock.patch.object(SERVER, "provider_service_plan", return_value=plan), mock.patch.object(
+            SERVER.IMAGE_NODE_POOL,
+            "call",
+            return_value={"data": [{"b64_json": "AA=="}]},
+        ) as call:
+            SERVER.provider_image_edit({}, {"model": "gpt-image-2"}, [(f"{i}.png", b"x", "image/png") for i in range(6)])
+        self.assertEqual(call.call_args.args[0]["id"], "large")
+
+    def test_image_node_affinity_keeps_one_job_on_one_relay(self) -> None:
+        job_id = "affinity-job"
+        SERVER.JOBS[job_id] = self.job(job_id)
+        ready = [
+            {"id": "node-a", "base_url": "https://a.example/v1", "api_key": "a"},
+            {"id": "node-b", "base_url": "https://b.example/v1", "api_key": "b"},
+        ]
+        used = []
+
+        def fake_call(service, invoke, **_kwargs):
+            used.append(service["id"])
+            return invoke()
+
+        with mock.patch.object(SERVER.IMAGE_NODE_POOL, "call", side_effect=fake_call) as call:
+            first = SERVER.provider_image_affinity_call(ready, lambda service: {"node": service["id"]}, job_id)
+            second = SERVER.provider_image_affinity_call(ready, lambda service: {"node": service["id"]}, job_id)
+        self.assertEqual(first, second)
+        self.assertEqual(used, [used[0], used[0]])
+        self.assertEqual(SERVER.JOBS[job_id]["image_affinity_node_id"], used[0])
+        self.assertTrue(all(item.kwargs["skip_cooldown"] for item in call.call_args_list))
+
+    def test_single_image_node_is_recorded_as_job_affinity(self) -> None:
+        job_id = "single-node-affinity"
+        SERVER.JOBS[job_id] = self.job(job_id)
+        ready = [{"id": "only-node", "base_url": "https://only.example/v1", "api_key": "a"}]
+        with mock.patch.object(SERVER.IMAGE_NODE_POOL, "call_any", return_value={"ok": True}):
+            SERVER.provider_image_affinity_call(ready, lambda service: {"node": service["id"]}, job_id)
+        self.assertEqual(SERVER.JOBS[job_id]["image_affinity_node_id"], "only-node")
+
+    def test_standard_job_freezes_approved_character_asset(self) -> None:
+        from PIL import Image
+
+        asset_id = "abcdef123456"
+        asset_dir = SERVER.CHARACTER_LIBRARY_DIR / SERVER.character_style_key(SERVER.DEFAULT_STYLE) / asset_id
+        asset_dir.mkdir(parents=True)
+        Image.effect_noise((128, 128), 80).convert("RGB").save(asset_dir / "character-sheet.png")
+        SERVER.atomic_write_json(asset_dir / "asset.json", {
+            "id": asset_id, "style": SERVER.DEFAULT_STYLE, "label": "青年男",
+            "description": "短黑发青年男性，深色上衣", "status": "approved",
+            "image": "character-sheet.png", "created_at": 1,
+        })
+        bindings = [{
+            "role_id": "role_01", "story_name": "小林", "description": "短黑发青年男性，深色上衣",
+            "gender": "男", "age_group": "青年", "asset_id": asset_id,
+        }]
+        response = TestClient(SERVER.app).post("/api/jobs", data={
+            "copy": "小林走进房间，随后坐在桌边认真写下今天的计划。",
+            "voice_mode": "none", "style": SERVER.DEFAULT_STYLE,
+            "character_bindings": json.dumps(bindings, ensure_ascii=False),
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        job_id = response.json()["id"]
+        saved = SERVER.JOBS[job_id]["character_bindings"][0]
+        self.assertEqual(saved["story_name"], "小林")
+        self.assertTrue((SERVER.JOBS_DIR / job_id / saved["image"]).exists())
+
+    def test_interrupted_character_draw_becomes_visible_error(self) -> None:
+        asset_id = "abcdef123456"
+        asset_dir = SERVER.CHARACTER_LIBRARY_DIR / SERVER.character_style_key(SERVER.DEFAULT_STYLE) / asset_id
+        asset_dir.mkdir(parents=True)
+        SERVER.atomic_write_json(asset_dir / "asset.json", {
+            "id": asset_id,
+            "style": SERVER.DEFAULT_STYLE,
+            "label": "候选",
+            "description": "短发青年男性",
+            "status": "queued",
+            "image": None,
+            "created_at": 1,
+        })
+        SERVER.recover_interrupted_character_draws()
+        _manifest, saved = SERVER.character_asset_record(asset_id)
+        self.assertEqual(saved["status"], "error")
+        self.assertIn("后台重启中断", saved["error"])
+
+    def test_standard_job_rejects_unmatched_character(self) -> None:
+        response = TestClient(SERVER.app).post("/api/jobs", data={
+            "copy": "小林走进房间，随后坐在桌边认真写下今天的计划。",
+            "voice_mode": "none", "style": SERVER.DEFAULT_STYLE,
+            "character_bindings": json.dumps([{"role_id": "role_01", "story_name": "小林", "asset_id": None}], ensure_ascii=False),
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("抽卡区", response.text)
+
+    def test_character_plan_requires_scene_cast_ids(self) -> None:
+        payload = [{"title": "小林进门", "key_text": "回到家", "concept": "小林走进房间", "elements": ["小林推门", "房间桌椅", "小林坐下"], "cast_ids": ["role_01"]}]
+        with mock.patch.object(SERVER, "provider_text", return_value={"output_text": json.dumps(payload, ensure_ascii=False)}):
+            scenes = SERVER.make_plan(
+                {"text_model": "gpt-5"}, "小林走进房间，随后坐在桌边认真写下今天的计划。",
+                8.0, SERVER.DEFAULT_STYLE, "role_01=小林（短黑发青年男性）",
+            )
+        self.assertEqual(scenes[0]["cast_ids"], ["role_01"])
 
     def test_clear_japanese_storybook_uses_built_in_style_reference(self) -> None:
         paths, instruction = SERVER.clear_storybook_reference_context()
