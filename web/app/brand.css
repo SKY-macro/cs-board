@@ -598,6 +598,21 @@
   color: #fff;
 }
 
+.historyList button.rerenderHistory {
+  border: 1px solid #dc4f2d;
+  background: #ef5b36;
+  color: #fff;
+  font-size: 10px;
+  white-space: nowrap;
+  box-shadow: 0 4px 12px #ef5b3638;
+}
+
+.historyList button.rerenderHistory:hover,
+.historyList button.rerenderHistory:focus-visible {
+  border-color: #b73518;
+  background: #d94725;
+}
+
 .historyList a.downloadHistory {
   border: 1px solid #aac4af;
   background: #edf5ef;

@@ -158,6 +158,11 @@ test("offers rerender below the gallery and hides stale video", async () => {
   assert.match(page, />重新渲染成片<\/button>/);
   assert.match(page, /result_url&&!hasPendingRerender/);
   assert.match(css, /\.galleryButton,\s*\.rerenderProgressButton/);
+  assert.match(page, /className="rerenderHistory"/);
+  assert.match(page, /已重新生成，重新渲染成片/);
+  assert.match(page, /rerender\(item\)/);
+  assert.match(css, /\.historyList button\.rerenderHistory\s*\{/);
+  assert.match(css, /font-size:\s*10px/);
 });
 
 test("keeps running jobs in the background while creating another task", async () => {

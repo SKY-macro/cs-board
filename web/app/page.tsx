@@ -2119,7 +2119,7 @@ export default function Home() {
                     {item.task_name || `未命名任务-${item.id.slice(-4)}`}
                   </strong>
                   <span>
-                    {formatDate(item.created_at)} · {item.style || "默认风格"} · {item.stage}
+                    {formatDate(item.created_at)} · {item.style || "默认风格"} · {hasPendingRerender(item) ? "图片已更新" : item.stage}
                   </span>
                   <span className="historyMeta">
                     笔身文字：{item.pen_text || "未设置"} · IP：
@@ -2144,6 +2144,18 @@ export default function Home() {
                     <a className="downloadHistory" href={`${API}${item.result_url}`} download onClick={(event) => event.stopPropagation()}>
                       下载成片
                     </a>
+                  )}
+                  {item.status === "done" && hasPendingRerender(item) && (
+                    <button
+                      type="button"
+                      className="rerenderHistory"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        rerender(item);
+                      }}
+                    >
+                      已重新生成，重新渲染成片
+                    </button>
                   )}
                   <button
                     type="button"
