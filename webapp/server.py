@@ -2759,6 +2759,7 @@ def regenerate_board_image(job_id: str, page: int, prompt: str) -> None:
             board_regeneration=None,
             error=None,
             can_rerender=True,
+            needs_rerender=True,
         )
     except Exception as exc:
         fail_job(job_id, "单图重新生成失败", exc)

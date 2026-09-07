@@ -127,3 +127,29 @@ test("keeps prompt editing inside task details and separates select from zoom", 
   assert.match(css, /\.taskDetailDialog\s*\{[^}]*font-size:\s*15px/s);
   assert.match(css, /\.galleryExpand\s*\{/);
 });
+
+test("embeds used media controls inside task details", async () => {
+  const [page, css] = await Promise.all([
+    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/brand.css", import.meta.url), "utf8"),
+  ]);
+  assert.match(page, /className="detailMaterials"/);
+  assert.match(page, /本次使用的素材/);
+  assert.match(page, /用当前图片重新渲染成片/);
+  assert.doesNotMatch(page, /className="detailMediaDock"/);
+  assert.match(css, /\.detailMaterials\s*\{/);
+  assert.doesNotMatch(css, /\.detailMediaDock\s*\{[^}]*position:\s*fixed/s);
+});
+
+test("offers rerender below the gallery and hides stale video", async () => {
+  const [page, css] = await Promise.all([
+    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/brand.css", import.meta.url), "utf8"),
+  ]);
+  assert.match(page, /needs_rerender\?:boolean/);
+  assert.match(page, /hasPendingRerender/);
+  assert.match(page, /className="rerenderProgressButton"/);
+  assert.match(page, />重新渲染成片<\/button>/);
+  assert.match(page, /result_url&&!hasPendingRerender/);
+  assert.match(css, /\.galleryButton,\s*\.rerenderProgressButton/);
+});
