@@ -207,11 +207,16 @@ test("shows a live prompt structure panel for the selected visual style", async 
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
   ]);
   assert.match(page, /fetch\(`\$\{API\}\/api\/styles`\)/);
+  assert.match(page, /fetch\(`\$\{API\}\/api\/style-prompt-preview`/);
   assert.match(page, /onClick=\{\(\)=>setStyle\(item\.name\)\}/);
   assert.match(page, /className="panelstylePromptPanel"/);
   assert.match(page, /画风提示词结构/);
   assert.match(page, /promptStructureLayers\.map/);
-  assert.match(page, /当前画风配方/);
+  assert.match(page, /完整拼接提示词（后台原文）/);
+  assert.match(page, /实际提交给图片模型的提示词/);
+  assert.match(page, /stylePromptPreview\?\.full_prompt/);
+  assert.match(page, /stylePromptPreview\.sent_prompt/);
+  assert.match(page, /超过上限：下方同时展示实际截取版本/);
   assert.match(page, /分镜内容＋构图＋人物身份＋画风配方＋约束/);
   assert.match(css, /\.stylePromptPanel\s*\{/);
   assert.match(css, /\.styleRecipeBox\s*\{/);

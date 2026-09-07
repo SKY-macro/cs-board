@@ -2252,9 +2252,17 @@ def normalize_generated_image_aspect(path: Path, aspect_ratio: str) -> None:
         normalized.save(path, format="PNG", optimize=True)
 
 
+IMAGE_PROMPT_LIMIT = 1000
+
+
+def compact_image_prompt(prompt: str) -> str:
+    """Mirror the exact prompt compaction applied before an image provider call."""
+    return prompt if len(prompt) <= IMAGE_PROMPT_LIMIT else f"{prompt[:830]}\n{prompt[-160:]}"
+
+
 def generate_image(config: dict[str, Any], prompt: str, target: Path, reference_images: list[Path] | None = None, job_id: str | None = None, aspect_ratio: str = "16:9") -> None:
     # OpenLux documents a 1000-character limit for this GPT Image route.
-    compact_prompt = prompt if len(prompt) <= 1000 else f"{prompt[:830]}\n{prompt[-160:]}"
+    compact_prompt = compact_image_prompt(prompt)
     request_payload = {
         "model": config["image_model"],
         "prompt": compact_prompt,
@@ -3615,6 +3623,62 @@ def get_style_catalog() -> dict[str, Any]:
             for name, recipe in STYLE_PRESETS.items()
             if name != INFOGRAPHIC_STYLE
         ]
+    }
+
+
+@app.post("/api/style-prompt-preview")
+def preview_style_prompt(payload: dict[str, Any]) -> dict[str, Any]:
+    """Build the exact prompt template used by the image request without calling a provider."""
+    page_mode = str(payload.get("page_mode") or "standard")
+    style = str(payload.get("style") or DEFAULT_STYLE)
+    if page_mode != "custom" and style not in STYLE_PRESETS:
+        raise HTTPException(status_code=400, detail=f"未知画面风格：{style}")
+    scene_count = max(1, min(4, int(payload.get("scenes_per_image") or 1)))
+    aspect_ratio = normalize_aspect_ratio(payload.get("aspect_ratio"))
+    presentation_mode = normalize_presentation_mode(payload.get("presentation_mode"))
+    identity_mode = normalize_identity_mode(payload.get("identity_mode"))
+    if page_mode == "infographic":
+        scenes = [{
+            "concept": "{{当前页面的中心观点}}",
+            "illustration_elements": ["{{主体}}", "{{动作或状态}}", "{{关键环境或道具}}"],
+            "visual_strategy": "{{PPT规划阶段选择的视觉策略}}",
+            "layout_type": "{{插图槽位类型}}",
+            "composition": "{{插图构图方式}}",
+        }]
+    else:
+        scenes = [
+            {
+                "concept": f"{{{{分镜{i}的事件与画面概念}}}}",
+                "elements": [f"{{{{分镜{i}的主体与动作}}}}", f"{{{{分镜{i}的环境与关键道具}}}}"],
+                "text": f"{{{{分镜{i}对应原文}}}}",
+            }
+            for i in range(1, scene_count + 1)
+        ]
+    reference_instruction = "{{上传风格参考图：只学习视觉风格，不复制图中人物或事件}}" if page_mode == "custom" else ""
+    full_prompt = build_board_prompt(
+        scenes,
+        style if page_mode != "custom" else "自定义参考",
+        reference_instruction,
+        page_mode == "custom",
+        page_mode == "infographic",
+        aspect_ratio,
+        presentation_mode,
+        identity_mode,
+    )
+    sent_prompt = compact_image_prompt(full_prompt)
+    return {
+        "full_prompt": full_prompt,
+        "sent_prompt": sent_prompt,
+        "full_length": len(full_prompt),
+        "sent_length": len(sent_prompt),
+        "truncated": sent_prompt != full_prompt,
+        "request": {
+            "prompt_limit": IMAGE_PROMPT_LIMIT,
+            "n": 1,
+            "size": aspect_api_size(aspect_ratio),
+            "quality": "medium",
+            "format": "png",
+        },
     }
 
 

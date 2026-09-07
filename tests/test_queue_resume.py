@@ -107,6 +107,24 @@ class QueueResumeTests(unittest.TestCase):
         self.assertEqual(len(styles), len(SERVER.STYLE_PRESETS) - 1)
         self.assertNotIn(SERVER.INFOGRAPHIC_STYLE, styles)
 
+    def test_style_prompt_preview_matches_the_real_provider_prompt_compaction(self) -> None:
+        preview = SERVER.preview_style_prompt({
+            "page_mode": "standard",
+            "style": "水墨写意",
+            "scenes_per_image": 2,
+            "aspect_ratio": "9:16",
+            "presentation_mode": "whiteboard",
+            "identity_mode": "female",
+        })
+
+        self.assertIn("{{分镜1的事件与画面概念}}", preview["full_prompt"])
+        self.assertIn("{{分镜2对应原文}}", preview["full_prompt"])
+        self.assertIn(SERVER.IDENTITY_PROMPTS["female"], preview["full_prompt"])
+        self.assertEqual(preview["sent_prompt"], SERVER.compact_image_prompt(preview["full_prompt"]))
+        self.assertEqual(preview["full_length"], len(preview["full_prompt"]))
+        self.assertEqual(preview["sent_length"], len(preview["sent_prompt"]))
+        self.assertEqual(preview["request"]["size"], SERVER.aspect_api_size("9:16"))
+
     def test_story_handdrawn_library_adds_exactly_twenty_styles(self) -> None:
         self.assertEqual(len(SERVER.HANDDRAWN_STYLE_PRESETS), 20)
         self.assertIn("彩铅日记漫画（默认）", SERVER.HANDDRAWN_STYLE_PRESETS)

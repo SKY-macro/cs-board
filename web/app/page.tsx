@@ -162,6 +162,14 @@ type ModelCatalog = {
   selected_text_model: string;
   selected_image_model: string;
 };
+type StylePromptPreview = {
+  full_prompt: string;
+  sent_prompt: string;
+  full_length: number;
+  sent_length: number;
+  truncated: boolean;
+  request: { prompt_limit: number; n: number; size: string; quality: string; format: string };
+};
 type SaveState = "idle" | "pending" | "saving" | "saved" | "error";
 const defaults: Config = {
   api_key: "",
@@ -477,6 +485,7 @@ export default function Home() {
   const [identityMode, setIdentityMode] = useState<IdentityMode>("consistent");
   const [style, setStyle] = useState("极简粗线简笔白板风");
   const [styleRecipes, setStyleRecipes] = useState<Record<string, string>>({});
+  const [stylePromptPreview, setStylePromptPreview] = useState<StylePromptPreview | null>(null);
   const [scenesPerImage, setScenesPerImage] = useState(1);
   const [aspectRatio, setAspectRatio] = useState("16:9");
   const [presentationMode, setPresentationMode] = useState<"whiteboard" | "story-color">("whiteboard");
@@ -514,6 +523,33 @@ export default function Home() {
       active = false;
     };
   }, []);
+  useEffect(() => {
+    let active = true;
+    setStylePromptPreview(null);
+    const timer = setTimeout(() => {
+      fetch(`${API}/api/style-prompt-preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          page_mode: pageMode,
+          style,
+          scenes_per_image: presentationMode === "story-color" ? 1 : scenesPerImage,
+          aspect_ratio: presentationMode === "story-color" ? "3:4" : aspectRatio,
+          presentation_mode: presentationMode,
+          identity_mode: identityMode,
+        }),
+      })
+        .then((response) => (response.ok ? response.json() : Promise.reject()))
+        .then((payload: StylePromptPreview) => {
+          if (active) setStylePromptPreview(payload);
+        })
+        .catch(() => undefined);
+    }, 120);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [pageMode, style, scenesPerImage, aspectRatio, presentationMode, identityMode]);
   useEffect(() => {
     let active = true;
     let reconnectTimer: ReturnType<typeof setInterval> | null = null;
@@ -2028,17 +2064,32 @@ export default function Home() {
                 </div>
               ))}
             </div>
-            <div className="styleRecipeBox">
+            <div className="styleRecipeBox fullPromptBox">
               <div>
-                <strong>当前画风配方</strong>
-                <span>{pageMode === "custom" ? "上传图片动态解析" : `${selectedStyleRecipeParts.length} 项`}</span>
+                <strong>完整拼接提示词（后台原文）</strong>
+                <span>{stylePromptPreview ? `${stylePromptPreview.full_length} 字符` : "等待新版后台"}</span>
               </div>
-              <ol>
-                {selectedStyleRecipeParts.map((part, index) => (
-                  <li key={`${style}-${index}`}>{part}</li>
-                ))}
-              </ol>
+              <pre>{stylePromptPreview?.full_prompt || `风格名称：${pageMode === "custom" ? "自定义参考" : style}\n视觉配方：${selectedStyleRecipe}\n\n完整动态模板将在当前运行任务结束、后台安全升级后显示。`}</pre>
             </div>
+            {stylePromptPreview?.truncated && (
+              <div className="styleRecipeBox sentPromptBox">
+                <div>
+                  <strong>实际提交给图片模型的提示词</strong>
+                  <span>{stylePromptPreview.sent_length} / {stylePromptPreview.request.prompt_limit} 字符</span>
+                </div>
+                <pre>{stylePromptPreview.sent_prompt}</pre>
+              </div>
+            )}
+            {stylePromptPreview && (
+              <div className="promptRequestMeta">
+                <span>请求参数</span>
+                <code>size={stylePromptPreview.request.size}</code>
+                <code>quality={stylePromptPreview.request.quality}</code>
+                <code>format={stylePromptPreview.request.format}</code>
+                <code>n={stylePromptPreview.request.n}</code>
+                <strong>{stylePromptPreview.truncated ? "超过上限：下方同时展示实际截取版本" : "未截断：完整原文即实际提交内容"}</strong>
+              </div>
+            )}
             <footer className="stylePromptFooter">
               <span>最终提示词</span>
               <strong>分镜内容 ＋ 构图 ＋ 人物身份 ＋ 画风配方 ＋ 约束</strong>
