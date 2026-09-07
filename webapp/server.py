@@ -718,6 +718,21 @@ class AdaptiveImageNodePool:
             self._persist()
         return changed
 
+    def clear_circuit_breaker(self, node_id: str) -> bool:
+        """Clear one node's active cooldown so it can be scheduled immediately."""
+        changed = False
+        with self.condition:
+            for state in self.states.values():
+                if str(state["node_id"]) != str(node_id):
+                    continue
+                state["cooldown_until"] = 0.0
+                state["next_request_at"] = 0.0
+                state["circuit_reason"] = ""
+                changed = True
+            if changed:
+                self.condition.notify_all()
+        return changed
+
     def _next_tier(self, rpm: int, rpm_limit: int) -> int:
         if rpm_limit > 10 and rpm >= 10:
             return min(rpm_limit, max(rpm + 1, math.ceil(rpm * 1.25)))
@@ -3822,6 +3837,13 @@ def reset_image_node_rpm_memory(node_id: str) -> dict[str, Any]:
     if not IMAGE_NODE_POOL.reset_failure_memory(node_id):
         raise HTTPException(status_code=404, detail="没有找到该图片节点的运行状态")
     return {"ok": True, "node_id": node_id, "message": "该节点的失败档位记忆已解除；当前429冷却仍继续生效"}
+
+
+@app.post("/api/image-nodes/{node_id}/clear-circuit-breaker")
+def clear_image_node_circuit_breaker(node_id: str) -> dict[str, Any]:
+    if not IMAGE_NODE_POOL.clear_circuit_breaker(node_id):
+        raise HTTPException(status_code=404, detail="没有找到该图片节点的运行状态")
+    return {"ok": True, "node_id": node_id, "message": "该节点的熔断已手动清除，可立即重新参与调度"}
 
 
 @app.post("/api/config")

@@ -964,6 +964,20 @@ export default function Home() {
       setConnectionMessage(error instanceof Error ? error.message : "解除失败");
     }
   };
+  const clearImageCircuitBreaker = async (nodeId: string) => {
+    if (!window.confirm("手动清除这个图片节点的熔断吗？节点会立即恢复调度；如果余额、密钥或服务故障尚未解决，下一次请求可能再次熔断。")) return;
+    try {
+      const response = await fetch(`${API}/api/image-nodes/${encodeURIComponent(nodeId)}/clear-circuit-breaker`, { method: "POST" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "清除失败");
+      setConnectionOk(true);
+      setConnectionMessage(data.message);
+      await loadHistory();
+    } catch (error) {
+      setConnectionOk(false);
+      setConnectionMessage(error instanceof Error ? error.message : "清除失败");
+    }
+  };
   const openRenameDialog = (source: Job) => {
     setRenameJob(source);
     setRenameDraft(source.task_name || source.id);
@@ -1582,6 +1596,11 @@ export default function Home() {
                       <i key={`${node.node_id}-${node.base_url}`} className={node.cooldown_seconds > 0 || node.runtime_rpm_capped || Number(node.tier_lock_seconds) > 0 ? "busy" : "idle"}>
                         图片节点 {index + 1} · {node.rpm_limit !== undefined ? `${node.rpm}/${node.effective_rpm_limit ?? node.rpm_limit}/${node.rpm_limit} RPM（当前/运行/配置） · 在途 ${node.in_flight}/${node.in_flight_limit} · ${imageCircuitLabel(node.circuit_reason)}${node.cooldown_seconds > 0 ? ` ${Math.ceil(node.cooldown_seconds)}秒` : ""}${node.runtime_rpm_capped ? ` · 已封顶${node.effective_rpm_limit ?? node.rpm} RPM至重启` : Number(node.tier_lock_seconds) > 0 ? ` · 高档锁定 ${Math.ceil(Number(node.tier_lock_seconds) / 60)}分钟` : node.recovery_mode ? ` · 恢复观察 ${node.promotion_required_successes}张/${Math.ceil(Number(node.promotion_required_seconds) / 60)}分钟` : ""} · 下次 ${Math.ceil(node.next_request_seconds || 0)}秒` : node.rpm !== undefined ? `${node.rpm} RPM · 在途 ${node.in_flight}` : `${node.concurrency} 路并发`} · 429 {node.rate_limit_count} 次 · 均耗 {node.average_latency.toFixed(1)} 秒 · 今日请求 {node.daily_used ?? 0}/{node.daily_budget ? node.daily_budget : "不限"}
                         {node.daily_exhausted ? "（额度已用尽）" : ""}
+                        {node.cooldown_seconds > 0 && (
+                          <button type="button" className="resetTierMemory clearCircuitBreaker" onClick={() => clearImageCircuitBreaker(node.node_id)}>
+                            清除熔断
+                          </button>
+                        )}
                         {(node.runtime_rpm_capped || Number(node.tier_lock_seconds) > 0 || node.recovery_mode) && (
                           <button type="button" className="resetTierMemory" onClick={() => resetImageTierMemory(node.node_id)}>
                             解除档位记忆

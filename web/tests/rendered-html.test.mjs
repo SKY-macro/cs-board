@@ -220,6 +220,9 @@ test("shows image relay RPM and in-flight statistics in API settings", async () 
   assert.match(page, /resetImageTierMemory/);
   assert.match(page, /reset-rpm-memory/);
   assert.match(page, />解除档位记忆<\/button>/);
+  assert.match(page, /clearImageCircuitBreaker/);
+  assert.match(page, /clear-circuit-breaker/);
+  assert.match(page, />清除熔断<\/button>/);
 });
 
 test("shows a live prompt structure panel for the selected visual style", async () => {

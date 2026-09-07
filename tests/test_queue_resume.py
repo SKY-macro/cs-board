@@ -707,6 +707,30 @@ class QueueResumeTests(unittest.TestCase):
         self.assertFalse(snapshot["runtime_rpm_capped"])
         self.assertEqual(snapshot["tier_failure_count"], 0)
 
+    def test_manual_clear_circuit_breaker_is_node_scoped_and_preserves_statistics(self) -> None:
+        first = {"id": "first", "base_url": "https://one.example/v1", "api_key": "one", "rpm_limit": 10}
+        second = {"id": "second", "base_url": "https://two.example/v1", "api_key": "two", "rpm_limit": 10}
+        with SERVER.IMAGE_NODE_POOL.condition:
+            _first_key, first_state = SERVER.IMAGE_NODE_POOL._state(first)
+            _second_key, second_state = SERVER.IMAGE_NODE_POOL._state(second)
+            first_state["cooldown_until"] = time.monotonic() + 3600
+            first_state["circuit_reason"] = "authentication"
+            first_state["rate_limit_count"] = 4
+            first_state["last_status"] = 403
+            second_state["cooldown_until"] = time.monotonic() + 300
+            second_state["circuit_reason"] = "unavailable"
+
+        response = TestClient(SERVER.app).post("/api/image-nodes/first/clear-circuit-breaker")
+
+        self.assertEqual(response.status_code, 200)
+        snapshots = {item["node_id"]: item for item in SERVER.IMAGE_NODE_POOL.snapshot()}
+        self.assertEqual(snapshots["first"]["cooldown_seconds"], 0)
+        self.assertEqual(snapshots["first"]["circuit_reason"], "")
+        self.assertEqual(snapshots["first"]["rate_limit_count"], 4)
+        self.assertEqual(snapshots["first"]["last_status"], 403)
+        self.assertGreater(snapshots["second"]["cooldown_seconds"], 0)
+        self.assertEqual(snapshots["second"]["circuit_reason"], "unavailable")
+
     def test_image_node_promotes_only_one_tier_after_stable_window(self) -> None:
         pool = SERVER.AdaptiveImageNodePool(
             Path(self.temporary.name) / "promotion.json",
