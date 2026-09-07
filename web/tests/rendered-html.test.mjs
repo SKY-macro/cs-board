@@ -256,6 +256,10 @@ test("supports one-click missing-role draws and live green binding feedback", as
   assert.match(page, /"去抽卡"/);
   assert.match(page, /story_name.*asset_label/s);
   assert.match(page, /setCharacterBindings\(\(items\)=>items\.map/);
+  assert.ok(
+    page.indexOf("<strong>本任务角色资产</strong>") < page.indexOf("<strong>成片设置</strong>"),
+    "task character assets should appear immediately before production settings",
+  );
   assert.match(css, /\.taskCharacterBindings article\.matched/);
   assert.match(css, /\.drawMissingRole/);
 });

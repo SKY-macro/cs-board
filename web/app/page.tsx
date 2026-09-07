@@ -2021,15 +2021,6 @@ export default function Home() {
                   </button>
                 ))}
               </div>
-              <section className="taskCharacterMatcher">
-                <div><strong>本任务角色资产</strong><span>AI 只匹配“{style}”的已审核角色；每个分镜只上传本幕实际出镜人物。</span></div>
-                <div className="taskCharacterActions">
-                  <button type="button" className="secondary" disabled={characterBusy || copy.trim().length < 10} onClick={matchCharacters}>{characterBusy ? "分析中…" : characterMatchReady ? "重新分析并匹配" : "AI 分析并挑选角色"}</button>
-                  <button type="button" className="secondary" onClick={() => setCharacterLibraryOpen(true)}>打开角色抽卡库</button>
-                </div>
-                {characterBindings.length > 0 && <div className="taskCharacterBindings">{characterBindings.map((binding) => <article key={binding.role_id} className={binding.asset_id ? "matched" : "missing"}>{binding.asset_image_url ? <img src={`${API}${binding.asset_image_url}`} alt="" /> : <span>缺</span>}<div><b>{binding.story_name}</b>{binding.asset_label && <small className="assetMatchName">已使用资产：{binding.asset_label}</small>}<small>{binding.age_group} · {binding.gender}</small><p>{binding.description}</p></div>{binding.asset_id ? <em>已匹配</em> : <button type="button" className="drawMissingRole" disabled={characterBusy || Boolean(pendingDrawRoles[binding.role_id])} onClick={() => drawMissingCharacter(binding)}>{drawingRoleId === binding.role_id ? "提交中…" : pendingDrawRoles[binding.role_id] ? "等待审核" : "去抽卡"}</button>}</article>)}</div>}
-                {characterMessage && <p className="characterMessage">{characterMessage}</p>}
-              </section>
             </>
           ) : (
             <section className="referenceBuilder">
@@ -2151,6 +2142,17 @@ export default function Home() {
           )}
         </section>
         <div className="rightStack">
+          {pageMode === "standard" && (
+            <section className="panel taskCharacterMatcher">
+              <div><strong>本任务角色资产</strong><span>AI 只匹配“{style}”的已审核角色；每个分镜只上传本幕实际出镜人物。</span></div>
+              <div className="taskCharacterActions">
+                <button type="button" className="secondary" disabled={characterBusy || copy.trim().length < 10} onClick={matchCharacters}>{characterBusy ? "分析中…" : characterMatchReady ? "重新分析并匹配" : "AI 分析并挑选角色"}</button>
+                <button type="button" className="secondary" onClick={() => setCharacterLibraryOpen(true)}>打开角色抽卡库</button>
+              </div>
+              {characterBindings.length > 0 && <div className="taskCharacterBindings">{characterBindings.map((binding) => <article key={binding.role_id} className={binding.asset_id ? "matched" : "missing"}>{binding.asset_image_url ? <img src={`${API}${binding.asset_image_url}`} alt="" /> : <span>缺</span>}<div><b>{binding.story_name}</b>{binding.asset_label && <small className="assetMatchName">已使用资产：{binding.asset_label}</small>}<small>{binding.age_group} · {binding.gender}</small><p>{binding.description}</p></div>{binding.asset_id ? <em>已匹配</em> : <button type="button" className="drawMissingRole" disabled={characterBusy || Boolean(pendingDrawRoles[binding.role_id])} onClick={() => drawMissingCharacter(binding)}>{drawingRoleId === binding.role_id ? "提交中…" : pendingDrawRoles[binding.role_id] ? "等待审核" : "去抽卡"}</button>}</article>)}</div>}
+              {characterMessage && <p className="characterMessage">{characterMessage}</p>}
+            </section>
+          )}
           <section className="panel controlPanel">
             <div className="controlCaption">
               <strong>成片设置</strong>
