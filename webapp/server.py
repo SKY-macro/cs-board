@@ -35,7 +35,7 @@ PYTHON = Path(sys.executable)
 NODE = shutil.which("node") or "node"
 REMOTION_RENDERER = ROOT / "video_renderer"
 HAND = ROOT / "assets" / "drawing-hand-clean.png"
-PIPELINE_VERSION = "narrated_deck_v8_oil_visual"
+PIPELINE_VERSION = "narrated_deck_v9_image_rpm"
 ALIGNMENT_SEGMENTATION = "word-boundary-dtw-audio-v2"
 SUBTITLE_FONT = os.environ.get(
     "CS_BOARD_SUBTITLE_FONT",
@@ -360,7 +360,7 @@ RENDER_ACTIVE_LOCK = threading.Lock()
 RUNNING_PROCESSES: dict[str, set[subprocess.Popen[str]]] = {}
 RUNNING_PROCESSES_LOCK = threading.Lock()
 MODEL_CONCURRENCY = 4
-IMAGE_GENERATION_CONCURRENCY = max(1, min(3, int(os.environ.get("IMAGE_GENERATION_CONCURRENCY", "3"))))
+IMAGE_GENERATION_RPM = max(1, min(60, int(os.environ.get("IMAGE_GENERATION_RPM", "3"))))
 WHITEBOARD_RENDER_CONCURRENCY = max(1, min(4, int(os.environ.get("WHITEBOARD_RENDER_CONCURRENCY", "3"))))
 RENDER_JOB_CONCURRENCY = max(1, min(3, int(os.environ.get("RENDER_JOB_CONCURRENCY", "2"))))
 RENDER_JOB_SEMAPHORE = threading.BoundedSemaphore(RENDER_JOB_CONCURRENCY)
@@ -428,11 +428,12 @@ class ImageNodeCoolingDown(RuntimeError):
 
 
 class AdaptiveImageNodePool:
-    """Share one adaptive concurrency budget per image relay across every job."""
+    """Pace image request starts per relay without waiting for earlier responses."""
 
-    def __init__(self, stats_path: Path, default_limit: int = 3):
+    def __init__(self, stats_path: Path, default_rpm: int = 3, window_seconds: float = 60.0):
         self.stats_path = stats_path
-        self.default_limit = max(1, min(3, int(default_limit)))
+        self.default_rpm = max(1, min(60, int(default_rpm)))
+        self.window_seconds = max(0.0, float(window_seconds))
         self.condition = threading.Condition()
         self.states: dict[str, dict[str, Any]] = {}
         self._load()
@@ -448,7 +449,7 @@ class AdaptiveImageNodePool:
             self.states[str(key)] = {
                 "node_id": str(raw.get("node_id") or ""),
                 "base_url": str(raw.get("base_url") or ""),
-                "limit": max(1, min(3, int(raw.get("limit") or self.default_limit))),
+                "rpm": max(1, min(60, int(raw.get("rpm") or raw.get("limit") or self.default_rpm))),
                 "in_flight": 0,
                 "success_streak": max(0, int(raw.get("success_streak") or 0)),
                 "success_count": max(0, int(raw.get("success_count") or 0)),
@@ -456,6 +457,7 @@ class AdaptiveImageNodePool:
                 "unavailable_count": max(0, int(raw.get("unavailable_count") or 0)),
                 "average_latency": max(0.0, float(raw.get("average_latency") or 0.0)),
                 "cooldown_until": 0.0,
+                "next_request_at": 0.0,
                 "last_status": raw.get("last_status"),
             }
 
@@ -471,7 +473,7 @@ class AdaptiveImageNodePool:
         state = self.states.setdefault(key, {
             "node_id": str(config.get("id") or ""),
             "base_url": str(config.get("base_url") or "").strip().rstrip("/"),
-            "limit": self.default_limit,
+            "rpm": self.default_rpm,
             "in_flight": 0,
             "success_streak": 0,
             "success_count": 0,
@@ -479,6 +481,7 @@ class AdaptiveImageNodePool:
             "unavailable_count": 0,
             "average_latency": 0.0,
             "cooldown_until": 0.0,
+            "next_request_at": 0.0,
             "last_status": None,
         })
         return key, state
@@ -486,7 +489,7 @@ class AdaptiveImageNodePool:
     def _persist(self) -> None:
         with self.condition:
             nodes = {
-                key: {field: value for field, value in state.items() if field not in {"in_flight", "cooldown_until"}}
+                key: {field: value for field, value in state.items() if field not in {"in_flight", "cooldown_until", "next_request_at"}}
                 for key, state in self.states.items()
             }
         try:
@@ -507,7 +510,7 @@ class AdaptiveImageNodePool:
             return [{
                 "node_id": state["node_id"],
                 "base_url": state["base_url"],
-                "concurrency": int(state["limit"]),
+                "rpm": int(state["rpm"]),
                 "in_flight": int(state["in_flight"]),
                 "success_streak": int(state["success_streak"]),
                 "success_count": int(state["success_count"]),
@@ -528,10 +531,14 @@ class AdaptiveImageNodePool:
                     cooldown = max(0.0, float(state["cooldown_until"]) - now)
                     if cooldown and skip_cooldown:
                         raise ImageNodeCoolingDown(cooldown)
-                    if not cooldown and int(state["in_flight"]) < int(state["limit"]):
+                    rate_wait = max(0.0, float(state["next_request_at"]) - now)
+                    wait_seconds = max(cooldown, rate_wait)
+                    if not wait_seconds:
+                        interval = self.window_seconds / max(1, int(state["rpm"]))
+                        state["next_request_at"] = now + interval
                         state["in_flight"] = int(state["in_flight"]) + 1
                         break
-                    self.condition.wait(timeout=max(0.05, min(cooldown or 0.5, 1.0)))
+                    self.condition.wait(timeout=max(0.01, min(wait_seconds, 1.0)))
             started = time.monotonic()
             try:
                 result = invoke()
@@ -545,7 +552,7 @@ class AdaptiveImageNodePool:
                     state["last_status"] = status or "error"
                     if status == 429:
                         state["rate_limit_count"] = int(state["rate_limit_count"]) + 1
-                        state["limit"] = 1
+                        state["rpm"] = 1
                         wait_seconds = max(0.5, float(exc.retry_after or provider_retry_delay(rate_limit_retries)))
                         state["cooldown_until"] = max(float(state["cooldown_until"]), time.monotonic() + wait_seconds)
                     elif status == 503:
@@ -553,7 +560,7 @@ class AdaptiveImageNodePool:
                     self.condition.notify_all()
                 self._persist()
                 if status == 429 and job_id and job_id in JOBS:
-                    update_job(job_id, stage=f"图片节点触发 429，已降为 1 路并按 Retry-After 等待 {math.ceil(wait_seconds)} 秒")
+                    update_job(job_id, stage=f"图片节点触发 429，已降为 1 RPM 并按 Retry-After 等待 {math.ceil(wait_seconds)} 秒")
                 if status == 429 and retry_rate_limit and rate_limit_retries < 2:
                     rate_limit_retries += 1
                     continue
@@ -570,18 +577,18 @@ class AdaptiveImageNodePool:
                     )
                     state["success_streak"] = int(state["success_streak"]) + 1
                     state["last_status"] = 200
-                    if int(state["limit"]) == 1 and int(state["success_streak"]) >= 3:
-                        state["limit"] = 2
+                    if int(state["rpm"]) == 1 and self.default_rpm >= 2 and int(state["success_streak"]) >= 3:
+                        state["rpm"] = 2
                         state["success_streak"] = 0
-                    elif int(state["limit"]) == 2 and int(state["success_streak"]) >= 6:
-                        state["limit"] = 3
+                    elif int(state["rpm"]) == 2 and self.default_rpm >= 3 and int(state["success_streak"]) >= 6:
+                        state["rpm"] = self.default_rpm
                         state["success_streak"] = 0
                     self.condition.notify_all()
                 self._persist()
                 return result
 
 
-IMAGE_NODE_POOL = AdaptiveImageNodePool(IMAGE_NODE_STATS_PATH, IMAGE_GENERATION_CONCURRENCY)
+IMAGE_NODE_POOL = AdaptiveImageNodePool(IMAGE_NODE_STATS_PATH, IMAGE_GENERATION_RPM)
 
 
 def valid_image_file(path: Path) -> bool:
@@ -2625,10 +2632,12 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path | None, scen
             job_id,
             "images",
             "PPT 插图",
-            f"正在以节点自适应并发生成 {len(boards)} 张插图（默认 {min(IMAGE_GENERATION_CONCURRENCY, len(boards))} 路）",
+            f"正在按图片节点 {IMAGE_GENERATION_RPM} RPM 提交 {len(boards)} 张插图（响应互不阻塞）",
             36,
         )
-        with ThreadPoolExecutor(max_workers=min(IMAGE_GENERATION_CONCURRENCY, len(boards))) as executor:
+        # Every board gets a waiting worker so a slow response cannot consume
+        # the request-start budget. AdaptiveImageNodePool only paces starts.
+        with ThreadPoolExecutor(max_workers=len(boards)) as executor:
             futures = [executor.submit(generate_board_image, i, board) for i, board in enumerate(boards, 1)]
             for future in as_completed(futures):
                 future.result()
@@ -3144,7 +3153,7 @@ def health() -> dict[str, Any]:
         "queues": {
             "voice": {"concurrency": len(nodes), "waiting": VOICE_QUEUE.qsize(), "nodes": voice_nodes},
             "model": {"concurrency": MODEL_CONCURRENCY, "waiting": MODEL_QUEUE.qsize()},
-            "image": {"default_concurrency": IMAGE_GENERATION_CONCURRENCY, "nodes": IMAGE_NODE_POOL.snapshot()},
+            "image": {"default_rpm": IMAGE_GENERATION_RPM, "nodes": IMAGE_NODE_POOL.snapshot()},
             "render": {"concurrency": RENDER_JOB_CONCURRENCY, "active": render_active, "waiting": max(0, render_waiting - render_active)},
         },
     }

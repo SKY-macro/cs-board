@@ -168,10 +168,11 @@ test("keeps running jobs in the background while creating another task", async (
   assert.match(css, /\.newTaskButton\s*\{/);
 });
 
-test("shows adaptive image relay statistics in API settings", async () => {
+test("shows image relay RPM and in-flight statistics in API settings", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
-  assert.match(page, /image:\{default_concurrency:number;nodes:/);
-  assert.match(page, /图片单节点默认 \{health\.queues\.image\.default_concurrency\} 路自适应/);
+  assert.match(page, /image:\{default_rpm\?:number;default_concurrency\?:number;nodes:/);
+  assert.match(page, /health\.queues\.image\.default_rpm!==undefined/);
+  assert.match(page, /RPM · 在途/);
   assert.match(page, /429 \{node\.rate_limit_count\} 次/);
   assert.match(page, /均耗 \{node\.average_latency\.toFixed\(1\)\} 秒/);
 });

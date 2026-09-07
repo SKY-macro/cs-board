@@ -282,7 +282,7 @@ class QueueResumeTests(unittest.TestCase):
         sleep.assert_not_called()
 
     def test_image_node_drops_to_one_after_429_and_recovers_in_steps(self) -> None:
-        pool = SERVER.AdaptiveImageNodePool(Path(self.temporary.name) / "adaptive.json", 3)
+        pool = SERVER.AdaptiveImageNodePool(Path(self.temporary.name) / "adaptive.json", 3, window_seconds=0)
         config = {"id": "primary", "base_url": "https://relay.example/v1", "api_key": "secret"}
         with self.assertRaises(SERVER.ProviderHTTPError):
             pool.call(
@@ -292,7 +292,7 @@ class QueueResumeTests(unittest.TestCase):
                 skip_cooldown=False,
             )
         snapshot = pool.snapshot()[0]
-        self.assertEqual(snapshot["concurrency"], 1)
+        self.assertEqual(snapshot["rpm"], 1)
         self.assertEqual(snapshot["rate_limit_count"], 1)
         self.assertGreaterEqual(snapshot["cooldown_seconds"], 11)
         self.assertNotIn("secret", json.dumps(snapshot))
@@ -301,44 +301,49 @@ class QueueResumeTests(unittest.TestCase):
             pool.states[pool.node_key(config)]["cooldown_until"] = 0
         for _ in range(3):
             pool.call(config, lambda: {"ok": True}, retry_rate_limit=False, skip_cooldown=False)
-        self.assertEqual(pool.snapshot()[0]["concurrency"], 2)
+        self.assertEqual(pool.snapshot()[0]["rpm"], 2)
         for _ in range(6):
             pool.call(config, lambda: {"ok": True}, retry_rate_limit=False, skip_cooldown=False)
         recovered = pool.snapshot()[0]
-        self.assertEqual(recovered["concurrency"], 3)
+        self.assertEqual(recovered["rpm"], 3)
         self.assertEqual(recovered["success_count"], 9)
 
-    def test_image_node_limit_is_shared_across_concurrent_jobs(self) -> None:
-        pool = SERVER.AdaptiveImageNodePool(Path(self.temporary.name) / "shared.json", 3)
+    def test_image_node_rpm_paces_starts_without_waiting_for_responses(self) -> None:
+        pool = SERVER.AdaptiveImageNodePool(Path(self.temporary.name) / "shared.json", 3, window_seconds=0.12)
         config = {"id": "shared", "base_url": "https://relay.example/v1", "api_key": "secret"}
         release = threading.Event()
         lock = threading.Lock()
         active = 0
-        maximum = 0
+        starts: list[float] = []
 
         def invoke() -> dict:
-            nonlocal active, maximum
+            nonlocal active
             with lock:
                 active += 1
-                maximum = max(maximum, active)
+                starts.append(time.monotonic())
             release.wait(2)
             with lock:
                 active -= 1
             return {"ok": True}
 
-        threads = [threading.Thread(target=lambda: pool.call(config, invoke, retry_rate_limit=False, skip_cooldown=False)) for _ in range(6)]
+        threads = [threading.Thread(target=lambda: pool.call(config, invoke, retry_rate_limit=False, skip_cooldown=False)) for _ in range(4)]
         for thread in threads:
             thread.start()
         deadline = time.time() + 2
         while time.time() < deadline:
             with lock:
-                if active == 3:
+                if active == 4:
                     break
             time.sleep(0.01)
+        with lock:
+            captured_starts = list(starts)
+            captured_active = active
         release.set()
         for thread in threads:
             thread.join(2)
-        self.assertEqual(maximum, 3)
+        self.assertEqual(captured_active, 4)
+        self.assertEqual(len(captured_starts), 4)
+        self.assertTrue(all(later - earlier >= 0.025 for earlier, later in zip(captured_starts, captured_starts[1:])))
 
     def test_text_provider_falls_back_to_chat_completions(self) -> None:
         unsupported = mock.Mock(is_error=True, status_code=404, text="responses endpoint not found")
