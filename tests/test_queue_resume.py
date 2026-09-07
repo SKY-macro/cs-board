@@ -883,6 +883,30 @@ class QueueResumeTests(unittest.TestCase):
         self.assertEqual(snapshot["daily_used"], 1)
         self.assertEqual(snapshot["daily_remaining"], 1439)
 
+    def test_image_dispatch_status_reports_each_real_node_and_runtime_rpm(self) -> None:
+        job_id = "image-dispatch-status"
+        SERVER.JOBS[job_id] = {**self.job(job_id), "status": "running", "current_phase": "images", "boards": 18, "completed_boards": 0}
+        pool = SERVER.AdaptiveImageNodePool(Path(self.temporary.name) / "dispatch-status.json", 3, window_seconds=0, max_rpm=300)
+        configs = [
+            {"id": "first", "base_url": "https://one.example/v1", "api_key": "one", "rpm_limit": 50, "rpd_limit": 800, "utilization_percent": 80, "_position": 1},
+            {"id": "second", "base_url": "https://two.example/v1", "api_key": "two", "rpm_limit": 90, "rpd_limit": 1600, "utilization_percent": 80, "_position": 2},
+        ]
+
+        def invoke(service: dict) -> dict:
+            if service["id"] == "first":
+                raise SERVER.ProviderHTTPError(503, "temporarily unavailable")
+            return {"ok": True}
+
+        self.assertEqual(pool.call_any(configs, invoke, job_id=job_id), {"ok": True})
+        activity = SERVER.JOBS[job_id]["image_node_activity"]
+        self.assertEqual(activity["1"]["submitted"], 1)
+        self.assertEqual(activity["1"]["failed"], 1)
+        self.assertEqual(activity["2"]["submitted"], 1)
+        self.assertEqual(activity["2"]["responses"], 1)
+        self.assertIn("节点 1 40 RPM", SERVER.JOBS[job_id]["stage"])
+        self.assertIn("节点 2 72 RPM", SERVER.JOBS[job_id]["stage"])
+        self.assertNotIn("图片节点 3 RPM", SERVER.JOBS[job_id]["stage"])
+
     def test_exhausted_daily_budget_routes_to_another_node(self) -> None:
         pool = SERVER.AdaptiveImageNodePool(Path(self.temporary.name) / "daily-routing.json", 3, window_seconds=0, max_rpm=300)
         configs = [

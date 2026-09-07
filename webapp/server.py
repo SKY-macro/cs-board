@@ -35,7 +35,7 @@ PYTHON = Path(sys.executable)
 NODE = shutil.which("node") or "node"
 REMOTION_RENDERER = ROOT / "video_renderer"
 HAND = ROOT / "assets" / "drawing-hand-clean.png"
-PIPELINE_VERSION = "narrated_deck_v13_style_prompt_panel"
+PIPELINE_VERSION = "narrated_deck_v14_live_node_routing"
 ALIGNMENT_SEGMENTATION = "word-boundary-dtw-audio-v2"
 SUBTITLE_FONT = os.environ.get(
     "CS_BOARD_SUBTITLE_FONT",
@@ -584,6 +584,7 @@ class AdaptiveImageNodePool:
         })
         state["node_id"] = str(config.get("id") or state["node_id"])
         state["base_url"] = str(config.get("base_url") or state["base_url"]).strip().rstrip("/")
+        state["position"] = max(1, int(config.get("_position") or state.get("position") or 1))
         if str(state.get("capacity_signature") or "") != capacity_signature:
             state["capacity_signature"] = capacity_signature
             state["rpd_limit"] = rpd_limit
@@ -849,6 +850,7 @@ class AdaptiveImageNodePool:
     def _record_failure(self, key: str, exc: Exception, job_id: str | None, *, attempted_rpm: int) -> None:
         status = exc.status_code if isinstance(exc, ProviderHTTPError) else None
         now = time.monotonic()
+        activity_status = f"{status or '网络'} 失败"
         with self.condition:
             state = self.states[key]
             state["in_flight"] = max(0, int(state["in_flight"]) - 1)
@@ -866,10 +868,12 @@ class AdaptiveImageNodePool:
                     state["rpm"] = 1
                     cooldown_seconds = max(retry_after, 900.0)
                     state["circuit_reason"] = "rate_limit"
+                    activity_status = f"429→1 RPM，熔断 {math.ceil(cooldown_seconds / 60)} 分钟"
                 else:
                     state["rpm"] = self._downgrade_rpm(int(state["rpm"]))
                     cooldown_seconds = max(retry_after, 60.0, self.window_seconds / max(1, int(state["rpm"])))
                     state["circuit_reason"] = "rate_limit_cooldown"
+                    activity_status = f"429→{state['rpm']} RPM，冷却 {math.ceil(cooldown_seconds)} 秒"
                 self._remember_failed_high_tier(state, attempted_rpm, now)
                 state["rpm"] = min(int(state["rpm"]), self._effective_rpm_limit(state, now))
             elif status in {500, 502, 503, 504} or status is None:
@@ -878,24 +882,20 @@ class AdaptiveImageNodePool:
                 if int(state["consecutive_unavailable"]) >= 3:
                     cooldown_seconds = 300.0
                     state["circuit_reason"] = "unavailable"
+                    activity_status = "连续 5xx，熔断 5 分钟"
             elif status in {401, 403}:
                 cooldown_seconds = 3600.0
                 state["circuit_reason"] = "authentication"
             if cooldown_seconds:
                 state["cooldown_until"] = max(float(state["cooldown_until"]), now + cooldown_seconds)
+            position = int(state.get("position") or 1)
+            node_id = str(state.get("node_id") or f"node-{position}")
+            current_rpm = int(state["rpm"])
             self.condition.notify_all()
         self._persist()
-        if status == 429 and job_id and job_id in JOBS:
-            update_job(
-                job_id,
-                stage=(
-                    f"图片节点连续 429，已降为 1 RPM 并熔断 {math.ceil(cooldown_seconds / 60)} 分钟"
-                    if int(self.states[key]["rate_limit_strikes"]) >= 2
-                    else f"图片节点触发 429，已降为 {self.states[key]['rpm']} RPM 并冷却 {math.ceil(cooldown_seconds)} 秒"
-                ),
-            )
+        record_image_node_activity(job_id, position, node_id, current_rpm, "failure", activity_status)
 
-    def _record_success(self, key: str, latency: float) -> None:
+    def _record_success(self, key: str, latency: float, job_id: str | None = None) -> None:
         now = time.monotonic()
         with self.condition:
             state = self.states[key]
@@ -925,8 +925,12 @@ class AdaptiveImageNodePool:
                 state["tier_successes"] = 0
                 state["tier_started_at"] = now
                 state["circuit_reason"] = ""
+            position = int(state.get("position") or 1)
+            node_id = str(state.get("node_id") or f"node-{position}")
+            current_rpm = int(state["rpm"])
             self.condition.notify_all()
         self._persist()
+        record_image_node_activity(job_id, position, node_id, current_rpm, "response", "正常")
 
     def call_any(self, configs: list[dict[str, Any]], invoke: Any, *, job_id: str | None = None) -> dict[str, Any]:
         if not configs:
@@ -936,6 +940,13 @@ class AdaptiveImageNodePool:
         last_exception: Exception | None = None
         while remaining:
             service, key, attempted_rpm = self._reserve_any(remaining, job_id)
+            record_image_node_activity(
+                job_id,
+                int(service.get("_position") or configs.index(service) + 1),
+                str(service.get("id") or ""),
+                attempted_rpm,
+                "dispatch",
+            )
             started = time.monotonic()
             try:
                 result = invoke(service)
@@ -947,7 +958,7 @@ class AdaptiveImageNodePool:
                 errors.append(f"节点 {position}: {status}{exc}")
                 remaining = [item for item in remaining if self.node_key(item) != key]
             else:
-                self._record_success(key, max(0.0, time.monotonic() - started))
+                self._record_success(key, max(0.0, time.monotonic() - started), job_id)
                 return result
         if len(configs) == 1 and last_exception is not None:
             raise last_exception
@@ -957,6 +968,13 @@ class AdaptiveImageNodePool:
         attempts = 0
         while True:
             service, key, attempted_rpm = self._reserve_any([config], job_id, skip_cooldown=skip_cooldown)
+            record_image_node_activity(
+                job_id,
+                int(service.get("_position") or 1),
+                str(service.get("id") or ""),
+                attempted_rpm,
+                "dispatch",
+            )
             started = time.monotonic()
             try:
                 result = invoke()
@@ -967,7 +985,7 @@ class AdaptiveImageNodePool:
                     continue
                 raise
             else:
-                self._record_success(key, max(0.0, time.monotonic() - started))
+                self._record_success(key, max(0.0, time.monotonic() - started), job_id)
                 return result
 
 
@@ -1095,6 +1113,78 @@ def update_job(job_id: str, **values: Any) -> None:
         if JOBS[job_id].get("status") == "cancelled" and values.get("status") != "cancelled":
             return
         JOBS[job_id].update(values)
+        _persist_job_locked(job_id)
+
+
+def _image_node_stage_locked(job: dict[str, Any]) -> str:
+    activity = job.get("image_node_activity") or {}
+    parts: list[str] = []
+    for key in sorted(activity, key=lambda item: int(item) if str(item).isdigit() else 9999):
+        item = activity[key]
+        status = str(item.get("status") or "")
+        suffix = f"，{status}" if status and status != "正常" else ""
+        submitted = int(item.get("submitted") or 0)
+        responses = int(item.get("responses") or 0)
+        failed = int(item.get("failed") or 0)
+        pending = max(0, submitted - responses - failed)
+        result_counts = f"，响应 {responses}，失败 {failed}" if responses or failed else ""
+        parts.append(
+            f"节点 {item['position']} {item['rpm']} RPM（提交 {submitted}，处理中 {pending}{result_counts}{suffix}）"
+        )
+    completed = max(0, int(job.get("completed_boards") or 0))
+    total = max(completed, int(job.get("boards") or 0))
+    progress = f"成图 {completed}/{total} 张" if total else f"已提交 {int(job.get('image_submitted_requests') or 0)} 次"
+    return f"图片请求分流：{' · '.join(parts)} · {progress}" if parts else f"等待图片节点调度 · {progress}"
+
+
+def record_image_node_activity(
+    job_id: str | None,
+    position: int,
+    node_id: str,
+    rpm: int,
+    event: str,
+    status: str = "",
+) -> None:
+    """Persist actual per-request routing instead of displaying a configured default RPM."""
+    if not job_id:
+        return
+    with LOCK:
+        job = JOBS.get(job_id)
+        if not job or job.get("status") == "cancelled":
+            return
+        activity = job.setdefault("image_node_activity", {})
+        key = str(max(1, int(position)))
+        item = activity.setdefault(key, {
+            "position": max(1, int(position)),
+            "node_id": node_id,
+            "rpm": max(1, int(rpm)),
+            "submitted": 0,
+            "responses": 0,
+            "failed": 0,
+            "status": "",
+        })
+        item.update(node_id=node_id or item.get("node_id") or "", rpm=max(1, int(rpm)))
+        if event == "dispatch":
+            item["submitted"] = int(item.get("submitted") or 0) + 1
+            job["image_submitted_requests"] = int(job.get("image_submitted_requests") or 0) + 1
+        elif event == "response":
+            item["responses"] = int(item.get("responses") or 0) + 1
+        elif event == "failure":
+            item["failed"] = int(item.get("failed") or 0) + 1
+        if status:
+            item["status"] = status
+        job["image_last_node"] = int(position)
+        job["stage"] = _image_node_stage_locked(job)
+        _persist_job_locked(job_id)
+
+
+def record_image_completed(job_id: str, completed: int, total: int, progress: int) -> None:
+    with LOCK:
+        job = JOBS.get(job_id)
+        if not job or job.get("status") == "cancelled":
+            return
+        job.update(completed_boards=completed, boards=total, progress=progress, checkpoint="images")
+        job["stage"] = _image_node_stage_locked(job)
         _persist_job_locked(job_id)
 
 
@@ -3059,22 +3149,17 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path | None, scen
             with completed_images_lock:
                 completed_images += 1
                 done = completed_images
-            update_job(
-                job_id,
-                stage=f"并行生成插图：已完成 {done}/{len(boards)} 张",
-                progress=36 + int(done / len(boards) * 40),
-                checkpoint="images",
-                completed_boards=done,
-            )
+            record_image_completed(job_id, done, len(boards), 36 + int(done / len(boards) * 40))
             return i
 
         begin_phase(
             job_id,
             "images",
             "PPT 插图",
-            f"正在按图片节点 {IMAGE_GENERATION_RPM} RPM 提交 {len(boards)} 张插图（响应互不阻塞）",
+            f"等待图片节点调度 · 成图 0/{len(boards)} 张",
             36,
         )
+        update_job(job_id, image_node_activity={}, image_submitted_requests=0, image_last_node=None, boards=len(boards), completed_boards=0)
         # Every board gets a waiting worker so a slow response cannot consume
         # the request-start budget. AdaptiveImageNodePool only paces starts.
         with ThreadPoolExecutor(max_workers=len(boards)) as executor:
