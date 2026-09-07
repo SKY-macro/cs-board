@@ -627,6 +627,7 @@ class QueueResumeTests(unittest.TestCase):
             Path(self.temporary.name) / "maximum.json",
             3,
             window_seconds=0,
+            max_rpm=10,
             promotion_window_seconds=0,
             promotion_successes=1,
         )
@@ -822,7 +823,82 @@ class QueueResumeTests(unittest.TestCase):
                 {"id": "second", "base_url": "https://two.example/v1", "api_key": "two", "model": "gpt-image-2", "enabled": True, "rpm_limit": 999},
             ]
         }, "image")
-        self.assertEqual([item["service"]["rpm_limit"] for item in plan["ready"]], [5, 10])
+        self.assertEqual([item["service"]["rpm_limit"] for item in plan["ready"]], [5, 300])
+
+    def test_image_relay_plan_defaults_legacy_nodes_to_ten_rpm(self) -> None:
+        plan = SERVER.provider_service_plan({
+            "image_services": [
+                {"id": "legacy", "base_url": "https://relay.example/v1", "api_key": "secret", "model": "gpt-image-2", "enabled": True},
+            ]
+        }, "image")
+
+        self.assertEqual(plan["ready"][0]["service"]["rpm_limit"], 10)
+
+    def test_high_capacity_plan_preserves_documented_rpm_rpd_and_safety_margin(self) -> None:
+        plan = SERVER.provider_service_plan({
+            "image_services": [
+                {"id": "first", "base_url": "https://one.example/v1", "api_key": "one", "model": "gpt-image-2", "enabled": True, "rpm_limit": 90, "rpd_limit": 1600, "utilization_percent": 80},
+                {"id": "second", "base_url": "https://two.example/v1", "api_key": "two", "model": "gpt-image-2", "enabled": True, "rpm_limit": 110, "rpd_limit": 1800, "utilization_percent": 80},
+            ]
+        }, "image")
+        services = [item["service"] for item in plan["ready"]]
+        self.assertEqual([item["rpm_limit"] for item in services], [90, 110])
+        self.assertEqual([item["rpd_limit"] for item in services], [1600, 1800])
+        self.assertEqual([item["utilization_percent"] for item in services], [80, 80])
+
+    def test_high_capacity_node_starts_at_safety_adjusted_target(self) -> None:
+        pool = SERVER.AdaptiveImageNodePool(Path(self.temporary.name) / "high-capacity.json", 3, window_seconds=0, max_rpm=300)
+        config = {"id": "primary", "base_url": "https://relay.example/v1", "api_key": "secret", "rpm_limit": 110, "rpd_limit": 1800, "utilization_percent": 80}
+        pool.call(config, lambda: {"ok": True}, retry_rate_limit=False, skip_cooldown=False)
+        snapshot = pool.snapshot()[0]
+        self.assertEqual(snapshot["rpm"], 88)
+        self.assertEqual(snapshot["safe_rpm_target"], 88)
+        self.assertEqual(snapshot["daily_budget"], 1440)
+        self.assertEqual(snapshot["daily_used"], 1)
+        self.assertEqual(snapshot["daily_remaining"], 1439)
+
+    def test_exhausted_daily_budget_routes_to_another_node(self) -> None:
+        pool = SERVER.AdaptiveImageNodePool(Path(self.temporary.name) / "daily-routing.json", 3, window_seconds=0, max_rpm=300)
+        configs = [
+            {"id": "first", "base_url": "https://one.example/v1", "api_key": "one", "rpm_limit": 90, "rpd_limit": 1, "utilization_percent": 100},
+            {"id": "second", "base_url": "https://two.example/v1", "api_key": "two", "rpm_limit": 110, "rpd_limit": 1800, "utilization_percent": 80},
+        ]
+        selected: list[str] = []
+        for _ in range(2):
+            pool.call_any(configs, lambda service: selected.append(service["id"]) or {"ok": True})
+        self.assertEqual(selected, ["first", "second"])
+        snapshots = {item["node_id"]: item for item in pool.snapshot()}
+        self.assertTrue(snapshots["first"]["daily_exhausted"])
+        self.assertEqual(snapshots["first"]["daily_remaining"], 0)
+
+    def test_all_daily_budgets_exhausted_fail_fast_instead_of_spinning(self) -> None:
+        pool = SERVER.AdaptiveImageNodePool(Path(self.temporary.name) / "daily-stop.json", 3, window_seconds=0, max_rpm=300)
+        config = {"id": "primary", "base_url": "https://relay.example/v1", "api_key": "secret", "rpm_limit": 90, "rpd_limit": 1, "utilization_percent": 100}
+        pool.call(config, lambda: {"ok": True}, retry_rate_limit=False, skip_cooldown=False)
+        started = time.monotonic()
+        with self.assertRaisesRegex(SERVER.ImageDailyQuotaExhausted, "日请求安全额度"):
+            pool.call(config, lambda: {"ok": True}, retry_rate_limit=False, skip_cooldown=False)
+        self.assertLess(time.monotonic() - started, 0.2)
+
+    def test_runtime_global_capacity_can_be_changed_without_restart(self) -> None:
+        pool = SERVER.AdaptiveImageNodePool(Path(self.temporary.name) / "global-console.json", 3, window_seconds=0, max_rpm=300, global_rpm_limit=200, global_in_flight_limit=80)
+        pool.configure(global_rpm_limit=150, global_in_flight_limit=120)
+        overview = pool.overview()
+        self.assertEqual(overview["global_rpm_limit"], 150)
+        self.assertEqual(overview["global_in_flight_limit"], 120)
+
+    def test_daily_usage_persists_and_resets_on_a_new_local_day(self) -> None:
+        stats = Path(self.temporary.name) / "daily-persist.json"
+        config = {"id": "primary", "base_url": "https://relay.example/v1", "api_key": "secret", "rpm_limit": 90, "rpd_limit": 1600, "utilization_percent": 80}
+        pool = SERVER.AdaptiveImageNodePool(stats, 3, window_seconds=0, max_rpm=300)
+        pool.call(config, lambda: {"ok": True}, retry_rate_limit=False, skip_cooldown=False)
+        restarted = SERVER.AdaptiveImageNodePool(stats, 3, window_seconds=0, max_rpm=300)
+        with restarted.condition:
+            _key, state = restarted._state(config)
+            self.assertEqual(state["daily_used"], 1)
+            state["daily_date"] = "2000-01-01"
+        restarted.snapshot()
+        self.assertEqual(restarted.snapshot()[0]["daily_used"], 0)
 
     def test_text_relay_switch_status_uses_total_configured_node_count(self) -> None:
         unavailable = SERVER.ProviderHTTPError(503, "Service temporarily unavailable")

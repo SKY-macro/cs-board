@@ -2,6 +2,12 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+const readPageSource = async () =>
+  (await readFile(new URL("../app/page.tsx", import.meta.url), "utf8")).replace(
+    /\s+/g,
+    "",
+  );
+
 async function render() {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
@@ -42,7 +48,7 @@ test("server-renders the whiteboard video application", async () => {
 
 test("keeps public defaults portable and free of local configuration", async () => {
   const [page, layout, packageJson] = await Promise.all([
-    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readPageSource(),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
   ]);
@@ -56,8 +62,8 @@ test("keeps public defaults portable and free of local configuration", async () 
 });
 
 test("offers three modular voice strategies and only uploads audio when selected", async () => {
-  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
-  assert.match(page, /type VoiceMode="none"\|"clone"\|"uploaded"/);
+  const page = await readPageSource();
+  assert.match(page, /typeVoiceMode="none"\|"clone"\|"uploaded"/);
   assert.match(page, /voiceMode!=="none"&&!reference/);
   assert.match(page, /if\(reference\)body\.append\("reference",reference\)/);
   assert.match(page, /className="noNarrationNotice"/);
@@ -67,14 +73,14 @@ test("offers three modular voice strategies and only uploads audio when selected
 });
 
 test("does not accumulate permanent new badges on style cards", async () => {
-  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const page = await readPageSource();
   assert.doesNotMatch(page, /badge:\s*"新增"/);
 });
 
 test("uses a modal API settings flow with debounced in-page autosave", async () => {
-  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const page = await readPageSource();
   assert.match(page, /className="settingsOverlay"/);
-  assert.match(page, /className="settingsDialog panel"/);
+  assert.match(page, /className="settingsDialogpanel"/);
   assert.match(page, /aria-modal="true"/);
   assert.match(page, /setTimeout\([^]*900\)/);
   assert.match(page, /已自动保存/);
@@ -83,30 +89,30 @@ test("uses a modal API settings flow with debounced in-page autosave", async () 
 });
 
 test("auto-detects only the edited text or image relay model after saving", async () => {
-  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const page = await readPageSource();
   assert.match(page, /detectChangedServiceModels/);
   assert.match(page, /serviceSignature\(kind,node\)/);
-  assert.match(page, /void detectChangedServiceModels\(snapshot\)/);
+  assert.match(page, /voiddetectChangedServiceModels\(snapshot\)/);
   assert.match(page, /图片节点.*已自动识别并更正|kind==="text"\?"文本":"图片"/);
 });
 
 test("creates text and image relay nodes without copying an existing endpoint", async () => {
-  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
-  const addService = page.match(/const addService=.*?;\r?\n/)?.[0] || "";
+  const page = await readPageSource();
+  const addService = page.match(/constaddService=.*?constremoveService/s)?.[0] || "";
   assert.match(addService, /base_url:"",api_key:""/);
   assert.doesNotMatch(addService, /fallback/);
 });
 
 test("shows callable versus configured relay counts for text and images", async () => {
-  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const page = await readPageSource();
   assert.match(page, /serviceAvailability/);
-  assert.match(page, /可调用 \{textAvailability\.ready\}\/\{textAvailability\.total\}/);
-  assert.match(page, /可调用 \{imageAvailability\.ready\}\/\{imageAvailability\.total\}/);
+  assert.match(page, /可调用\{textAvailability\.ready\}\/\{textAvailability\.total\}/);
+  assert.match(page, /可调用\{imageAvailability\.ready\}\/\{imageAvailability\.total\}/);
 });
 
 test("offers three mutually exclusive identity prompt modes and persists the choice", async () => {
-  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
-  assert.match(page, /type IdentityMode="consistent"\|"male"\|"female"/);
+  const page = await readPageSource();
+  assert.match(page, /typeIdentityMode="consistent"\|"male"\|"female"/);
   assert.match(page, /身份一致（默认）/);
   assert.match(page, /默认男主角/);
   assert.match(page, /默认女主角/);
@@ -116,7 +122,7 @@ test("offers three mutually exclusive identity prompt modes and persists the cho
 
 test("keeps prompt editing inside task details and separates select from zoom", async () => {
   const [page, css] = await Promise.all([
-    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readPageSource(),
     readFile(new URL("../app/brand.css", import.meta.url), "utf8"),
   ]);
   assert.match(page, /onClick=\{\(\)=>selectGalleryPrompt\(image\)\}/);
@@ -130,7 +136,7 @@ test("keeps prompt editing inside task details and separates select from zoom", 
 
 test("embeds used media controls inside task details", async () => {
   const [page, css] = await Promise.all([
-    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readPageSource(),
     readFile(new URL("../app/brand.css", import.meta.url), "utf8"),
   ]);
   assert.match(page, /className="detailMaterials"/);
@@ -143,7 +149,7 @@ test("embeds used media controls inside task details", async () => {
 
 test("offers rerender below the gallery and hides stale video", async () => {
   const [page, css] = await Promise.all([
-    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readPageSource(),
     readFile(new URL("../app/brand.css", import.meta.url), "utf8"),
   ]);
   assert.match(page, /needs_rerender\?:boolean/);
@@ -156,12 +162,12 @@ test("offers rerender below the gallery and hides stale video", async () => {
 
 test("keeps running jobs in the background while creating another task", async () => {
   const [page, css] = await Promise.all([
-    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readPageSource(),
     readFile(new URL("../app/brand.css", import.meta.url), "utf8"),
   ]);
-  assert.match(page, /const focusedJobId=useRef<string\|null>\(null\)/);
+  assert.match(page, /constfocusedJobId=useRef<string\|null>\(null\)/);
   assert.match(page, /focusedJobId\.current===id\)setJob\(next\)/);
-  assert.match(page, /const createAnotherTask=/);
+  assert.match(page, /constcreateAnotherTask=/);
   assert.match(page, /上一任务继续在后台制作/);
   assert.match(page, /className="newTaskButton"/);
   assert.match(page, />创建新的任务<\/button>/);
@@ -169,19 +175,26 @@ test("keeps running jobs in the background while creating another task", async (
 });
 
 test("shows image relay RPM and in-flight statistics in API settings", async () => {
-  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const page = await readPageSource();
   assert.match(page, /image:\{default_rpm\?:number;default_concurrency\?:number;max_rpm\?:number;global_rpm_limit\?:number/);
   assert.match(page, /health\.queues\.image\.default_rpm!==undefined/);
-  assert.match(page, /RPM · 在途/);
-  assert.match(page, /429 \{node\.rate_limit_count\} 次/);
-  assert.match(page, /均耗 \{node\.average_latency\.toFixed\(1\)\} 秒/);
-  assert.match(page, /最高 RPM<select/);
-  assert.match(page, /10 RPM（最高）/);
-  assert.match(page, /各节点独立限速并主动分流/);
+  assert.match(page, /RPM·在途/);
+  assert.match(page, /429\{node\.rate_limit_count\}次/);
+  assert.match(page, /node\.average_latency\.toFixed\(1\)/);
+  assert.match(page, /图片容量控制台/);
+  assert.match(page, /标称RPM<inputtype="number"/);
+  assert.match(page, /标称RPD<inputtype="number"/);
+  assert.match(page, /安全使用率<select/);
+  assert.match(page, /110RPM\/1800RPD/);
+  assert.match(page, /image_global_rpm_limit/);
+  assert.match(page, /image_global_in_flight_limit/);
+  assert.match(page, /实际目标/);
+  assert.match(page, /RPM、RPD和安全余量按节点独立计算/);
   assert.match(page, /global_in_flight_limit/);
   assert.match(page, /imageCircuitLabel/);
   assert.match(page, /effective_rpm_limit/);
-  assert.match(page, /已封顶5 RPM至重启/);
+  assert.match(page, /已封顶\$\{node\.effective_rpm_limit\?\?node\.rpm\}RPM至重启/);
+  assert.match(page, /今日请求\{node\.daily_used\?\?0\}/);
   assert.match(page, /恢复观察/);
   assert.match(page, /resetImageTierMemory/);
   assert.match(page, /reset-rpm-memory/);

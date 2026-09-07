@@ -35,7 +35,7 @@ PYTHON = Path(sys.executable)
 NODE = shutil.which("node") or "node"
 REMOTION_RENDERER = ROOT / "video_renderer"
 HAND = ROOT / "assets" / "drawing-hand-clean.png"
-PIPELINE_VERSION = "narrated_deck_v11_rpm_tier_memory"
+PIPELINE_VERSION = "narrated_deck_v12_capacity_console"
 ALIGNMENT_SEGMENTATION = "word-boundary-dtw-audio-v2"
 SUBTITLE_FONT = os.environ.get(
     "CS_BOARD_SUBTITLE_FONT",
@@ -51,6 +51,8 @@ DEFAULT_CONFIG = {
     "image_api_key": "",
     "text_services": [],
     "image_services": [],
+    "image_global_rpm_limit": 200,
+    "image_global_in_flight_limit": 80,
     "tts_url": "http://127.0.0.1:7860",
     "tts_url_2": "",
     "tts_mode": "gradio",
@@ -360,10 +362,10 @@ RENDER_ACTIVE_LOCK = threading.Lock()
 RUNNING_PROCESSES: dict[str, set[subprocess.Popen[str]]] = {}
 RUNNING_PROCESSES_LOCK = threading.Lock()
 MODEL_CONCURRENCY = 4
-IMAGE_GENERATION_RPM = max(1, min(10, int(os.environ.get("IMAGE_GENERATION_RPM", "3"))))
-IMAGE_GENERATION_MAX_RPM = max(IMAGE_GENERATION_RPM, min(10, int(os.environ.get("IMAGE_GENERATION_MAX_RPM", "10"))))
-IMAGE_GENERATION_GLOBAL_RPM = max(IMAGE_GENERATION_MAX_RPM, min(60, int(os.environ.get("IMAGE_GENERATION_GLOBAL_RPM", "60"))))
-IMAGE_GLOBAL_IN_FLIGHT_LIMIT = max(20, min(200, int(os.environ.get("IMAGE_GLOBAL_IN_FLIGHT_LIMIT", "80"))))
+IMAGE_GENERATION_RPM = max(1, min(300, int(os.environ.get("IMAGE_GENERATION_RPM", "3"))))
+IMAGE_GENERATION_MAX_RPM = max(IMAGE_GENERATION_RPM, min(300, int(os.environ.get("IMAGE_GENERATION_MAX_RPM", "300"))))
+IMAGE_GENERATION_GLOBAL_RPM = max(1, min(500, int(os.environ.get("IMAGE_GENERATION_GLOBAL_RPM", "200"))))
+IMAGE_GLOBAL_IN_FLIGHT_LIMIT = max(10, min(500, int(os.environ.get("IMAGE_GLOBAL_IN_FLIGHT_LIMIT", "80"))))
 WHITEBOARD_RENDER_CONCURRENCY = max(1, min(4, int(os.environ.get("WHITEBOARD_RENDER_CONCURRENCY", "3"))))
 RENDER_JOB_CONCURRENCY = max(1, min(3, int(os.environ.get("RENDER_JOB_CONCURRENCY", "2"))))
 RENDER_JOB_SEMAPHORE = threading.BoundedSemaphore(RENDER_JOB_CONCURRENCY)
@@ -430,6 +432,14 @@ class ImageNodeCoolingDown(RuntimeError):
         super().__init__(f"节点限流冷却中，约 {self.wait_seconds:.1f} 秒后恢复")
 
 
+class ImageDailyQuotaExhausted(RuntimeError):
+    """All candidate image relays reached their configured safe daily budget."""
+
+    def __init__(self, reset_seconds: float):
+        self.reset_seconds = max(0.0, float(reset_seconds))
+        super().__init__(f"所有图片节点均已达到日请求安全额度，约 {max(1, math.ceil(self.reset_seconds / 3600))} 小时后重置")
+
+
 class AdaptiveImageNodePool:
     """Fair, multi-relay RPM scheduler with adaptive tiers and circuit breakers."""
 
@@ -446,8 +456,8 @@ class AdaptiveImageNodePool:
         default_rpm: int = 3,
         window_seconds: float = 60.0,
         *,
-        max_rpm: int = 10,
-        global_rpm_limit: int = 60,
+        max_rpm: int = 300,
+        global_rpm_limit: int = 200,
         promotion_window_seconds: float = 600.0,
         promotion_successes: int = 30,
         recovery_window_seconds: float = 1800.0,
@@ -457,9 +467,9 @@ class AdaptiveImageNodePool:
         global_in_flight_limit: int = 80,
     ):
         self.stats_path = stats_path
-        self.max_rpm = max(1, min(10, int(max_rpm)))
+        self.max_rpm = max(1, min(300, int(max_rpm)))
         self.default_rpm = max(1, min(self.max_rpm, int(default_rpm)))
-        self.global_rpm_limit = max(self.max_rpm, min(60, int(global_rpm_limit)))
+        self.global_rpm_limit = max(1, min(500, int(global_rpm_limit)))
         self.window_seconds = max(0.0, float(window_seconds))
         self.promotion_window_seconds = max(0.0, float(promotion_window_seconds))
         self.promotion_successes = max(1, int(promotion_successes))
@@ -489,6 +499,13 @@ class AdaptiveImageNodePool:
                 "node_id": str(raw.get("node_id") or ""),
                 "base_url": str(raw.get("base_url") or ""),
                 "rpm_limit": rpm_limit,
+                "rpd_limit": max(0, int(raw.get("rpd_limit") or 0)),
+                "utilization_percent": max(10, min(100, int(raw.get("utilization_percent") or 100))),
+                "safe_rpm_target": max(1, int(raw.get("safe_rpm_target") or self.default_rpm)),
+                "daily_budget": max(0, int(raw.get("daily_budget") or 0)),
+                "daily_date": str(raw.get("daily_date") or time.strftime("%Y-%m-%d")),
+                "daily_used": max(0, int(raw.get("daily_used") or 0)),
+                "capacity_signature": str(raw.get("capacity_signature") or ""),
                 "rpm": max(1, min(rpm_limit, int(raw.get("rpm") or raw.get("limit") or self.default_rpm))),
                 "in_flight": 0,
                 "success_streak": max(0, int(raw.get("success_streak") or 0)),
@@ -524,11 +541,25 @@ class AdaptiveImageNodePool:
         key = self.node_key(config)
         now = time.monotonic()
         rpm_limit = max(1, min(self.max_rpm, int(config.get("rpm_limit") or self.max_rpm)))
+        explicit_capacity = "utilization_percent" in config
+        utilization_percent = max(10, min(100, int(config.get("utilization_percent") or 80)))
+        rpd_limit = max(0, min(100000, int(config.get("rpd_limit") or 0)))
+        safe_rpm_target = max(1, math.floor(rpm_limit * utilization_percent / 100)) if explicit_capacity else rpm_limit
+        initial_rpm = safe_rpm_target if explicit_capacity else min(self.default_rpm, rpm_limit)
+        daily_budget = max(1, math.floor(rpd_limit * utilization_percent / 100)) if rpd_limit else 0
+        capacity_signature = f"{rpm_limit}:{rpd_limit}:{utilization_percent}:{int(explicit_capacity)}"
         state = self.states.setdefault(key, {
             "node_id": str(config.get("id") or ""),
             "base_url": str(config.get("base_url") or "").strip().rstrip("/"),
             "rpm_limit": rpm_limit,
-            "rpm": min(self.default_rpm, rpm_limit),
+            "rpd_limit": rpd_limit,
+            "utilization_percent": utilization_percent,
+            "safe_rpm_target": safe_rpm_target,
+            "daily_budget": daily_budget,
+            "daily_date": time.strftime("%Y-%m-%d"),
+            "daily_used": 0,
+            "capacity_signature": capacity_signature,
+            "rpm": initial_rpm,
             "in_flight": 0,
             "success_streak": 0,
             "success_count": 0,
@@ -553,8 +584,17 @@ class AdaptiveImageNodePool:
         })
         state["node_id"] = str(config.get("id") or state["node_id"])
         state["base_url"] = str(config.get("base_url") or state["base_url"]).strip().rstrip("/")
+        if str(state.get("capacity_signature") or "") != capacity_signature:
+            state["capacity_signature"] = capacity_signature
+            state["rpd_limit"] = rpd_limit
+            state["utilization_percent"] = utilization_percent
+            state["safe_rpm_target"] = safe_rpm_target
+            state["daily_budget"] = daily_budget
+            if not state["recovery_mode"] and not int(state["runtime_rpm_cap"]):
+                state["rpm"] = initial_rpm
         state["rpm_limit"] = rpm_limit
-        state["rpm"] = min(int(state["rpm"]), rpm_limit)
+        self._refresh_daily(state)
+        state["rpm"] = min(int(state["rpm"]), safe_rpm_target)
         return key, state
 
     def _persist(self) -> None:
@@ -582,6 +622,32 @@ class AdaptiveImageNodePool:
             self.next_global_request_at = 0.0
             self.condition.notify_all()
 
+    def configure(self, *, global_rpm_limit: int, global_in_flight_limit: int) -> None:
+        """Apply console-wide capacity limits immediately without restarting workers."""
+        with self.condition:
+            self.global_rpm_limit = max(1, min(500, int(global_rpm_limit)))
+            self.global_in_flight_limit = max(10, min(500, int(global_in_flight_limit)))
+            self.condition.notify_all()
+
+    @staticmethod
+    def _daily_reset_seconds() -> float:
+        now = time.time()
+        local = time.localtime(now)
+        tomorrow = time.mktime((local.tm_year, local.tm_mon, local.tm_mday + 1, 0, 0, 0, 0, 0, -1))
+        return max(0.0, tomorrow - now)
+
+    @staticmethod
+    def _refresh_daily(state: dict[str, Any]) -> None:
+        today = time.strftime("%Y-%m-%d")
+        if str(state.get("daily_date") or "") != today:
+            state["daily_date"] = today
+            state["daily_used"] = 0
+
+    def _daily_exhausted(self, state: dict[str, Any]) -> bool:
+        self._refresh_daily(state)
+        budget = int(state["daily_budget"])
+        return budget > 0 and int(state["daily_used"]) >= budget
+
     def _in_flight_limit(self, state: dict[str, Any]) -> int:
         return max(self.minimum_in_flight_limit, math.ceil(int(state["rpm"]) * self.in_flight_minutes))
 
@@ -594,7 +660,7 @@ class AdaptiveImageNodePool:
         return recent
 
     def _effective_rpm_limit(self, state: dict[str, Any], now: float) -> int:
-        limit = int(state["rpm_limit"])
+        limit = int(state["safe_rpm_target"])
         permanent = int(state["runtime_rpm_cap"])
         if permanent:
             limit = min(limit, permanent)
@@ -610,11 +676,12 @@ class AdaptiveImageNodePool:
         recent.append(now)
         state["failed_tier_failure_times"] = recent
         state["failed_tier"] = max(int(state["failed_tier"]), attempted_rpm)
-        state["tier_lock_rpm"] = self.FAILED_TIER_CAP
+        failed_cap = self._downgrade_rpm(attempted_rpm)
+        state["tier_lock_rpm"] = failed_cap
         state["recovery_mode"] = True
         state["recovery_target_rpm"] = max(int(state["recovery_target_rpm"]), attempted_rpm)
         if len(recent) >= 3:
-            state["runtime_rpm_cap"] = self.FAILED_TIER_CAP
+            state["runtime_rpm_cap"] = failed_cap
             state["tier_lock_until"] = 0.0
         elif len(recent) == 2:
             state["tier_lock_until"] = max(float(state["tier_lock_until"]), now + self.REPEATED_TIER_LOCK_SECONDS)
@@ -646,6 +713,8 @@ class AdaptiveImageNodePool:
         return changed
 
     def _next_tier(self, rpm: int, rpm_limit: int) -> int:
+        if rpm_limit > 10 and rpm >= 10:
+            return min(rpm_limit, max(rpm + 1, math.ceil(rpm * 1.25)))
         tiers = [value for value in self.RPM_TIERS if value <= rpm_limit]
         if rpm_limit not in tiers:
             tiers.append(rpm_limit)
@@ -656,6 +725,8 @@ class AdaptiveImageNodePool:
 
     @staticmethod
     def _downgrade_rpm(rpm: int) -> int:
+        if rpm > 10:
+            return max(5, math.floor(rpm * 0.7))
         if rpm >= 10:
             return 5
         if rpm >= 8:
@@ -664,14 +735,22 @@ class AdaptiveImageNodePool:
             return 3
         return 1
 
-    def snapshot(self) -> list[dict[str, Any]]:
+    def snapshot(self, configs: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         now = time.monotonic()
         with self.condition:
+            states = list(self.states.values())
+            if configs is not None:
+                states = [self._state(config)[1] for config in configs]
+            for state in states:
+                self._refresh_daily(state)
             return [{
                 "node_id": state["node_id"],
                 "base_url": state["base_url"],
                 "rpm": int(state["rpm"]),
                 "rpm_limit": int(state["rpm_limit"]),
+                "rpd_limit": int(state["rpd_limit"]),
+                "utilization_percent": int(state["utilization_percent"]),
+                "safe_rpm_target": int(state["safe_rpm_target"]),
                 "effective_rpm_limit": self._effective_rpm_limit(state, now),
                 "in_flight": int(state["in_flight"]),
                 "in_flight_limit": self._in_flight_limit(state),
@@ -693,9 +772,15 @@ class AdaptiveImageNodePool:
                 "recovery_mode": bool(state["recovery_mode"]),
                 "promotion_required_seconds": int(self.recovery_window_seconds if state["recovery_mode"] else self.promotion_window_seconds),
                 "promotion_required_successes": int(self.recovery_successes if state["recovery_mode"] else self.promotion_successes),
+                "daily_date": state["daily_date"],
+                "daily_budget": int(state["daily_budget"]),
+                "daily_used": int(state["daily_used"]),
+                "daily_remaining": max(0, int(state["daily_budget"]) - int(state["daily_used"])) if int(state["daily_budget"]) else None,
+                "daily_exhausted": self._daily_exhausted(state),
+                "daily_reset_seconds": round(self._daily_reset_seconds(), 1),
                 "circuit_reason": state["circuit_reason"] if float(state["cooldown_until"]) > now else "",
                 "last_status": state["last_status"],
-            } for state in self.states.values()]
+            } for state in states]
 
     def overview(self) -> dict[str, int]:
         """Return queue-wide counters under the scheduler lock."""
@@ -703,6 +788,7 @@ class AdaptiveImageNodePool:
             return {
                 "global_in_flight": int(self.global_in_flight),
                 "global_in_flight_limit": int(self.global_in_flight_limit),
+                "global_rpm_limit": int(self.global_rpm_limit),
                 "waiting": len(self.waiters),
             }
 
@@ -722,8 +808,12 @@ class AdaptiveImageNodePool:
                         self.condition.wait(timeout=0.5)
                         continue
                     candidates: list[tuple[float, int, int, dict[str, Any], str, dict[str, Any]]] = []
+                    quota_blocked: list[dict[str, Any]] = []
                     for index, config in enumerate(configs):
                         key, state = self._state(config)
+                        if self._daily_exhausted(state):
+                            quota_blocked.append(state)
+                            continue
                         state["rpm"] = min(int(state["rpm"]), self._effective_rpm_limit(state, now))
                         cooldown = max(0.0, float(state["cooldown_until"]) - now)
                         if cooldown and skip_cooldown and len(configs) == 1:
@@ -733,6 +823,8 @@ class AdaptiveImageNodePool:
                         ready_at = max(float(state["cooldown_until"]), float(state["next_request_at"]), self.next_global_request_at)
                         candidates.append((ready_at, int(state["in_flight"]), index, config, key, state))
                     if not candidates:
+                        if quota_blocked and len(quota_blocked) == len(configs):
+                            raise ImageDailyQuotaExhausted(self._daily_reset_seconds())
                         self.condition.wait(timeout=0.5)
                         continue
                     ready_at, _active, _index, config, key, state = min(candidates, key=lambda item: (item[0], item[1], item[2]))
@@ -742,10 +834,12 @@ class AdaptiveImageNodePool:
                         continue
                     state["next_request_at"] = now + self.window_seconds / max(1, int(state["rpm"]))
                     state["in_flight"] = int(state["in_flight"]) + 1
+                    state["daily_used"] = int(state["daily_used"]) + 1
                     self.next_global_request_at = now + self.window_seconds / self.global_rpm_limit
                     self.global_in_flight += 1
                     self.waiters.pop(0)
                     self.condition.notify_all()
+                    self._persist()
                     return config, key, int(state["rpm"])
             finally:
                 if ticket in self.waiters:
@@ -1587,12 +1681,19 @@ def resolve_configured_models(config: dict[str, Any]) -> dict[str, Any]:
 
 def provider_service_plan(config: dict[str, Any], kind: str) -> dict[str, Any]:
     """Describe every configured relay and retain original node positions."""
+    if kind == "image":
+        IMAGE_NODE_POOL.configure(
+            global_rpm_limit=max(1, min(500, int(config.get("image_global_rpm_limit") or IMAGE_GENERATION_GLOBAL_RPM))),
+            global_in_flight_limit=max(10, min(500, int(config.get("image_global_in_flight_limit") or IMAGE_GLOBAL_IN_FLIGHT_LIMIT))),
+        )
     key = "text_services" if kind == "text" else "image_services"
     raw_services = config.get(key)
     if not isinstance(raw_services, list) or not raw_services:
         fallback = dict(config) if kind == "text" else image_provider_config(config)
         if kind == "image":
-            fallback["rpm_limit"] = max(1, min(IMAGE_GENERATION_MAX_RPM, int(fallback.get("rpm_limit") or IMAGE_GENERATION_MAX_RPM)))
+            fallback["rpm_limit"] = max(1, min(IMAGE_GENERATION_MAX_RPM, int(fallback.get("rpm_limit") or 10)))
+            fallback["rpd_limit"] = max(0, min(100000, int(fallback.get("rpd_limit") or 0)))
+            fallback["utilization_percent"] = max(10, min(100, int(fallback.get("utilization_percent") or 80)))
         return {"configured_count": 1, "ready_count": 1, "ready": [{"position": 1, "service": fallback}], "skipped": []}
 
     ready: list[dict[str, Any]] = []
@@ -1615,9 +1716,17 @@ def provider_service_plan(config: dict[str, Any], kind: str) -> dict[str, Any]:
         service = dict(item)
         if kind == "image":
             try:
-                service["rpm_limit"] = max(1, min(IMAGE_GENERATION_MAX_RPM, int(service.get("rpm_limit") or IMAGE_GENERATION_MAX_RPM)))
+                service["rpm_limit"] = max(1, min(IMAGE_GENERATION_MAX_RPM, int(service.get("rpm_limit") or 10)))
             except (TypeError, ValueError):
-                service["rpm_limit"] = IMAGE_GENERATION_MAX_RPM
+                service["rpm_limit"] = 10
+            try:
+                service["rpd_limit"] = max(0, min(100000, int(service.get("rpd_limit") or 0)))
+            except (TypeError, ValueError):
+                service["rpd_limit"] = 0
+            try:
+                service["utilization_percent"] = max(10, min(100, int(service.get("utilization_percent") or 80)))
+            except (TypeError, ValueError):
+                service["utilization_percent"] = 80
         ready.append({"position": position, "service": service})
     return {"configured_count": len(services), "ready_count": len(ready), "ready": ready, "skipped": skipped}
 
@@ -3471,6 +3580,9 @@ def health() -> dict[str, Any]:
             {"index": index + 1, "url": url, "active": bool(VOICE_NODE_JOBS.get(index)), "job_id": VOICE_NODE_JOBS.get(index)}
             for index, url in enumerate(nodes)
         ]
+    runtime_config = load_config()
+    image_plan = provider_service_plan(runtime_config, "image")
+    image_configs = [dict(item["service"]) for item in image_plan["ready"]]
     image_overview = IMAGE_NODE_POOL.overview()
     return {
         "status": "ok", "pipeline_version": PIPELINE_VERSION, "renderer": PYTHON.exists(), "tts": nodes,
@@ -3482,7 +3594,7 @@ def health() -> dict[str, Any]:
                 "max_rpm": IMAGE_GENERATION_MAX_RPM,
                 "global_rpm_limit": IMAGE_GENERATION_GLOBAL_RPM,
                 **image_overview,
-                "nodes": IMAGE_NODE_POOL.snapshot(),
+                "nodes": IMAGE_NODE_POOL.snapshot(image_configs),
             },
             "render": {"concurrency": RENDER_JOB_CONCURRENCY, "active": render_active, "waiting": max(0, render_waiting - render_active)},
         },
@@ -3520,6 +3632,10 @@ def save_config(payload: dict[str, Any]) -> dict[str, Any]:
     current = resolve_configured_models(current)
     STATE_DIR.mkdir(exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+    IMAGE_NODE_POOL.configure(
+        global_rpm_limit=max(1, min(500, int(current.get("image_global_rpm_limit") or IMAGE_GENERATION_GLOBAL_RPM))),
+        global_in_flight_limit=max(10, min(500, int(current.get("image_global_in_flight_limit") or IMAGE_GLOBAL_IN_FLIGHT_LIMIT))),
+    )
     ensure_pipeline_workers()
     return safe_config(current)
 
