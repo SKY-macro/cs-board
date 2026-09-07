@@ -461,6 +461,152 @@ class QueueResumeTests(unittest.TestCase):
         self.assertEqual(second["circuit_reason"], "rate_limit")
         self.assertGreaterEqual(second["cooldown_seconds"], 899)
 
+    def test_failed_eight_rpm_tier_is_locked_at_five_for_thirty_minutes(self) -> None:
+        pool = SERVER.AdaptiveImageNodePool(Path(self.temporary.name) / "tier-memory.json", 3, window_seconds=0)
+        config = {"id": "primary", "base_url": "https://relay.example/v1", "api_key": "secret", "rpm_limit": 10}
+        with pool.condition:
+            key, state = pool._state(config)
+            state["rpm"] = 8
+            state["in_flight"] = 1
+            pool.global_in_flight = 1
+        pool._record_failure(key, SERVER.ProviderHTTPError(429, "limited"), None, attempted_rpm=8)
+        snapshot = pool.snapshot()[0]
+        self.assertEqual(snapshot["rpm"], 5)
+        self.assertEqual(snapshot["effective_rpm_limit"], 5)
+        self.assertEqual(snapshot["failed_tier"], 8)
+        self.assertEqual(snapshot["tier_failure_count"], 1)
+        self.assertGreaterEqual(snapshot["tier_lock_seconds"], 1799)
+        self.assertTrue(snapshot["recovery_mode"])
+        self.assertEqual(snapshot["promotion_required_seconds"], 1800)
+        self.assertEqual(snapshot["promotion_required_successes"], 100)
+
+    def test_repeated_high_tier_failures_lock_six_hours_then_cap_until_restart(self) -> None:
+        stats = Path(self.temporary.name) / "tier-repeat.json"
+        pool = SERVER.AdaptiveImageNodePool(stats, 3, window_seconds=0)
+        config = {"id": "primary", "base_url": "https://relay.example/v1", "api_key": "secret", "rpm_limit": 10}
+        with pool.condition:
+            key, state = pool._state(config)
+        for failure_number in range(1, 4):
+            with pool.condition:
+                state["in_flight"] += 1
+                pool.global_in_flight += 1
+            pool._record_failure(key, SERVER.ProviderHTTPError(429, "limited"), None, attempted_rpm=8)
+            snapshot = pool.snapshot()[0]
+            self.assertEqual(snapshot["tier_failure_count"], failure_number)
+            if failure_number == 2:
+                self.assertGreaterEqual(snapshot["tier_lock_seconds"], 21599)
+                self.assertFalse(snapshot["runtime_rpm_capped"])
+        capped = pool.snapshot()[0]
+        self.assertTrue(capped["runtime_rpm_capped"])
+        self.assertEqual(capped["effective_rpm_limit"], 5)
+
+        restarted = SERVER.AdaptiveImageNodePool(stats, 3, window_seconds=0)
+        with restarted.condition:
+            restarted._state(config)
+        after_restart = restarted.snapshot()[0]
+        self.assertFalse(after_restart["runtime_rpm_capped"])
+        self.assertEqual(after_restart["tier_failure_count"], 0)
+        self.assertEqual(after_restart["effective_rpm_limit"], 10)
+
+    def test_high_tier_failure_older_than_six_hours_does_not_count_again(self) -> None:
+        pool = SERVER.AdaptiveImageNodePool(Path(self.temporary.name) / "tier-expiry.json", 3, window_seconds=0)
+        config = {"id": "primary", "base_url": "https://relay.example/v1", "api_key": "secret", "rpm_limit": 10}
+        with pool.condition:
+            key, state = pool._state(config)
+            state["rpm"] = 8
+            state["failed_tier_failure_times"] = [time.monotonic() - 21601]
+            state["failed_tier"] = 8
+            state["in_flight"] = 1
+            pool.global_in_flight = 1
+        pool._record_failure(key, SERVER.ProviderHTTPError(429, "limited"), None, attempted_rpm=8)
+        snapshot = pool.snapshot()[0]
+        self.assertEqual(snapshot["tier_failure_count"], 1)
+        self.assertGreaterEqual(snapshot["tier_lock_seconds"], 1799)
+        self.assertLess(snapshot["tier_lock_seconds"], 1801)
+
+    def test_failed_tier_memory_is_isolated_per_image_node(self) -> None:
+        pool = SERVER.AdaptiveImageNodePool(Path(self.temporary.name) / "tier-isolation.json", 3, window_seconds=0)
+        first = {"id": "first", "base_url": "https://one.example/v1", "api_key": "one", "rpm_limit": 10}
+        second = {"id": "second", "base_url": "https://two.example/v1", "api_key": "two", "rpm_limit": 10}
+        with pool.condition:
+            first_key, first_state = pool._state(first)
+            _second_key, second_state = pool._state(second)
+            first_state["rpm"] = 8
+            second_state["rpm"] = 8
+            first_state["in_flight"] = 1
+            pool.global_in_flight = 1
+        pool._record_failure(first_key, SERVER.ProviderHTTPError(429, "limited"), None, attempted_rpm=8)
+        snapshots = {item["node_id"]: item for item in pool.snapshot()}
+        self.assertEqual(snapshots["first"]["effective_rpm_limit"], 5)
+        self.assertEqual(snapshots["second"]["effective_rpm_limit"], 10)
+        self.assertEqual(snapshots["second"]["tier_failure_count"], 0)
+
+    def test_recovery_promotion_requires_the_stricter_observation_threshold(self) -> None:
+        pool = SERVER.AdaptiveImageNodePool(
+            Path(self.temporary.name) / "tier-recovery.json",
+            3,
+            window_seconds=0,
+            promotion_window_seconds=0,
+            promotion_successes=1,
+            recovery_window_seconds=0,
+            recovery_successes=3,
+        )
+        config = {"id": "primary", "base_url": "https://relay.example/v1", "api_key": "secret", "rpm_limit": 10}
+        with pool.condition:
+            key, state = pool._state(config)
+            state["rpm"] = 8
+            state["in_flight"] = 1
+            pool.global_in_flight = 1
+        pool._record_failure(key, SERVER.ProviderHTTPError(429, "limited"), None, attempted_rpm=8)
+        with pool.condition:
+            state["cooldown_until"] = 0
+            state["tier_lock_until"] = 0
+            state["next_request_at"] = 0
+        for _ in range(2):
+            pool.call(config, lambda: {"ok": True}, retry_rate_limit=False, skip_cooldown=False)
+        self.assertEqual(pool.snapshot()[0]["rpm"], 5)
+        pool.call(config, lambda: {"ok": True}, retry_rate_limit=False, skip_cooldown=False)
+        recovered = pool.snapshot()[0]
+        self.assertEqual(recovered["rpm"], 8)
+        self.assertFalse(recovered["recovery_mode"])
+
+    def test_manual_reset_clears_failed_tier_memory_for_only_one_node(self) -> None:
+        pool = SERVER.AdaptiveImageNodePool(Path(self.temporary.name) / "tier-reset.json", 3, window_seconds=0)
+        configs = [
+            {"id": "first", "base_url": "https://one.example/v1", "api_key": "one", "rpm_limit": 10},
+            {"id": "second", "base_url": "https://two.example/v1", "api_key": "two", "rpm_limit": 10},
+        ]
+        for config in configs:
+            with pool.condition:
+                key, state = pool._state(config)
+            for _ in range(3):
+                with pool.condition:
+                    state["in_flight"] += 1
+                    pool.global_in_flight += 1
+                pool._record_failure(key, SERVER.ProviderHTTPError(429, "limited"), None, attempted_rpm=8)
+        self.assertTrue(all(item["runtime_rpm_capped"] for item in pool.snapshot()))
+        self.assertTrue(pool.reset_failure_memory("first"))
+        snapshots = {item["node_id"]: item for item in pool.snapshot()}
+        self.assertFalse(snapshots["first"]["runtime_rpm_capped"])
+        self.assertEqual(snapshots["first"]["tier_failure_count"], 0)
+        self.assertTrue(snapshots["second"]["runtime_rpm_capped"])
+
+    def test_manual_reset_endpoint_exposes_node_scoped_unlock(self) -> None:
+        config = {"id": "primary", "base_url": "https://relay.example/v1", "api_key": "secret", "rpm_limit": 10}
+        with SERVER.IMAGE_NODE_POOL.condition:
+            key, state = SERVER.IMAGE_NODE_POOL._state(config)
+            state["failed_tier"] = 8
+            state["failed_tier_failure_times"] = [time.monotonic()] * 3
+            state["runtime_rpm_cap"] = 5
+            state["recovery_mode"] = True
+            state["recovery_target_rpm"] = 8
+        response = TestClient(SERVER.app).post("/api/image-nodes/primary/reset-rpm-memory")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ok"])
+        snapshot = SERVER.IMAGE_NODE_POOL.snapshot()[0]
+        self.assertFalse(snapshot["runtime_rpm_capped"])
+        self.assertEqual(snapshot["tier_failure_count"], 0)
+
     def test_image_node_promotes_only_one_tier_after_stable_window(self) -> None:
         pool = SERVER.AdaptiveImageNodePool(
             Path(self.temporary.name) / "promotion.json",

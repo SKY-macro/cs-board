@@ -35,7 +35,7 @@ PYTHON = Path(sys.executable)
 NODE = shutil.which("node") or "node"
 REMOTION_RENDERER = ROOT / "video_renderer"
 HAND = ROOT / "assets" / "drawing-hand-clean.png"
-PIPELINE_VERSION = "narrated_deck_v10_adaptive_rpm"
+PIPELINE_VERSION = "narrated_deck_v11_rpm_tier_memory"
 ALIGNMENT_SEGMENTATION = "word-boundary-dtw-audio-v2"
 SUBTITLE_FONT = os.environ.get(
     "CS_BOARD_SUBTITLE_FONT",
@@ -434,6 +434,11 @@ class AdaptiveImageNodePool:
     """Fair, multi-relay RPM scheduler with adaptive tiers and circuit breakers."""
 
     RPM_TIERS = (1, 3, 5, 8, 10)
+    HIGH_TIER_FLOOR = 8
+    FAILED_TIER_CAP = 5
+    FIRST_TIER_LOCK_SECONDS = 1800.0
+    REPEATED_TIER_LOCK_SECONDS = 21600.0
+    TIER_FAILURE_WINDOW_SECONDS = 21600.0
 
     def __init__(
         self,
@@ -445,6 +450,8 @@ class AdaptiveImageNodePool:
         global_rpm_limit: int = 60,
         promotion_window_seconds: float = 600.0,
         promotion_successes: int = 30,
+        recovery_window_seconds: float = 1800.0,
+        recovery_successes: int = 100,
         minimum_in_flight_limit: int = 30,
         in_flight_minutes: float = 10.0,
         global_in_flight_limit: int = 80,
@@ -456,6 +463,8 @@ class AdaptiveImageNodePool:
         self.window_seconds = max(0.0, float(window_seconds))
         self.promotion_window_seconds = max(0.0, float(promotion_window_seconds))
         self.promotion_successes = max(1, int(promotion_successes))
+        self.recovery_window_seconds = max(0.0, float(recovery_window_seconds))
+        self.recovery_successes = max(1, int(recovery_successes))
         self.minimum_in_flight_limit = max(1, int(minimum_in_flight_limit))
         self.in_flight_minutes = max(0.0, float(in_flight_minutes))
         self.global_in_flight_limit = max(1, int(global_in_flight_limit))
@@ -491,6 +500,13 @@ class AdaptiveImageNodePool:
                 "average_latency": max(0.0, float(raw.get("average_latency") or 0.0)),
                 "tier_successes": max(0, int(raw.get("tier_successes") or 0)),
                 "tier_started_at": now,
+                "failed_tier": 0,
+                "failed_tier_failure_times": [],
+                "tier_lock_until": 0.0,
+                "tier_lock_rpm": 0,
+                "runtime_rpm_cap": 0,
+                "recovery_mode": False,
+                "recovery_target_rpm": 0,
                 "cooldown_until": 0.0,
                 "next_request_at": 0.0,
                 "circuit_reason": "",
@@ -523,6 +539,13 @@ class AdaptiveImageNodePool:
             "average_latency": 0.0,
             "tier_successes": 0,
             "tier_started_at": now,
+            "failed_tier": 0,
+            "failed_tier_failure_times": [],
+            "tier_lock_until": 0.0,
+            "tier_lock_rpm": 0,
+            "runtime_rpm_cap": 0,
+            "recovery_mode": False,
+            "recovery_target_rpm": 0,
             "cooldown_until": 0.0,
             "next_request_at": 0.0,
             "circuit_reason": "",
@@ -539,6 +562,8 @@ class AdaptiveImageNodePool:
             nodes = {
                 key: {field: value for field, value in state.items() if field not in {
                     "in_flight", "cooldown_until", "next_request_at", "tier_started_at", "circuit_reason", "consecutive_unavailable",
+                    "failed_tier", "failed_tier_failure_times", "tier_lock_until", "tier_lock_rpm", "runtime_rpm_cap",
+                    "recovery_mode", "recovery_target_rpm",
                 }}
                 for key, state in self.states.items()
             }
@@ -559,6 +584,66 @@ class AdaptiveImageNodePool:
 
     def _in_flight_limit(self, state: dict[str, Any]) -> int:
         return max(self.minimum_in_flight_limit, math.ceil(int(state["rpm"]) * self.in_flight_minutes))
+
+    def _tier_failure_times(self, state: dict[str, Any], now: float) -> list[float]:
+        cutoff = now - self.TIER_FAILURE_WINDOW_SECONDS
+        recent = [float(item) for item in state["failed_tier_failure_times"] if float(item) >= cutoff]
+        state["failed_tier_failure_times"] = recent
+        if not recent and not state["recovery_mode"] and not int(state["runtime_rpm_cap"]):
+            state["failed_tier"] = 0
+        return recent
+
+    def _effective_rpm_limit(self, state: dict[str, Any], now: float) -> int:
+        limit = int(state["rpm_limit"])
+        permanent = int(state["runtime_rpm_cap"])
+        if permanent:
+            limit = min(limit, permanent)
+        elif float(state["tier_lock_until"]) > now:
+            limit = min(limit, max(1, int(state["tier_lock_rpm"])))
+        return max(1, limit)
+
+    def _remember_failed_high_tier(self, state: dict[str, Any], attempted_rpm: int, now: float) -> None:
+        """Remember 8/10 RPM failures for this node only during this process lifetime."""
+        if attempted_rpm < self.HIGH_TIER_FLOOR:
+            return
+        recent = self._tier_failure_times(state, now)
+        recent.append(now)
+        state["failed_tier_failure_times"] = recent
+        state["failed_tier"] = max(int(state["failed_tier"]), attempted_rpm)
+        state["tier_lock_rpm"] = self.FAILED_TIER_CAP
+        state["recovery_mode"] = True
+        state["recovery_target_rpm"] = max(int(state["recovery_target_rpm"]), attempted_rpm)
+        if len(recent) >= 3:
+            state["runtime_rpm_cap"] = self.FAILED_TIER_CAP
+            state["tier_lock_until"] = 0.0
+        elif len(recent) == 2:
+            state["tier_lock_until"] = max(float(state["tier_lock_until"]), now + self.REPEATED_TIER_LOCK_SECONDS)
+        else:
+            state["tier_lock_until"] = max(float(state["tier_lock_until"]), now + self.FIRST_TIER_LOCK_SECONDS)
+
+    def reset_failure_memory(self, node_id: str) -> bool:
+        """Clear runtime tier memory for one configured node without skipping an active cooldown."""
+        changed = False
+        now = time.monotonic()
+        with self.condition:
+            for state in self.states.values():
+                if str(state["node_id"]) != str(node_id):
+                    continue
+                state["failed_tier"] = 0
+                state["failed_tier_failure_times"] = []
+                state["tier_lock_until"] = 0.0
+                state["tier_lock_rpm"] = 0
+                state["runtime_rpm_cap"] = 0
+                state["recovery_mode"] = False
+                state["recovery_target_rpm"] = 0
+                state["tier_successes"] = 0
+                state["tier_started_at"] = now
+                changed = True
+            if changed:
+                self.condition.notify_all()
+        if changed:
+            self._persist()
+        return changed
 
     def _next_tier(self, rpm: int, rpm_limit: int) -> int:
         tiers = [value for value in self.RPM_TIERS if value <= rpm_limit]
@@ -587,6 +672,7 @@ class AdaptiveImageNodePool:
                 "base_url": state["base_url"],
                 "rpm": int(state["rpm"]),
                 "rpm_limit": int(state["rpm_limit"]),
+                "effective_rpm_limit": self._effective_rpm_limit(state, now),
                 "in_flight": int(state["in_flight"]),
                 "in_flight_limit": self._in_flight_limit(state),
                 "success_streak": int(state["success_streak"]),
@@ -600,6 +686,13 @@ class AdaptiveImageNodePool:
                 "next_request_seconds": round(max(0.0, float(state["next_request_at"]) - now), 1),
                 "tier_successes": int(state["tier_successes"]),
                 "tier_elapsed_seconds": round(max(0.0, now - float(state["tier_started_at"])), 1),
+                "failed_tier": int(state["failed_tier"]),
+                "tier_failure_count": len(self._tier_failure_times(state, now)),
+                "tier_lock_seconds": round(max(0.0, float(state["tier_lock_until"]) - now), 1),
+                "runtime_rpm_capped": bool(int(state["runtime_rpm_cap"])),
+                "recovery_mode": bool(state["recovery_mode"]),
+                "promotion_required_seconds": int(self.recovery_window_seconds if state["recovery_mode"] else self.promotion_window_seconds),
+                "promotion_required_successes": int(self.recovery_successes if state["recovery_mode"] else self.promotion_successes),
                 "circuit_reason": state["circuit_reason"] if float(state["cooldown_until"]) > now else "",
                 "last_status": state["last_status"],
             } for state in self.states.values()]
@@ -613,7 +706,7 @@ class AdaptiveImageNodePool:
                 "waiting": len(self.waiters),
             }
 
-    def _reserve_any(self, configs: list[dict[str, Any]], job_id: str | None, skip_cooldown: bool = False) -> tuple[dict[str, Any], str]:
+    def _reserve_any(self, configs: list[dict[str, Any]], job_id: str | None, skip_cooldown: bool = False) -> tuple[dict[str, Any], str, int]:
         ticket = object()
         with self.condition:
             self.waiters.append(ticket)
@@ -631,6 +724,7 @@ class AdaptiveImageNodePool:
                     candidates: list[tuple[float, int, int, dict[str, Any], str, dict[str, Any]]] = []
                     for index, config in enumerate(configs):
                         key, state = self._state(config)
+                        state["rpm"] = min(int(state["rpm"]), self._effective_rpm_limit(state, now))
                         cooldown = max(0.0, float(state["cooldown_until"]) - now)
                         if cooldown and skip_cooldown and len(configs) == 1:
                             raise ImageNodeCoolingDown(cooldown)
@@ -652,13 +746,13 @@ class AdaptiveImageNodePool:
                     self.global_in_flight += 1
                     self.waiters.pop(0)
                     self.condition.notify_all()
-                    return config, key
+                    return config, key, int(state["rpm"])
             finally:
                 if ticket in self.waiters:
                     self.waiters.remove(ticket)
                     self.condition.notify_all()
 
-    def _record_failure(self, key: str, exc: Exception, job_id: str | None) -> None:
+    def _record_failure(self, key: str, exc: Exception, job_id: str | None, *, attempted_rpm: int) -> None:
         status = exc.status_code if isinstance(exc, ProviderHTTPError) else None
         now = time.monotonic()
         with self.condition:
@@ -682,6 +776,8 @@ class AdaptiveImageNodePool:
                     state["rpm"] = self._downgrade_rpm(int(state["rpm"]))
                     cooldown_seconds = max(retry_after, 60.0, self.window_seconds / max(1, int(state["rpm"])))
                     state["circuit_reason"] = "rate_limit_cooldown"
+                self._remember_failed_high_tier(state, attempted_rpm, now)
+                state["rpm"] = min(int(state["rpm"]), self._effective_rpm_limit(state, now))
             elif status in {500, 502, 503, 504} or status is None:
                 state["unavailable_count"] = int(state["unavailable_count"]) + 1
                 state["consecutive_unavailable"] = int(state["consecutive_unavailable"]) + 1
@@ -719,16 +815,19 @@ class AdaptiveImageNodePool:
             state["consecutive_unavailable"] = 0
             state["last_status"] = 200
             stable = (
-                int(state["tier_successes"]) >= self.promotion_successes
-                and now - float(state["tier_started_at"]) >= self.promotion_window_seconds
+                int(state["tier_successes"]) >= (self.recovery_successes if state["recovery_mode"] else self.promotion_successes)
+                and now - float(state["tier_started_at"]) >= (self.recovery_window_seconds if state["recovery_mode"] else self.promotion_window_seconds)
                 and float(state["cooldown_until"]) <= now
             )
             if stable:
                 state["rate_limit_strikes"] = 0
-                promoted = self._next_tier(int(state["rpm"]), int(state["rpm_limit"]))
+                promoted = self._next_tier(int(state["rpm"]), self._effective_rpm_limit(state, now))
                 if promoted != int(state["rpm"]):
                     state["rpm"] = promoted
                     state["success_streak"] = 0
+                if state["recovery_mode"] and int(state["rpm"]) >= int(state["recovery_target_rpm"]):
+                    state["recovery_mode"] = False
+                    state["recovery_target_rpm"] = 0
                 state["tier_successes"] = 0
                 state["tier_started_at"] = now
                 state["circuit_reason"] = ""
@@ -742,13 +841,13 @@ class AdaptiveImageNodePool:
         errors: list[str] = []
         last_exception: Exception | None = None
         while remaining:
-            service, key = self._reserve_any(remaining, job_id)
+            service, key, attempted_rpm = self._reserve_any(remaining, job_id)
             started = time.monotonic()
             try:
                 result = invoke(service)
             except Exception as exc:
                 last_exception = exc
-                self._record_failure(key, exc, job_id)
+                self._record_failure(key, exc, job_id, attempted_rpm=attempted_rpm)
                 position = int(service.get("_position") or configs.index(service) + 1)
                 status = f"{exc.status_code} " if isinstance(exc, ProviderHTTPError) else ""
                 errors.append(f"节点 {position}: {status}{exc}")
@@ -763,12 +862,12 @@ class AdaptiveImageNodePool:
     def call(self, config: dict[str, Any], invoke: Any, *, retry_rate_limit: bool, skip_cooldown: bool, job_id: str | None = None) -> dict[str, Any]:
         attempts = 0
         while True:
-            service, key = self._reserve_any([config], job_id, skip_cooldown=skip_cooldown)
+            service, key, attempted_rpm = self._reserve_any([config], job_id, skip_cooldown=skip_cooldown)
             started = time.monotonic()
             try:
                 result = invoke()
             except Exception as exc:
-                self._record_failure(key, exc, job_id)
+                self._record_failure(key, exc, job_id, attempted_rpm=attempted_rpm)
                 attempts += 1
                 if isinstance(exc, ProviderHTTPError) and exc.status_code == 429 and retry_rate_limit and attempts < 3:
                     continue
@@ -3393,6 +3492,13 @@ def health() -> dict[str, Any]:
 @app.get("/api/config")
 def get_config() -> dict[str, Any]:
     return safe_config(load_config())
+
+
+@app.post("/api/image-nodes/{node_id}/reset-rpm-memory")
+def reset_image_node_rpm_memory(node_id: str) -> dict[str, Any]:
+    if not IMAGE_NODE_POOL.reset_failure_memory(node_id):
+        raise HTTPException(status_code=404, detail="没有找到该图片节点的运行状态")
+    return {"ok": True, "node_id": node_id, "message": "该节点的失败档位记忆已解除；当前429冷却仍继续生效"}
 
 
 @app.post("/api/config")

@@ -180,4 +180,10 @@ test("shows image relay RPM and in-flight statistics in API settings", async () 
   assert.match(page, /各节点独立限速并主动分流/);
   assert.match(page, /global_in_flight_limit/);
   assert.match(page, /imageCircuitLabel/);
+  assert.match(page, /effective_rpm_limit/);
+  assert.match(page, /已封顶5 RPM至重启/);
+  assert.match(page, /恢复观察/);
+  assert.match(page, /resetImageTierMemory/);
+  assert.match(page, /reset-rpm-memory/);
+  assert.match(page, />解除档位记忆<\/button>/);
 });
