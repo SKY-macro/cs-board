@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 import mimetypes
@@ -29,6 +30,7 @@ STATE_DIR = ROOT / ".webapp"
 JOBS_DIR = STATE_DIR / "jobs"
 CONFIG_PATH = STATE_DIR / "config.json"
 PREFERENCES_PATH = STATE_DIR / "preferences.json"
+IMAGE_NODE_STATS_PATH = STATE_DIR / "image-node-stats.json"
 PYTHON = Path(sys.executable)
 NODE = shutil.which("node") or "node"
 REMOTION_RENDERER = ROOT / "video_renderer"
@@ -353,11 +355,15 @@ VOICE_NODE_LOCK = threading.Lock()
 MODEL_WORKER_THREADS: list[threading.Thread] = []
 RENDER_THREADS: set[threading.Thread] = set()
 RENDER_THREADS_LOCK = threading.Lock()
+RENDER_ACTIVE = 0
+RENDER_ACTIVE_LOCK = threading.Lock()
 RUNNING_PROCESSES: dict[str, set[subprocess.Popen[str]]] = {}
 RUNNING_PROCESSES_LOCK = threading.Lock()
 MODEL_CONCURRENCY = 4
-IMAGE_GENERATION_CONCURRENCY = max(1, min(4, int(os.environ.get("IMAGE_GENERATION_CONCURRENCY", "3"))))
+IMAGE_GENERATION_CONCURRENCY = max(1, min(3, int(os.environ.get("IMAGE_GENERATION_CONCURRENCY", "3"))))
 WHITEBOARD_RENDER_CONCURRENCY = max(1, min(4, int(os.environ.get("WHITEBOARD_RENDER_CONCURRENCY", "3"))))
+RENDER_JOB_CONCURRENCY = max(1, min(3, int(os.environ.get("RENDER_JOB_CONCURRENCY", "2"))))
+RENDER_JOB_SEMAPHORE = threading.BoundedSemaphore(RENDER_JOB_CONCURRENCY)
 MAX_ACTIVE_AND_QUEUED = 20
 
 
@@ -409,9 +415,173 @@ def _persist_job_locked(job_id: str) -> None:
 
 
 def atomic_write_json(target: Path, value: Any) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(target.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(target)
+
+
+class ImageNodeCoolingDown(RuntimeError):
+    def __init__(self, wait_seconds: float):
+        self.wait_seconds = max(0.0, float(wait_seconds))
+        super().__init__(f"节点限流冷却中，约 {self.wait_seconds:.1f} 秒后恢复")
+
+
+class AdaptiveImageNodePool:
+    """Share one adaptive concurrency budget per image relay across every job."""
+
+    def __init__(self, stats_path: Path, default_limit: int = 3):
+        self.stats_path = stats_path
+        self.default_limit = max(1, min(3, int(default_limit)))
+        self.condition = threading.Condition()
+        self.states: dict[str, dict[str, Any]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            payload = json.loads(self.stats_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        for key, raw in (payload.get("nodes") or {}).items():
+            if not isinstance(raw, dict):
+                continue
+            self.states[str(key)] = {
+                "node_id": str(raw.get("node_id") or ""),
+                "base_url": str(raw.get("base_url") or ""),
+                "limit": max(1, min(3, int(raw.get("limit") or self.default_limit))),
+                "in_flight": 0,
+                "success_streak": max(0, int(raw.get("success_streak") or 0)),
+                "success_count": max(0, int(raw.get("success_count") or 0)),
+                "rate_limit_count": max(0, int(raw.get("rate_limit_count") or 0)),
+                "unavailable_count": max(0, int(raw.get("unavailable_count") or 0)),
+                "average_latency": max(0.0, float(raw.get("average_latency") or 0.0)),
+                "cooldown_until": 0.0,
+                "last_status": raw.get("last_status"),
+            }
+
+    @staticmethod
+    def node_key(config: dict[str, Any]) -> str:
+        node_id = str(config.get("id") or "node")
+        base_url = str(config.get("base_url") or "").strip().rstrip("/").lower()
+        key_hash = hashlib.sha256(str(config.get("api_key") or "").encode("utf-8")).hexdigest()[:12]
+        return hashlib.sha256(f"{node_id}|{base_url}|{key_hash}".encode("utf-8")).hexdigest()[:20]
+
+    def _state(self, config: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        key = self.node_key(config)
+        state = self.states.setdefault(key, {
+            "node_id": str(config.get("id") or ""),
+            "base_url": str(config.get("base_url") or "").strip().rstrip("/"),
+            "limit": self.default_limit,
+            "in_flight": 0,
+            "success_streak": 0,
+            "success_count": 0,
+            "rate_limit_count": 0,
+            "unavailable_count": 0,
+            "average_latency": 0.0,
+            "cooldown_until": 0.0,
+            "last_status": None,
+        })
+        return key, state
+
+    def _persist(self) -> None:
+        with self.condition:
+            nodes = {
+                key: {field: value for field, value in state.items() if field not in {"in_flight", "cooldown_until"}}
+                for key, state in self.states.items()
+            }
+        try:
+            atomic_write_json(self.stats_path, {"version": 1, "nodes": nodes})
+        except OSError:
+            pass
+
+    def reset(self, stats_path: Path | None = None) -> None:
+        with self.condition:
+            if stats_path is not None:
+                self.stats_path = stats_path
+            self.states.clear()
+            self.condition.notify_all()
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        with self.condition:
+            return [{
+                "node_id": state["node_id"],
+                "base_url": state["base_url"],
+                "concurrency": int(state["limit"]),
+                "in_flight": int(state["in_flight"]),
+                "success_streak": int(state["success_streak"]),
+                "success_count": int(state["success_count"]),
+                "rate_limit_count": int(state["rate_limit_count"]),
+                "unavailable_count": int(state["unavailable_count"]),
+                "average_latency": round(float(state["average_latency"]), 2),
+                "cooldown_seconds": round(max(0.0, float(state["cooldown_until"]) - now), 1),
+                "last_status": state["last_status"],
+            } for state in self.states.values()]
+
+    def call(self, config: dict[str, Any], invoke: Any, *, retry_rate_limit: bool, skip_cooldown: bool, job_id: str | None = None) -> dict[str, Any]:
+        rate_limit_retries = 0
+        while True:
+            with self.condition:
+                key, state = self._state(config)
+                while True:
+                    now = time.monotonic()
+                    cooldown = max(0.0, float(state["cooldown_until"]) - now)
+                    if cooldown and skip_cooldown:
+                        raise ImageNodeCoolingDown(cooldown)
+                    if not cooldown and int(state["in_flight"]) < int(state["limit"]):
+                        state["in_flight"] = int(state["in_flight"]) + 1
+                        break
+                    self.condition.wait(timeout=max(0.05, min(cooldown or 0.5, 1.0)))
+            started = time.monotonic()
+            try:
+                result = invoke()
+            except Exception as exc:
+                latency = max(0.0, time.monotonic() - started)
+                status = exc.status_code if isinstance(exc, ProviderHTTPError) else None
+                with self.condition:
+                    state = self.states[key]
+                    state["in_flight"] = max(0, int(state["in_flight"]) - 1)
+                    state["success_streak"] = 0
+                    state["last_status"] = status or "error"
+                    if status == 429:
+                        state["rate_limit_count"] = int(state["rate_limit_count"]) + 1
+                        state["limit"] = 1
+                        wait_seconds = max(0.5, float(exc.retry_after or provider_retry_delay(rate_limit_retries)))
+                        state["cooldown_until"] = max(float(state["cooldown_until"]), time.monotonic() + wait_seconds)
+                    elif status == 503:
+                        state["unavailable_count"] = int(state["unavailable_count"]) + 1
+                    self.condition.notify_all()
+                self._persist()
+                if status == 429 and job_id and job_id in JOBS:
+                    update_job(job_id, stage=f"图片节点触发 429，已降为 1 路并按 Retry-After 等待 {math.ceil(wait_seconds)} 秒")
+                if status == 429 and retry_rate_limit and rate_limit_retries < 2:
+                    rate_limit_retries += 1
+                    continue
+                raise
+            else:
+                latency = max(0.0, time.monotonic() - started)
+                with self.condition:
+                    state = self.states[key]
+                    state["in_flight"] = max(0, int(state["in_flight"]) - 1)
+                    previous_count = int(state["success_count"])
+                    state["success_count"] = previous_count + 1
+                    state["average_latency"] = (
+                        (float(state["average_latency"]) * previous_count + latency) / (previous_count + 1)
+                    )
+                    state["success_streak"] = int(state["success_streak"]) + 1
+                    state["last_status"] = 200
+                    if int(state["limit"]) == 1 and int(state["success_streak"]) >= 3:
+                        state["limit"] = 2
+                        state["success_streak"] = 0
+                    elif int(state["limit"]) == 2 and int(state["success_streak"]) >= 6:
+                        state["limit"] = 3
+                        state["success_streak"] = 0
+                    self.condition.notify_all()
+                self._persist()
+                return result
+
+
+IMAGE_NODE_POOL = AdaptiveImageNodePool(IMAGE_NODE_STATS_PATH, IMAGE_GENERATION_CONCURRENCY)
 
 
 def valid_image_file(path: Path) -> bool:
@@ -753,9 +923,29 @@ def parse_json_block(text: str) -> Any:
 
 
 class ProviderHTTPError(RuntimeError):
-    def __init__(self, status_code: int, message: str):
+    def __init__(self, status_code: int, message: str, retry_after: float | None = None):
         super().__init__(message)
         self.status_code = status_code
+        self.retry_after = retry_after
+
+
+def response_retry_after(response: httpx.Response) -> float | None:
+    value = response.headers.get("Retry-After")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return max(0.0, float(value.strip()))
+    except ValueError:
+        try:
+            from email.utils import parsedate_to_datetime
+            from datetime import datetime, timezone
+
+            target = parsedate_to_datetime(value)
+            if target.tzinfo is None:
+                target = target.replace(tzinfo=timezone.utc)
+            return max(0.0, (target - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 def provider_retry_delay(attempt: int) -> int:
@@ -794,7 +984,11 @@ def provider_post(config: dict[str, Any], endpoint: str, payload: dict[str, Any]
                     json=payload,
                 )
             if response.is_error:
-                error = ProviderHTTPError(response.status_code, f"模型服务调用失败：{response.status_code} {response.text[:800]}")
+                error = ProviderHTTPError(
+                    response.status_code,
+                    f"模型服务调用失败：{response.status_code} {response.text[:800]}",
+                    response_retry_after(response),
+                )
                 if response.status_code not in {408, 409, 425, 429, 500, 502, 503, 504}:
                     raise error
                 raise error
@@ -902,13 +1096,19 @@ def provider_image(config: dict[str, Any], endpoint: str, payload: dict[str, Any
     return provider_service_failover(
         plan,
         "图片中转站",
-        lambda service: provider_image_single(
+        lambda service: IMAGE_NODE_POOL.call(
             service,
-            endpoint,
-            {**payload, "model": str(service.get("model") or payload.get("model") or config.get("image_model") or "")},
-            timeout=timeout,
+            lambda: provider_image_single(
+                service,
+                endpoint,
+                {**payload, "model": str(service.get("model") or payload.get("model") or config.get("image_model") or "")},
+                timeout=timeout,
+                job_id=job_id,
+                attempts=attempts,
+            ),
+            retry_rate_limit=plan["ready_count"] == 1,
+            skip_cooldown=plan["ready_count"] > 1,
             job_id=job_id,
-            attempts=attempts,
         ),
         job_id=job_id,
     )
@@ -930,7 +1130,7 @@ def provider_image_edit_once(config: dict[str, Any], form_data: dict[str, str], 
     if response is None or response.is_error:
         status = response.status_code if response is not None else 500
         detail = response.text[:800] if response is not None else "没有响应"
-        raise ProviderHTTPError(status, f"参考图调用失败：{status} {detail}")
+        raise ProviderHTTPError(status, f"参考图调用失败：{status} {detail}", response_retry_after(response) if response is not None else None)
     return response.json()
 
 
@@ -939,11 +1139,17 @@ def provider_image_edit(config: dict[str, Any], form_data: dict[str, str], raw_f
     return provider_service_failover(
         plan,
         "参考图中转站",
-        lambda service: provider_image_edit_once(
+        lambda service: IMAGE_NODE_POOL.call(
             service,
-            {**form_data, "model": str(service.get("model") or form_data.get("model") or "")},
-            raw_files,
-            timeout=timeout,
+            lambda: provider_image_edit_once(
+                service,
+                {**form_data, "model": str(service.get("model") or form_data.get("model") or "")},
+                raw_files,
+                timeout=timeout,
+            ),
+            retry_rate_limit=plan["ready_count"] == 1,
+            skip_cooldown=plan["ready_count"] > 1,
+            job_id=job_id,
         ),
         job_id=job_id,
     )
@@ -2415,7 +2621,13 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path | None, scen
             )
             return i
 
-        begin_phase(job_id, "images", "PPT 插图", f"正在以 {min(IMAGE_GENERATION_CONCURRENCY, len(boards))} 路并行生成 {len(boards)} 张插图", 36)
+        begin_phase(
+            job_id,
+            "images",
+            "PPT 插图",
+            f"正在以节点自适应并发生成 {len(boards)} 张插图（默认 {min(IMAGE_GENERATION_CONCURRENCY, len(boards))} 路）",
+            36,
+        )
         with ThreadPoolExecutor(max_workers=min(IMAGE_GENERATION_CONCURRENCY, len(boards))) as executor:
             futures = [executor.submit(generate_board_image, i, board) for i, board in enumerate(boards, 1)]
             for future in as_completed(futures):
@@ -2792,13 +3004,27 @@ def start_render_task(target: Any, *args: Any) -> None:
     job_id = str(args[0])
 
     def runner() -> None:
+        global RENDER_ACTIVE
+        acquired = False
         try:
+            while not acquired:
+                with LOCK:
+                    should_run = JOBS.get(job_id, {}).get("status") in {"queued", "running"}
+                if not should_run:
+                    return
+                acquired = RENDER_JOB_SEMAPHORE.acquire(timeout=0.5)
             with LOCK:
                 should_run = JOBS.get(job_id, {}).get("status") in {"queued", "running"}
             if not should_run:
                 return
+            with RENDER_ACTIVE_LOCK:
+                RENDER_ACTIVE += 1
             target(*args)
         finally:
+            if acquired:
+                with RENDER_ACTIVE_LOCK:
+                    RENDER_ACTIVE = max(0, RENDER_ACTIVE - 1)
+                RENDER_JOB_SEMAPHORE.release()
             with RENDER_THREADS_LOCK:
                 RENDER_THREADS.discard(threading.current_thread())
 
@@ -2904,7 +3130,9 @@ resume_pending_jobs()
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     with RENDER_THREADS_LOCK:
-        render_active = sum(1 for thread in RENDER_THREADS if thread.is_alive())
+        render_waiting = sum(1 for thread in RENDER_THREADS if thread.is_alive())
+    with RENDER_ACTIVE_LOCK:
+        render_active = RENDER_ACTIVE
     nodes = configured_tts_nodes()
     with VOICE_NODE_LOCK:
         voice_nodes = [
@@ -2916,7 +3144,8 @@ def health() -> dict[str, Any]:
         "queues": {
             "voice": {"concurrency": len(nodes), "waiting": VOICE_QUEUE.qsize(), "nodes": voice_nodes},
             "model": {"concurrency": MODEL_CONCURRENCY, "waiting": MODEL_QUEUE.qsize()},
-            "render": {"concurrency": "local-direct", "active": render_active},
+            "image": {"default_concurrency": IMAGE_GENERATION_CONCURRENCY, "nodes": IMAGE_NODE_POOL.snapshot()},
+            "render": {"concurrency": RENDER_JOB_CONCURRENCY, "active": render_active, "waiting": max(0, render_waiting - render_active)},
         },
     }
 

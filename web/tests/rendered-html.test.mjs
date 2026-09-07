@@ -153,3 +153,25 @@ test("offers rerender below the gallery and hides stale video", async () => {
   assert.match(page, /result_url&&!hasPendingRerender/);
   assert.match(css, /\.galleryButton,\s*\.rerenderProgressButton/);
 });
+
+test("keeps running jobs in the background while creating another task", async () => {
+  const [page, css] = await Promise.all([
+    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/brand.css", import.meta.url), "utf8"),
+  ]);
+  assert.match(page, /const focusedJobId=useRef<string\|null>\(null\)/);
+  assert.match(page, /focusedJobId\.current===id\)setJob\(next\)/);
+  assert.match(page, /const createAnotherTask=/);
+  assert.match(page, /上一任务继续在后台制作/);
+  assert.match(page, /className="newTaskButton"/);
+  assert.match(page, />创建新的任务<\/button>/);
+  assert.match(css, /\.newTaskButton\s*\{/);
+});
+
+test("shows adaptive image relay statistics in API settings", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.match(page, /image:\{default_concurrency:number;nodes:/);
+  assert.match(page, /图片单节点默认 \{health\.queues\.image\.default_concurrency\} 路自适应/);
+  assert.match(page, /429 \{node\.rate_limit_count\} 次/);
+  assert.match(page, /均耗 \{node\.average_latency\.toFixed\(1\)\} 秒/);
+});
