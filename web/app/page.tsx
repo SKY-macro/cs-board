@@ -86,9 +86,15 @@ type CharacterBinding = {
   gender: string;
   age_group: string;
   description: string;
+  core_personality?: string;
+  facial_persona?: string;
+  temporary_behavior?: string;
   asset_id: string | null;
   asset_label?: string | null;
   asset_image_url?: string | null;
+  persona_compatible?: boolean;
+  match_confidence?: number;
+  match_reason?: string;
 };
 type InputAsset = { name: string; url: string; content_type: string };
 type VoiceMode = "none" | "clone" | "uploaded";
@@ -791,12 +797,17 @@ export default function Home() {
   };
   const drawMissingCharacter = async (binding: CharacterBinding) => {
     const label = reusableAssetLabel(binding);
+    const description = [
+      binding.description,
+      binding.core_personality ? `核心性格：${binding.core_personality}` : "",
+      binding.facial_persona ? `固定脸相：${binding.facial_persona}` : "",
+    ].filter(Boolean).join("；");
     setDrawLabel(label);
-    setDrawDescription(binding.description);
+    setDrawDescription(description);
     setDrawCount(1);
     setDrawingRoleId(binding.role_id);
     setCharacterLibraryOpen(true);
-    await submitCharacterDraw(label, binding.description, 1, binding.role_id);
+    await submitCharacterDraw(label, description, 1, binding.role_id);
   };
   const reviewCharacterAsset = async (asset: CharacterAsset, status: "approved" | "rejected") => {
     const response = await fetch(`${API}/api/character-assets/${asset.id}`, {
@@ -2149,7 +2160,7 @@ export default function Home() {
                 <button type="button" className="secondary" disabled={characterBusy || copy.trim().length < 10} onClick={matchCharacters}>{characterBusy ? "分析中…" : characterMatchReady ? "重新分析并匹配" : "AI 分析并挑选角色"}</button>
                 <button type="button" className="secondary" onClick={() => setCharacterLibraryOpen(true)}>打开角色抽卡库</button>
               </div>
-              {characterBindings.length > 0 && <div className="taskCharacterBindings">{characterBindings.map((binding) => <article key={binding.role_id} className={binding.asset_id ? "matched" : "missing"}>{binding.asset_image_url ? <img src={`${API}${binding.asset_image_url}`} alt="" /> : <span>缺</span>}<div><b>{binding.story_name}</b>{binding.asset_label && <small className="assetMatchName">已使用资产：{binding.asset_label}</small>}<small>{binding.age_group} · {binding.gender}</small><p>{binding.description}</p></div>{binding.asset_id ? <em>已匹配</em> : <button type="button" className="drawMissingRole" disabled={characterBusy || Boolean(pendingDrawRoles[binding.role_id])} onClick={() => drawMissingCharacter(binding)}>{drawingRoleId === binding.role_id ? "提交中…" : pendingDrawRoles[binding.role_id] ? "等待审核" : "去抽卡"}</button>}</article>)}</div>}
+              {characterBindings.length > 0 && <div className="taskCharacterBindings">{characterBindings.map((binding) => <article key={binding.role_id} className={binding.asset_id ? "matched" : "missing"}>{binding.asset_image_url ? <img src={`${API}${binding.asset_image_url}`} alt="" /> : <span>缺</span>}<div><b>{binding.story_name}</b>{binding.asset_label && <small className="assetMatchName">已使用资产：{binding.asset_label}</small>}<small>{binding.age_group} · {binding.gender}</small>{binding.core_personality && <small>核心性格：{binding.core_personality}</small>}{binding.facial_persona && <small>固定脸相：{binding.facial_persona}</small>}<p>{binding.description}</p>{binding.match_reason && <small>{binding.asset_id ? "匹配理由" : "未匹配原因"}：{binding.match_reason}</small>}</div>{binding.asset_id ? <em>{Math.round((binding.match_confidence || 0) * 100)}% 匹配</em> : <button type="button" className="drawMissingRole" disabled={characterBusy || Boolean(pendingDrawRoles[binding.role_id])} onClick={() => drawMissingCharacter(binding)}>{drawingRoleId === binding.role_id ? "提交中…" : pendingDrawRoles[binding.role_id] ? "等待审核" : "去抽卡"}</button>}</article>)}</div>}
               {characterMessage && <p className="characterMessage">{characterMessage}</p>}
             </section>
           )}

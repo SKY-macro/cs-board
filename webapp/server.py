@@ -39,7 +39,7 @@ PYTHON = Path(sys.executable)
 NODE = shutil.which("node") or "node"
 REMOTION_RENDERER = ROOT / "video_renderer"
 HAND = ROOT / "assets" / "drawing-hand-clean.png"
-PIPELINE_VERSION = "narrated_deck_v21_character_draw_handoff"
+PIPELINE_VERSION = "narrated_deck_v22_persona_matching"
 ALIGNMENT_SEGMENTATION = "word-boundary-dtw-audio-v2"
 SUBTITLE_FONT = os.environ.get(
     "CS_BOARD_SUBTITLE_FONT",
@@ -2693,10 +2693,16 @@ def task_character_reference_context(
         image_number = input_offset + len(paths)
         name = str(item.get("story_name") or item.get("role_id") or "人物")[:20]
         description = str(item.get("description") or "以角色设定图外观为准")[:80]
+        core_personality = str(item.get("core_personality") or "")[:60]
+        facial_persona = str(item.get("facial_persona") or "")[:60]
         role_id = str(item.get("role_id") or "")
-        lines.append(f"输入图{image_number}定义人物“{name}”（{role_id}）：{description}。")
+        persona = "；".join(value for value in (
+            f"核心性格：{core_personality}" if core_personality else "",
+            f"固定脸相：{facial_persona}" if facial_persona else "",
+        ) if value)
+        lines.append(f"输入图{image_number}定义人物“{name}”（{role_id}）：{description}{f'；{persona}' if persona else ''}。")
     if lines:
-        lines.append("人物图只锁定身份、脸型、眼睛、发型发色、年龄体型、服装与标志特征；姿势、背景和构图必须服从当前分镜。")
+        lines.append("人物图锁定身份、脸型、眼睛、发型发色、年龄体型、服装、标志特征与写在脸上的固定气质；临时情绪、姿势、背景和构图必须服从当前分镜。")
     context = "；".join(
         f"{str(item.get('role_id') or '')}={str(item.get('story_name') or '')}（{str(item.get('description') or '')}）"
         for item in bindings
@@ -4323,11 +4329,14 @@ def match_character_assets(payload: dict[str, Any]) -> dict[str, Any]:
         f"- asset_id={item['id']}｜{item.get('label', '')}｜{item.get('description', '')}"
         for item in assets
     ) or "（当前风格没有已审核角色资产）"
-    prompt = f"""你是视频角色统筹。分析文案里真正会以人物形象出镜的角色；群体、机构、作者引用、比喻对象和只被提及但不出镜的人不算角色。
-为每个角色建立稳定的 role_id（role_01 起）、story_name（沿用文案称呼，没有姓名时用身份称呼）、gender、age_group、description。
-description 用 25～80 个汉字写身份、年龄段、脸型、眼睛、发型发色、体型、服装和标志特征，不写姿势、场景和构图。
-从下方“{style}”专属资产中为每个角色选择最相符的一项；只有性别、年龄段和核心外观都合理才填 asset_id，否则必须填 null，禁止勉强匹配。一个资产可以被一个角色使用，不能同时分配给两个角色。
-只返回 JSON 数组，每项字段固定为 role_id、story_name、gender、age_group、description、asset_id。
+    prompt = f"""你是视频角色统筹。先完整阅读全文和结局，再分析真正会以人物形象出镜的角色；群体、机构、作者引用、比喻对象和只被提及但不出镜的人不算角色。
+人物判断必须以全文最终揭示的真实本性为最高依据：区分永久核心性格、写在脸上的固定气质、当前剧情中的临时行为，以及开头为了反转而制造的误解。不得把节省等同于吝啬，不得把沉默等同于冷漠，不得让前段误导覆盖结尾揭示。
+为每个角色建立稳定的 role_id（role_01 起）、story_name（沿用文案称呼，没有姓名时用身份称呼）、gender、age_group、description、core_personality、facial_persona、temporary_behavior。
+description 用 25～100 个汉字写身份、年龄段、脸型、眼睛、发型发色、体型、服装、标志特征，并把与 core_personality 一致、可长期保持的脸部气质写进去；不写姿势、场景和构图。
+core_personality 写全文验证后的稳定本性；facial_persona 写适合固定在脸上的可视气质；temporary_behavior 只写本故事阶段性行为，不得用它替代核心性格。
+从下方“{style}”专属资产中逐项比较性别、年龄、外观和人格兼容。资产描述中的精明、温和、强势、怯懦、正直等气质是永久脸相设定，不得忽略或改写。只有四项均相符且 match_confidence 不低于 0.78，才可填 asset_id，并令 persona_compatible=true；只匹配年龄性别、人格脸相冲突、证据不足或库中只有一个同类候选时，都必须填 null。宁可去抽卡，也禁止为了使用现有资产而勉强匹配。一个资产不能同时分配给两个角色。
+match_reason 简述全文人物本性与候选脸相为什么相符或冲突；match_confidence 为 0～1 小数。
+只返回 JSON 数组，每项字段固定为 role_id、story_name、gender、age_group、description、core_personality、facial_persona、temporary_behavior、asset_id、persona_compatible、match_confidence、match_reason。
 
 可用资产：
 {catalog}
@@ -4347,10 +4356,22 @@ description 用 25～80 个汉字写身份、年龄段、脸型、眼睛、发�
         if not isinstance(raw, dict):
             continue
         description = str(raw.get("description") or "普通人物形象").strip()[:300]
-        asset_id = str(raw.get("asset_id") or "")
+        core_personality = str(raw.get("core_personality") or "").strip()[:120]
+        facial_persona = str(raw.get("facial_persona") or "").strip()[:120]
+        temporary_behavior = str(raw.get("temporary_behavior") or "").strip()[:160]
+        match_reason = str(raw.get("match_reason") or "").strip()[:240]
+        try:
+            match_confidence = max(0.0, min(1.0, float(raw.get("match_confidence") or 0)))
+        except (TypeError, ValueError):
+            match_confidence = 0.0
+        persona_compatible = raw.get("persona_compatible") is True
+        requested_asset_id = str(raw.get("asset_id") or "")
+        asset_id = requested_asset_id
         if asset_id not in asset_map or asset_id in used_assets:
             asset_id = ""
-        if not asset_id:
+        if asset_id and (not persona_compatible or match_confidence < 0.78):
+            asset_id = ""
+        if not requested_asset_id and not asset_id:
             normalized_description = re.sub(r"\s+", "", description)
             exact = next((
                 item for item in assets
@@ -4359,6 +4380,9 @@ description 用 25～80 个汉字写身份、年龄段、脸型、眼睛、发�
             ), None)
             if exact:
                 asset_id = str(exact.get("id") or "")
+                persona_compatible = True
+                match_confidence = 1.0
+                match_reason = match_reason or "人物描述与已审核资产完全一致"
         if asset_id:
             used_assets.add(asset_id)
         bindings.append({
@@ -4367,9 +4391,15 @@ description 用 25～80 个汉字写身份、年龄段、脸型、眼睛、发�
             "gender": str(raw.get("gender") or "未知").strip()[:12],
             "age_group": str(raw.get("age_group") or "未知").strip()[:20],
             "description": description,
+            "core_personality": core_personality,
+            "facial_persona": facial_persona,
+            "temporary_behavior": temporary_behavior,
             "asset_id": asset_id or None,
             "asset_label": str(asset_map.get(asset_id, {}).get("label") or "") if asset_id else None,
             "asset_image_url": f"/api/character-assets/{asset_id}/image" if asset_id else None,
+            "persona_compatible": persona_compatible if asset_id else False,
+            "match_confidence": match_confidence,
+            "match_reason": match_reason,
         })
     return {"bindings": bindings, "missing_roles": [item for item in bindings if not item.get("asset_id")], "style": style}
 
@@ -4539,6 +4569,9 @@ async def create_job(
                 "role_id": role_id[:30],
                 "story_name": str(binding.get("story_name") or asset.get("label") or f"人物{index}").strip()[:30],
                 "description": str(binding.get("description") or asset.get("description") or "").strip()[:300],
+                "core_personality": str(binding.get("core_personality") or "").strip()[:120],
+                "facial_persona": str(binding.get("facial_persona") or "").strip()[:120],
+                "temporary_behavior": str(binding.get("temporary_behavior") or "").strip()[:160],
                 "gender": str(binding.get("gender") or "").strip()[:12],
                 "age_group": str(binding.get("age_group") or "").strip()[:20],
                 "asset_id": asset_id,
@@ -4694,7 +4727,7 @@ def get_job_parameters(job_id: str) -> dict[str, Any]:
         if not isinstance(raw, dict):
             continue
         character_bindings.append({
-            **{key: raw.get(key) for key in ("role_id", "story_name", "gender", "age_group", "description", "asset_id", "asset_label")},
+            **{key: raw.get(key) for key in ("role_id", "story_name", "gender", "age_group", "description", "core_personality", "facial_persona", "temporary_behavior", "asset_id", "asset_label")},
             "asset_image_url": (asset_descriptor(source_id, str(raw.get("image") or "")) or {}).get("url"),
         })
     reference_mode = str(source.get("reference_mode") or "standard")

@@ -249,7 +249,7 @@ class QueueResumeTests(unittest.TestCase):
             **self.job(job_id),
             "style": "复古报纸拼贴风",
             "character_bindings": [
-                {"role_id": "role_01", "story_name": "小满", "description": "8岁短发女孩", "image": "library-character-01.png"},
+                {"role_id": "role_01", "story_name": "小满", "description": "8岁短发女孩", "core_personality": "勇敢好奇", "facial_persona": "灵动坚定", "image": "library-character-01.png"},
                 {"role_id": "role_02", "story_name": "妈妈", "description": "低发髻青年女性", "image": "library-character-02.png"},
                 {"role_id": "role_03", "story_name": "老师", "description": "戴眼镜中年女性", "image": "library-character-03.png"},
             ],
@@ -261,6 +261,8 @@ class QueueResumeTests(unittest.TestCase):
         )
         self.assertEqual([path.name for path in paths], ["library-character-01.png", "library-character-02.png"])
         self.assertIn("输入图2定义人物“小满”", instruction)
+        self.assertIn("核心性格：勇敢好奇", instruction)
+        self.assertIn("固定脸相：灵动坚定", instruction)
         self.assertIn("输入图3定义人物“妈妈”", instruction)
         self.assertNotIn("老师", instruction)
         self.assertIn("role_01=小满", context)
@@ -364,7 +366,8 @@ class QueueResumeTests(unittest.TestCase):
         })
         bindings = [{
             "role_id": "role_01", "story_name": "小林", "description": "短黑发青年男性，深色上衣",
-            "gender": "男", "age_group": "青年", "asset_id": asset_id,
+            "core_personality": "温和可靠", "facial_persona": "眉眼温厚",
+            "temporary_behavior": "认真写计划", "gender": "男", "age_group": "青年", "asset_id": asset_id,
         }]
         response = TestClient(SERVER.app).post("/api/jobs", data={
             "copy": "小林走进房间，随后坐在桌边认真写下今天的计划。",
@@ -375,6 +378,8 @@ class QueueResumeTests(unittest.TestCase):
         job_id = response.json()["id"]
         saved = SERVER.JOBS[job_id]["character_bindings"][0]
         self.assertEqual(saved["story_name"], "小林")
+        self.assertEqual(saved["core_personality"], "温和可靠")
+        self.assertEqual(saved["facial_persona"], "眉眼温厚")
         self.assertTrue((SERVER.JOBS_DIR / job_id / saved["image"]).exists())
 
     def test_interrupted_character_draw_becomes_visible_error(self) -> None:
@@ -429,6 +434,68 @@ class QueueResumeTests(unittest.TestCase):
         binding = response.json()["bindings"][0]
         self.assertEqual(binding["story_name"], "我")
         self.assertEqual(binding["asset_label"], "青年女")
+
+    def test_character_match_rejects_demographic_fit_when_fixed_persona_conflicts(self) -> None:
+        asset_id = "abcdef123456"
+        asset_dir = SERVER.CHARACTER_LIBRARY_DIR / SERVER.character_style_key(SERVER.DEFAULT_STYLE) / asset_id
+        asset_dir.mkdir(parents=True)
+        SERVER.atomic_write_json(asset_dir / "asset.json", {
+            "id": asset_id, "style": SERVER.DEFAULT_STYLE, "label": "精明青年男",
+            "description": "青年男性，窄长脸，眼神精明，整体显得工于算计", "status": "approved",
+            "image": "character-sheet.png", "created_at": 1,
+        })
+        model_result = [{
+            "role_id": "role_01", "story_name": "他", "gender": "男", "age_group": "青年",
+            "description": "青年男性，短黑发，眉眼温和真诚，衣着朴素",
+            "core_personality": "真诚深情、克制付出", "facial_persona": "温和可靠、朴素克制",
+            "temporary_behavior": "为了攒钱而节省开支",
+            "asset_id": asset_id, "persona_compatible": False, "match_confidence": 0.42,
+            "match_reason": "年龄性别相符，但精明算计脸与最终揭示的真诚付出冲突",
+        }]
+        captured: dict[str, str] = {}
+
+        def fake_provider(_config, _model, prompt):
+            captured["prompt"] = prompt
+            return {"output_text": json.dumps(model_result, ensure_ascii=False)}
+
+        with mock.patch.object(SERVER, "provider_text", side_effect=fake_provider):
+            response = TestClient(SERVER.app).post("/api/character-matches", json={
+                "copy": "他平时处处省钱，我以为他抠门，最后才发现他省了三个月，把自己能给的全给了我。",
+                "style": SERVER.DEFAULT_STYLE,
+            })
+        self.assertEqual(response.status_code, 200)
+        binding = response.json()["bindings"][0]
+        self.assertIsNone(binding["asset_id"])
+        self.assertEqual(binding["core_personality"], "真诚深情、克制付出")
+        self.assertIn("最终揭示", captured["prompt"])
+        self.assertIn("不得把节省等同于吝啬", captured["prompt"])
+        self.assertIn("人格兼容", captured["prompt"])
+
+    def test_character_match_accepts_high_confidence_fixed_persona(self) -> None:
+        asset_id = "abcdef123456"
+        asset_dir = SERVER.CHARACTER_LIBRARY_DIR / SERVER.character_style_key(SERVER.DEFAULT_STYLE) / asset_id
+        asset_dir.mkdir(parents=True)
+        SERVER.atomic_write_json(asset_dir / "asset.json", {
+            "id": asset_id, "style": SERVER.DEFAULT_STYLE, "label": "温厚青年男",
+            "description": "青年男性，短黑发，眉眼温和真诚，神情朴素克制", "status": "approved",
+            "image": "character-sheet.png", "created_at": 1,
+        })
+        model_result = [{
+            "role_id": "role_01", "story_name": "他", "gender": "男", "age_group": "青年",
+            "description": "青年男性，短黑发，眉眼温和真诚，衣着朴素",
+            "core_personality": "真诚深情、克制付出", "facial_persona": "温和可靠、朴素克制",
+            "temporary_behavior": "为了攒钱而节省开支",
+            "asset_id": asset_id, "persona_compatible": True, "match_confidence": 0.91,
+            "match_reason": "年龄、外观与温和克制的固定脸相均一致",
+        }]
+        with mock.patch.object(SERVER, "provider_text", return_value={"output_text": json.dumps(model_result, ensure_ascii=False)}):
+            response = TestClient(SERVER.app).post("/api/character-matches", json={
+                "copy": "他省下自己的生活费，最后把自己能给的全给了我。", "style": SERVER.DEFAULT_STYLE,
+            })
+        binding = response.json()["bindings"][0]
+        self.assertEqual(binding["asset_id"], asset_id)
+        self.assertEqual(binding["asset_label"], "温厚青年男")
+        self.assertEqual(binding["match_confidence"], 0.91)
 
     def test_standard_job_rejects_unmatched_character(self) -> None:
         response = TestClient(SERVER.app).post("/api/jobs", data={

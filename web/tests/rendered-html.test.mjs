@@ -252,6 +252,10 @@ test("supports one-click missing-role draws and live green binding feedback", as
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
   ]);
   assert.match(page, /asset_label\?:string/);
+  assert.match(page, /core_personality\?:string/);
+  assert.match(page, /facial_persona\?:string/);
+  assert.match(page, /核心性格：/);
+  assert.match(page, /固定脸相：/);
   assert.match(page, /constdrawMissingCharacter=/);
   assert.match(page, /"去抽卡"/);
   assert.match(page, /story_name.*asset_label/s);
