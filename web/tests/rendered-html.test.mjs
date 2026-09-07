@@ -160,9 +160,25 @@ test("offers rerender below the gallery and hides stale video", async () => {
   assert.match(css, /\.galleryButton,\s*\.rerenderProgressButton/);
   assert.match(page, /className="rerenderHistory"/);
   assert.match(page, /已重新生成，重新渲染成片/);
-  assert.match(page, /rerender\(item\)/);
+  assert.match(page, /openRerenderDialog\(item\)/);
   assert.match(css, /\.historyList button\.rerenderHistory\s*\{/);
   assert.match(css, /font-size:\s*10px/);
+});
+
+test("renames tasks, versions copied rerenders, and downloads every image", async () => {
+  const [page, css] = await Promise.all([
+    readPageSource(),
+    readFile(new URL("../app/brand.css", import.meta.url), "utf8"),
+  ]);
+  assert.match(page, /className="renameTaskButton"/);
+  assert.match(page, /\/api\/jobs\/\$\{renameJob\.id\}\/name/);
+  assert.match(page, /确认新任务名称/);
+  assert.match(page, /\+重新渲染第\$\{version\}版/);
+  assert.match(page, /原任务与原成片不会被覆盖/);
+  assert.match(page, /className="downloadAllImages"/);
+  assert.match(page, /\/api\/jobs\/\$\{detailJob\.id\}\/images\.zip/);
+  assert.match(css, /\.nameDialogOverlay\s*\{/);
+  assert.match(css, /\.downloadAllImages\s*\{/);
 });
 
 test("keeps running jobs in the background while creating another task", async () => {

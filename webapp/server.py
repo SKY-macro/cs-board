@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import math
 import mimetypes
@@ -14,6 +15,7 @@ import sys
 import threading
 import time
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -21,8 +23,9 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from gradio_client import Client, handle_file
+from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,7 +38,7 @@ PYTHON = Path(sys.executable)
 NODE = shutil.which("node") or "node"
 REMOTION_RENDERER = ROOT / "video_renderer"
 HAND = ROOT / "assets" / "drawing-hand-clean.png"
-PIPELINE_VERSION = "narrated_deck_v14_live_node_routing"
+PIPELINE_VERSION = "narrated_deck_v15_history_naming"
 ALIGNMENT_SEGMENTATION = "word-boundary-dtw-audio-v2"
 SUBTITLE_FONT = os.environ.get(
     "CS_BOARD_SUBTITLE_FONT",
@@ -1094,6 +1097,42 @@ def normalized_task_name(value: Any, script: str = "", job_id: str = "") -> str:
     return automatic or f"未命名任务-{job_id[-4:]}"
 
 
+def _rerender_root_id_locked(job_id: str) -> str:
+    current = job_id
+    visited = {job_id}
+    while current in JOBS and JOBS[current].get("rerender_of"):
+        parent = str(JOBS[current]["rerender_of"])
+        if parent in visited or parent not in JOBS:
+            break
+        visited.add(parent)
+        current = parent
+    return current
+
+
+def _next_rerender_version_locked(job_id: str) -> int:
+    root_id = _rerender_root_id_locked(job_id)
+    versions: list[int] = []
+    legacy_count = 0
+    for candidate_id, candidate in JOBS.items():
+        if candidate.get("job_type") != "rerender" or _rerender_root_id_locked(candidate_id) != root_id:
+            continue
+        legacy_count += 1
+        versions.append(max(0, int(candidate.get("rerender_version") or 0)))
+    return max([legacy_count, *versions], default=0) + 1
+
+
+def rerender_default_name(source: dict[str, Any], version: int, root: dict[str, Any]) -> str:
+    base = str(source.get("rerender_base_name") or root.get("task_name") or source.get("task_name") or "任务").strip()
+    base = re.sub(r"\+重新渲染第\d+版$", "", base).strip() or "任务"
+    suffix = f"+重新渲染第{version}版"
+    return f"{base[:max(1, 30 - len(suffix))]}{suffix}"
+
+
+def safe_download_name(value: Any, fallback: str) -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", str(value or "").strip()).rstrip(". ")
+    return (cleaned or fallback)[:80]
+
+
 def request_client_ip(request: Request) -> str:
     # The API only listens on loopback and is reached through the local Vite
     # proxy. Its last forwarded address is therefore the nearest LAN client.
@@ -1275,6 +1314,7 @@ def job_snapshot(job_id: str) -> dict[str, Any]:
         source = JOBS[job_id]
         result = source.copy()
         result["task_name"] = normalized_task_name(source.get("task_name"), str(source.get("copy", "")), job_id)
+        result["next_rerender_version"] = _next_rerender_version_locked(job_id)
         result["can_retry"] = source.get("status") == "error"
         result["can_cancel"] = source.get("status") in {"queued", "running"}
         result["image_count"] = sum(
@@ -4030,6 +4070,21 @@ def list_jobs(limit: int = 20) -> dict[str, Any]:
     return {"items": [job_snapshot(job_id) for job_id in ids]}
 
 
+@app.patch("/api/jobs/{job_id}/name")
+def rename_job(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    task_name = re.sub(r"\s+", " ", str(payload.get("task_name") or "")).strip()
+    if not task_name:
+        raise HTTPException(400, "任务名不能为空")
+    if len(task_name) > 30:
+        raise HTTPException(400, "任务名最多30个字")
+    with LOCK:
+        if job_id not in JOBS:
+            raise HTTPException(404, "历史任务不存在")
+        JOBS[job_id]["task_name"] = task_name
+        _persist_job_locked(job_id)
+    return job_snapshot(job_id)
+
+
 @app.post("/api/jobs/{job_id}/cancel")
 def cancel_job(job_id: str) -> dict[str, Any]:
     now = time.time()
@@ -4205,6 +4260,32 @@ def get_job_generated_image(job_id: str, filename: str) -> FileResponse:
     return FileResponse(path, media_type="image/png")
 
 
+@app.get("/api/jobs/{job_id}/images.zip")
+def download_job_images(job_id: str) -> StreamingResponse:
+    with LOCK:
+        item = JOBS.get(job_id)
+        if item is None:
+            raise HTTPException(404, "历史任务不存在")
+        task_name = safe_download_name(item.get("task_name"), f"任务-{job_id}")
+    images = sorted(
+        (path for path in (JOBS_DIR / job_id).glob("board-*.png") if re.fullmatch(r"board-\d+\.png", path.name)),
+        key=lambda path: int(re.search(r"\d+", path.stem).group()),
+    )
+    if not images:
+        raise HTTPException(404, "该任务还没有可保存的图片")
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        for index, image in enumerate(images, 1):
+            output.write(image, f"{task_name}/第{index:02d}张.png")
+    archive.seek(0)
+    filename = f"{task_name}-全部图片.zip"
+    return StreamingResponse(
+        archive,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+    )
+
+
 @app.post("/api/jobs/{job_id}/boards/{page}/regenerate")
 def regenerate_job_board(job_id: str, page: int, payload: dict[str, Any], request: Request) -> dict[str, Any]:
     prompt = str(payload.get("prompt") or "").strip()
@@ -4288,7 +4369,9 @@ def create_rerender(job_id: str, payload: dict[str, Any], request: Request) -> d
     detail = str(payload.get("stroke_detail", source.get("stroke_detail", "detailed")))
     detail = detail if detail in {"light", "standard", "detailed", "full"} else "detailed"
     scenes_per_image = max(1, min(4, int(source.get("scenes_per_image", 1))))
-    task_name = normalized_task_name(payload.get("task_name") or source.get("task_name"), str(source.get("copy", "")), job_id)
+    requested_name = re.sub(r"\s+", " ", str(payload.get("task_name") or "")).strip()
+    if len(requested_name) > 30:
+        raise HTTPException(400, "任务名最多30个字")
     pen_text = str(payload.get("pen_text", source.get("pen_text", ""))).strip()[:12]
     include_key_text = bool(payload.get("include_key_text", source.get("include_key_text", True)))
     include_subtitles = bool(payload.get("include_subtitles", source.get("include_subtitles", True)))
@@ -4308,12 +4391,18 @@ def create_rerender(job_id: str, payload: dict[str, Any], request: Request) -> d
         shutil.copy2(image, target_dir / image.name)
     now = time.time()
     with LOCK:
+        root_id = _rerender_root_id_locked(job_id)
+        root = JOBS[root_id].copy()
+        rerender_version = _next_rerender_version_locked(job_id)
+        task_name = requested_name or rerender_default_name(source, rerender_version, root)
         JOBS[new_id] = {
             "id": new_id, "status": "queued", "stage": "准备重新渲染", "progress": 1,
             "created_at": now, "started_at": now, "timings": {},
             "queue_stage": "render", "queue_order": time.time_ns(),
             "client_ip": request_client_ip(request),
             "job_type": "rerender", "rerender_of": job_id, "style": source.get("style", ""),
+            "rerender_root_id": root_id, "rerender_version": rerender_version,
+            "rerender_base_name": re.sub(r"\+重新渲染第\d+版$", "", str(root.get("task_name") or source.get("task_name") or "任务")).strip(),
             "reference_mode": source.get("reference_mode", "standard"),
             "aspect_ratio": normalize_aspect_ratio(source.get("aspect_ratio")),
             "voice_mode": source.get("voice_mode", "clone"),

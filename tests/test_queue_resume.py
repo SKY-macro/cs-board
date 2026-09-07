@@ -8,6 +8,8 @@ import threading
 import time
 import unittest
 import wave
+import zipfile
+from io import BytesIO
 from pathlib import Path
 from unittest import mock
 
@@ -65,6 +67,57 @@ class QueueResumeTests(unittest.TestCase):
 
     def test_explicit_task_name_is_preserved(self) -> None:
         self.assertEqual(SERVER.normalized_task_name("  我的任务  ", "备用文案", "job-test"), "我的任务")
+
+    def test_task_name_can_be_changed_without_touching_other_job_data(self) -> None:
+        job_id = "rename-test"
+        SERVER.JOBS[job_id] = {**self.job(job_id), "task_name": "旧名称", "status": "done"}
+        response = TestClient(SERVER.app).patch(f"/api/jobs/{job_id}/name", json={"task_name": " 新名称 "})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["task_name"], "新名称")
+        self.assertEqual(SERVER.JOBS[job_id]["copy"], self.job(job_id)["copy"])
+
+    def test_rerender_copies_history_and_assigns_incrementing_default_versions(self) -> None:
+        from PIL import Image
+
+        job_id = "rerender-source"
+        source_dir = SERVER.JOBS_DIR / job_id
+        source_dir.mkdir(parents=True)
+        (source_dir / "voice.wav").write_bytes(b"voice")
+        (source_dir / "plan.json").write_text("[]", encoding="utf-8")
+        (source_dir / "boards.json").write_text("[]", encoding="utf-8")
+        Image.new("RGB", (64, 64), "white").save(source_dir / "board-01.png")
+        SERVER.JOBS[job_id] = {**self.job(job_id), "task_name": "测试故事", "status": "done", "can_rerender": True}
+        original = dict(SERVER.JOBS[job_id])
+
+        with mock.patch.object(SERVER, "start_render_task"):
+            first = TestClient(SERVER.app).post(f"/api/jobs/{job_id}/rerender", json={})
+            second = TestClient(SERVER.app).post(f"/api/jobs/{job_id}/rerender", json={})
+
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(first.json()["task_name"], "测试故事+重新渲染第1版")
+        self.assertEqual(second.json()["task_name"], "测试故事+重新渲染第2版")
+        self.assertEqual(first.json()["rerender_version"], 1)
+        self.assertEqual(second.json()["rerender_version"], 2)
+        self.assertEqual(SERVER.JOBS[job_id], original)
+        self.assertNotEqual(first.json()["id"], job_id)
+        self.assertTrue((SERVER.JOBS_DIR / first.json()["id"] / "board-01.png").is_file())
+
+    def test_all_generated_images_download_as_named_zip(self) -> None:
+        from PIL import Image
+
+        job_id = "gallery-zip"
+        job_dir = SERVER.JOBS_DIR / job_id
+        job_dir.mkdir(parents=True)
+        Image.new("RGB", (64, 64), "red").save(job_dir / "board-01.png")
+        Image.new("RGB", (64, 64), "blue").save(job_dir / "board-02.png")
+        SERVER.JOBS[job_id] = {**self.job(job_id), "task_name": "图片测试", "status": "done"}
+
+        response = TestClient(SERVER.app).get(f"/api/jobs/{job_id}/images.zip")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("attachment", response.headers["content-disposition"])
+        with zipfile.ZipFile(BytesIO(response.content)) as archive:
+            self.assertEqual(archive.namelist(), ["图片测试/第01张.png", "图片测试/第02张.png"])
 
     def test_custom_reference_prompt_replaces_default_character(self) -> None:
         prompt = SERVER.build_board_prompt(

@@ -673,6 +673,30 @@
   white-space: nowrap;
 }
 
+.detailTitleLine {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.renameTaskButton {
+  flex: none;
+  padding: 5px 9px;
+  border: 1px solid #c8bda9;
+  border-radius: 7px;
+  background: #fffdf7;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.renameTaskButton:hover,
+.renameTaskButton:focus-visible {
+  border-color: var(--red);
+  color: var(--red);
+}
+
 .taskDetailDialog > header p {
   grid-column: 1 / -1;
   margin: 0;
@@ -755,6 +779,106 @@
 
 .detailSectionTitle i {
   color: #9b4c1d;
+}
+
+.galleryHeaderActions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.downloadAllImages {
+  padding: 8px 12px;
+  border: 1px solid #aac4af;
+  border-radius: 8px;
+  background: #edf5ef;
+  color: var(--green);
+  font-size: 12px;
+  font-weight: 900;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.downloadAllImages:hover,
+.downloadAllImages:focus-visible {
+  border-color: var(--green);
+  background: var(--green);
+  color: #fff;
+}
+
+.nameDialogOverlay {
+  position: fixed;
+  z-index: 1400;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: #211d17a8;
+  backdrop-filter: blur(8px);
+}
+
+.nameDialog {
+  display: grid;
+  gap: 12px;
+  width: min(480px, calc(100vw - 32px));
+  padding: 24px;
+  border: 1px solid #cfc3af;
+  border-radius: 16px;
+  background: #fffaf0;
+  box-shadow: 0 28px 80px #17120b66;
+}
+
+.nameDialog > span {
+  color: var(--red);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: .12em;
+}
+
+.nameDialog h3,
+.nameDialog p {
+  margin: 0;
+}
+
+.nameDialog h3 {
+  font: 750 21px Georgia, "Noto Serif SC", serif;
+}
+
+.nameDialog p,
+.nameDialog small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.nameDialog label {
+  display: grid;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.nameDialog label small {
+  text-align: right;
+  font-weight: 500;
+}
+
+.nameDialog > em {
+  color: var(--red);
+  font-size: 12px;
+  font-style: normal;
+}
+
+.nameDialog > div {
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+  margin-top: 3px;
+}
+
+.rerenderNameDialog {
+  border-top: 4px solid var(--green);
 }
 
 .galleryGrid {
@@ -1409,5 +1533,24 @@
 
   .galleryGrid {
     grid-template-columns: 1fr;
+  }
+
+  .detailSectionTitle {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .galleryHeaderActions {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .detailTitleLine {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .nameDialog {
+    padding: 20px;
   }
 }

@@ -44,6 +44,8 @@ type Job = {
   stroke_detail?: string;
   job_type?: string;
   rerender_of?: string;
+  rerender_version?: number;
+  next_rerender_version?: number;
   can_rerender?: boolean;
   needs_rerender?: boolean;
   can_retry?: boolean;
@@ -479,6 +481,12 @@ export default function Home() {
   const [regeneratingPage, setRegeneratingPage] = useState<number | null>(null);
   const [detailActionMessage, setDetailActionMessage] = useState("");
   const [detailLoading, setDetailLoading] = useState(false);
+  const [renameJob, setRenameJob] = useState<Job | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [renaming, setRenaming] = useState(false);
+  const [rerenderSource, setRerenderSource] = useState<Job | null>(null);
+  const [rerenderName, setRerenderName] = useState("");
+  const [rerendering, setRerendering] = useState(false);
   const [copy, setCopy] = useState("");
   const [reference, setReference] = useState<File | null>(null);
   const [voiceMode, setVoiceMode] = useState<VoiceMode>("clone");
@@ -956,18 +964,58 @@ export default function Home() {
       setConnectionMessage(error instanceof Error ? error.message : "解除失败");
     }
   };
-  const rerender = async (source: Job) => {
+  const openRenameDialog = (source: Job) => {
+    setRenameJob(source);
+    setRenameDraft(source.task_name || source.id);
+    setDetailActionMessage("");
+  };
+  const saveTaskName = async () => {
+    if (!renameJob || !renameDraft.trim()) return;
+    setRenaming(true);
+    try {
+      const response = await fetch(`${API}/api/jobs/${renameJob.id}/name`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task_name: renameDraft.trim() }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "修改任务名失败");
+      if (detailJob?.id === data.id) setDetailJob(data);
+      if (job?.id === data.id) setJob(data);
+      setRenameJob(null);
+      setDetailActionMessage("任务名已保存");
+      await loadHistory();
+    } catch (err) {
+      setDetailActionMessage(err instanceof Error ? err.message : "修改任务名失败");
+    } finally {
+      setRenaming(false);
+    }
+  };
+  const openRerenderDialog = (source: Job) => {
+    const version = source.next_rerender_version || (source.rerender_version || 0) + 1;
+    const suffix = `+重新渲染第${version}版`;
+    const base = (source.task_name || source.id).replace(/\+重新渲染第\d+版$/, "");
+    setRerenderSource(source);
+    setRerenderName(`${base.slice(0, Math.max(1, 30 - suffix.length))}${suffix}`);
+    setMessage("");
+    setDetailActionMessage("");
+  };
+  const submitRerender = async () => {
+    if (!rerenderSource || !rerenderName.trim()) return;
+    const source = rerenderSource;
+    setRerendering(true);
     setMessage("");
     setDetailActionMessage("");
     try {
       const r = await fetch(`${API}/api/jobs/${source.id}/rerender`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
+        body: JSON.stringify({ task_name: rerenderName.trim() }),
       });
       const data = await r.json();
       if (!r.ok) throw new Error(data.detail || "重新渲染提交失败");
       setJob(data);
+      setRerenderSource(null);
       setDetailJobId(null);
       setPreviewImage(null);
       loadHistory();
@@ -976,6 +1024,8 @@ export default function Home() {
       const text = err instanceof Error ? err.message : "重新渲染失败";
       setMessage(text);
       setDetailActionMessage(text);
+    } finally {
+      setRerendering(false);
     }
   };
   const retryFailed = async (source: Job) => {
@@ -1994,7 +2044,7 @@ export default function Home() {
                   </button>
                 )}
                 {shownJob.status === "done" && hasPendingRerender(shownJob) && (
-                  <button type="button" className="rerenderProgressButton" onClick={() => rerender(shownJob)}>
+                  <button type="button" className="rerenderProgressButton" onClick={() => openRerenderDialog(shownJob)}>
                     重新渲染成片
                   </button>
                 )}
@@ -2151,7 +2201,7 @@ export default function Home() {
                       className="rerenderHistory"
                       onClick={(event) => {
                         event.stopPropagation();
-                        rerender(item);
+                        openRerenderDialog(item);
                       }}
                     >
                       已重新生成，重新渲染成片
@@ -2190,7 +2240,12 @@ export default function Home() {
             <header>
               <div>
                 <span className={`taskStatus ${detailJob.status}`}>{statusLabel(detailJob.status)}</span>
-                <h2>{detailJob.task_name || detailJob.id}</h2>
+                <div className="detailTitleLine">
+                  <h2>{detailJob.task_name || detailJob.id}</h2>
+                  <button type="button" className="renameTaskButton" onClick={() => openRenameDialog(detailJob)}>
+                    修改名称
+                  </button>
+                </div>
                 <p>
                   {detailJob.stage} · {detailJob.progress}% · {formatDate(detailJob.created_at)}
                 </p>
@@ -2214,7 +2269,14 @@ export default function Home() {
                     <strong>生成图片</strong>
                     <span>{gallery.length ? `共 ${gallery.length} 张，单击切换提示词，双击或点击右上角放大` : detailLoading ? "正在读取图片…" : "该任务尚未生成图片"}</span>
                   </div>
-                  {["queued", "running"].includes(detailJob.status) && <i>生成中，图片会自动出现</i>}
+                  <div className="galleryHeaderActions">
+                    {gallery.length > 0 && (
+                      <a className="downloadAllImages" href={`${API}/api/jobs/${detailJob.id}/images.zip`} download>
+                        保存全部图片
+                      </a>
+                    )}
+                    {["queued", "running"].includes(detailJob.status) && <i>生成中，图片会自动出现</i>}
+                  </div>
                 </div>
                 {gallery.length ? (
                   <div className="galleryGrid">
@@ -2351,7 +2413,7 @@ export default function Home() {
                     ))}
                     {!detailParameters.reference && !detailParameters.style_reference && detailParameters.characters.every((character) => character.images.length === 0) && <p className="detailMaterialsEmpty">本次没有上传音频或参考图片</p>}
                     {detailJob.status === "done" && detailJob.can_rerender && (
-                      <button type="button" className="rerenderFromDetail" onClick={() => rerender(detailJob)}>
+                      <button type="button" className="rerenderFromDetail" onClick={() => openRerenderDialog(detailJob)}>
                         用当前图片重新渲染成片
                       </button>
                     )}
@@ -2425,7 +2487,33 @@ export default function Home() {
           )}
         </div>
       )}
-      {inputPreviewFile && <FileLightbox file={inputPreviewFile} onClose={() => setInputPreviewFile(null)} />}{" "}
+      {renameJob && (
+        /* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */
+        <div className="nameDialogOverlay" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setRenameJob(null)}>
+          <form className="nameDialog" role="dialog" aria-modal="true" aria-labelledby="rename-dialog-title" onSubmit={(event) => { event.preventDefault(); void saveTaskName(); }}>
+            <span>任务名称</span>
+            <h3 id="rename-dialog-title">修改任务名</h3>
+            <p>只修改历史记录中的显示名称，不会重新执行或改变任务内容。</p>
+            <label>新任务名<input maxLength={30} value={renameDraft} onChange={(event) => setRenameDraft(event.target.value)} /><small>{renameDraft.length}/30</small></label>
+            {detailActionMessage && <em>{detailActionMessage}</em>}
+            <div><button type="button" className="secondary" onClick={() => setRenameJob(null)}>取消</button><button type="submit" className="primary small" disabled={renaming || !renameDraft.trim()}>{renaming ? "保存中…" : "确认修改"}</button></div>
+          </form>
+        </div>
+      )}
+      {rerenderSource && (
+        /* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */
+        <div className="nameDialogOverlay" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setRerenderSource(null)}>
+          <form className="nameDialog rerenderNameDialog" role="dialog" aria-modal="true" aria-labelledby="rerender-dialog-title" onSubmit={(event) => { event.preventDefault(); void submitRerender(); }}>
+            <span>新建重新渲染任务</span>
+            <h3 id="rerender-dialog-title">确认新任务名称</h3>
+            <p>系统会复制当前配音、分镜和全部图片，新建一条历史任务；原任务与原成片不会被覆盖。</p>
+            <label>新任务名<input maxLength={30} value={rerenderName} onChange={(event) => setRerenderName(event.target.value)} /><small>{rerenderName.length}/30 · 已自动填写重新渲染版本号</small></label>
+            {detailActionMessage && <em>{detailActionMessage}</em>}
+            <div><button type="button" className="secondary" onClick={() => setRerenderSource(null)}>取消</button><button type="submit" className="primary small" disabled={rerendering || !rerenderName.trim()}>{rerendering ? "正在复制并提交…" : "复制并开始重新渲染"}</button></div>
+          </form>
+        </div>
+      )}
+      {inputPreviewFile && <FileLightbox file={inputPreviewFile} onClose={() => setInputPreviewFile(null)} />} {" "}
       {assetPreview && (
         <div
           className="imageLightbox assetLightbox"
