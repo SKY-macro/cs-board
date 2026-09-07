@@ -87,6 +87,7 @@ type CharacterBinding = {
   age_group: string;
   description: string;
   asset_id: string | null;
+  asset_label?: string | null;
   asset_image_url?: string | null;
 };
 type InputAsset = { name: string; url: string; content_type: string };
@@ -489,6 +490,9 @@ export default function Home() {
   const [characterBindings, setCharacterBindings] = useState<CharacterBinding[]>([]);
   const [characterMatchReady, setCharacterMatchReady] = useState(false);
   const [characterBusy, setCharacterBusy] = useState(false);
+  const [drawingRoleId, setDrawingRoleId] = useState<string | null>(null);
+  const [pendingDrawRoles, setPendingDrawRoles] = useState<Record<string, string>>({});
+  const drawOriginRoles = useRef<Record<string, string>>({});
   const [drawLabel, setDrawLabel] = useState("角色候选");
   const [drawDescription, setDrawDescription] = useState("");
   const [drawCount, setDrawCount] = useState(1);
@@ -675,10 +679,43 @@ export default function Home() {
       if (healthResponse.ok) setHealth(await healthResponse.json());
     } catch {}
   };
+  const applyApprovedAssetsToBindings = (assets: CharacterAsset[]) => {
+    setCharacterBindings((items) => {
+      const used = new Set(items.map((item) => item.asset_id).filter(Boolean));
+      let changed = false;
+      const next = items.map((binding) => {
+        if (binding.asset_id) return binding;
+        const normalized = binding.description.replace(/\s+/g, "").trim();
+        const match = assets.find((asset) => asset.status === "approved" && !used.has(asset.id) && asset.description.replace(/\s+/g, "").trim() === normalized);
+        if (!match) return binding;
+        used.add(match.id);
+        changed = true;
+        return { ...binding, asset_id: match.id, asset_label: match.label, asset_image_url: match.image_url || null };
+      });
+      return changed ? next : items;
+    });
+  };
   const loadCharacterAssets = async () => {
     try {
       const response = await fetch(`${API}/api/character-assets?style=${encodeURIComponent(style)}`);
-      if (response.ok) setCharacterAssets((await response.json()).items || []);
+      if (response.ok) {
+        const assets: CharacterAsset[] = (await response.json()).items || [];
+        setCharacterAssets(assets);
+        applyApprovedAssetsToBindings(assets);
+        setPendingDrawRoles((items) => {
+          let changed = false;
+          const next = { ...items };
+          for (const [roleId, assetId] of Object.entries(items)) {
+            const asset = assets.find((candidate) => candidate.id === assetId);
+            if (asset && (asset.status === "error" || asset.status === "rejected")) {
+              delete next[roleId];
+              delete drawOriginRoles.current[assetId];
+              changed = true;
+            }
+          }
+          return changed ? next : items;
+        });
+      }
     } catch {}
   };
   useEffect(() => {
@@ -691,6 +728,10 @@ export default function Home() {
     const id = setInterval(loadCharacterAssets, 2200);
     return () => clearInterval(id);
   }, [characterLibraryOpen, style]);
+  const hasMissingCharacters = characterBindings.some((item) => !item.asset_id);
+  useEffect(() => {
+    if (pageMode === "standard" && characterMatchReady && hasMissingCharacters) void loadCharacterAssets();
+  }, [pageMode, characterMatchReady, hasMissingCharacters, style]);
   const matchCharacters = async () => {
     if (copy.trim().length < 10) return setMessage("请先填写至少 10 个字的文案，再分析角色");
     setCharacterBusy(true);
@@ -708,10 +749,7 @@ export default function Home() {
       setCharacterMatchReady(true);
       const missing = bindings.filter((item) => !item.asset_id);
       if (missing.length) {
-        setDrawLabel(missing[0].story_name || "角色候选");
-        setDrawDescription(missing[0].description || "");
-        setCharacterMessage(`有 ${missing.length} 个角色没有合适资产，已为你准备抽卡条件；审核保存后再点一次匹配。`);
-        setCharacterLibraryOpen(true);
+        setCharacterMessage(`有 ${missing.length} 个角色没有合适资产；点击每张红色卡片右侧的“去抽卡”即可直接生成。`);
       } else {
         setCharacterMessage(bindings.length ? `已匹配 ${bindings.length} 个角色；生成时会按分镜只上传实际出镜角色。` : "文案中没有需要固定形象的出镜角色，可直接生成。");
       }
@@ -721,23 +759,44 @@ export default function Home() {
       setCharacterBusy(false);
     }
   };
-  const drawCharacterAssets = async () => {
+  const submitCharacterDraw = async (label: string, description: string, count: number, originRoleId?: string) => {
     setCharacterBusy(true);
     setCharacterMessage("已提交角色抽卡，生成完成后会出现在审核区…");
     try {
       const response = await fetch(`${API}/api/character-assets/draw`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ style, label: drawLabel, description: drawDescription, count: drawCount }),
+        body: JSON.stringify({ style, label, description, count }),
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail || "抽卡失败");
+      if (originRoleId) {
+        for (const asset of payload.items || []) drawOriginRoles.current[asset.id] = originRoleId;
+        const firstAsset = (payload.items || [])[0];
+        if (firstAsset) setPendingDrawRoles((items) => ({ ...items, [originRoleId]: firstAsset.id }));
+      }
       await loadCharacterAssets();
     } catch (error) {
       setCharacterMessage(error instanceof Error ? error.message : "抽卡失败");
     } finally {
       setCharacterBusy(false);
+      setDrawingRoleId(null);
     }
+  };
+  const drawCharacterAssets = async () => submitCharacterDraw(drawLabel, drawDescription, drawCount);
+  const reusableAssetLabel = (binding: CharacterBinding) => {
+    const age = binding.age_group && binding.age_group !== "未知" ? binding.age_group.replace(/阶段|人群/g, "") : "";
+    const gender = binding.gender === "女性" ? "女" : binding.gender === "男性" ? "男" : binding.gender !== "未知" ? binding.gender : "";
+    return `${age}${gender}`.trim() || "角色候选";
+  };
+  const drawMissingCharacter = async (binding: CharacterBinding) => {
+    const label = reusableAssetLabel(binding);
+    setDrawLabel(label);
+    setDrawDescription(binding.description);
+    setDrawCount(1);
+    setDrawingRoleId(binding.role_id);
+    setCharacterLibraryOpen(true);
+    await submitCharacterDraw(label, binding.description, 1, binding.role_id);
   };
   const reviewCharacterAsset = async (asset: CharacterAsset, status: "approved" | "rejected") => {
     const response = await fetch(`${API}/api/character-assets/${asset.id}`, {
@@ -747,7 +806,37 @@ export default function Home() {
     });
     const payload = await response.json();
     if (!response.ok) return setCharacterMessage(payload.detail || "审核失败");
-    setCharacterMessage(status === "approved" ? "已保存到该画风的公共角色资产库；返回标准制作后请重新匹配。" : "已标记为不采用。");
+    if (status === "approved") {
+      const originRoleId = drawOriginRoles.current[asset.id];
+      if (originRoleId) {
+        setCharacterBindings((items) => items.map((binding) => binding.role_id === originRoleId ? {
+          ...binding,
+          asset_id: asset.id,
+          asset_label: payload.label,
+          asset_image_url: payload.image_url || null,
+        } : binding));
+        delete drawOriginRoles.current[asset.id];
+        setPendingDrawRoles((items) => {
+          const next = { ...items };
+          delete next[originRoleId];
+          return next;
+        });
+      } else {
+        applyApprovedAssetsToBindings([{ ...asset, ...payload }]);
+      }
+      setCharacterMessage("已审核并自动绑定到当前任务；对应角色已从红色变为绿色。");
+    } else {
+      const originRoleId = drawOriginRoles.current[asset.id];
+      if (originRoleId) {
+        delete drawOriginRoles.current[asset.id];
+        setPendingDrawRoles((items) => {
+          const next = { ...items };
+          delete next[originRoleId];
+          return next;
+        });
+      }
+      setCharacterMessage("已标记为不采用。");
+    }
     loadCharacterAssets();
   };
   const deleteCharacterAsset = async (asset: CharacterAsset) => {
@@ -755,6 +844,15 @@ export default function Home() {
     const response = await fetch(`${API}/api/character-assets/${asset.id}`, { method: "DELETE" });
     const payload = await response.json();
     if (!response.ok) return setCharacterMessage(payload.detail || "删除失败");
+    const originRoleId = drawOriginRoles.current[asset.id];
+    if (originRoleId) {
+      delete drawOriginRoles.current[asset.id];
+      setPendingDrawRoles((items) => {
+        const next = { ...items };
+        delete next[originRoleId];
+        return next;
+      });
+    }
     setCharacterMessage("角色资产已删除；历史任务里的冻结副本仍然保留。");
     loadCharacterAssets();
   };
@@ -1929,7 +2027,7 @@ export default function Home() {
                   <button type="button" className="secondary" disabled={characterBusy || copy.trim().length < 10} onClick={matchCharacters}>{characterBusy ? "分析中…" : characterMatchReady ? "重新分析并匹配" : "AI 分析并挑选角色"}</button>
                   <button type="button" className="secondary" onClick={() => setCharacterLibraryOpen(true)}>打开角色抽卡库</button>
                 </div>
-                {characterBindings.length > 0 && <div className="taskCharacterBindings">{characterBindings.map((binding) => <article key={binding.role_id} className={binding.asset_id ? "matched" : "missing"}>{binding.asset_image_url ? <img src={`${API}${binding.asset_image_url}`} alt="" /> : <span>缺</span>}<div><b>{binding.story_name}</b><small>{binding.age_group} · {binding.gender}</small><p>{binding.description}</p></div><em>{binding.asset_id ? "已匹配" : "需抽卡"}</em></article>)}</div>}
+                {characterBindings.length > 0 && <div className="taskCharacterBindings">{characterBindings.map((binding) => <article key={binding.role_id} className={binding.asset_id ? "matched" : "missing"}>{binding.asset_image_url ? <img src={`${API}${binding.asset_image_url}`} alt="" /> : <span>缺</span>}<div><b>{binding.story_name}</b>{binding.asset_label && <small className="assetMatchName">已使用资产：{binding.asset_label}</small>}<small>{binding.age_group} · {binding.gender}</small><p>{binding.description}</p></div>{binding.asset_id ? <em>已匹配</em> : <button type="button" className="drawMissingRole" disabled={characterBusy || Boolean(pendingDrawRoles[binding.role_id])} onClick={() => drawMissingCharacter(binding)}>{drawingRoleId === binding.role_id ? "提交中…" : pendingDrawRoles[binding.role_id] ? "等待审核" : "去抽卡"}</button>}</article>)}</div>}
                 {characterMessage && <p className="characterMessage">{characterMessage}</p>}
               </section>
             </>

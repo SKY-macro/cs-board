@@ -245,3 +245,17 @@ test("shows a live prompt structure panel for the selected visual style", async 
   assert.match(css, /\.stylePromptPanel\s*\{/);
   assert.match(css, /\.styleRecipeBox\s*\{/);
 });
+
+test("supports one-click missing-role draws and live green binding feedback", async () => {
+  const [page, css] = await Promise.all([
+    readPageSource(),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+  assert.match(page, /asset_label\?:string/);
+  assert.match(page, /constdrawMissingCharacter=/);
+  assert.match(page, /"去抽卡"/);
+  assert.match(page, /story_name.*asset_label/s);
+  assert.match(page, /setCharacterBindings\(\(items\)=>items\.map/);
+  assert.match(css, /\.taskCharacterBindings article\.matched/);
+  assert.match(css, /\.drawMissingRole/);
+});

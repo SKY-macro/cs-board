@@ -39,7 +39,7 @@ PYTHON = Path(sys.executable)
 NODE = shutil.which("node") or "node"
 REMOTION_RENDERER = ROOT / "video_renderer"
 HAND = ROOT / "assets" / "drawing-hand-clean.png"
-PIPELINE_VERSION = "narrated_deck_v20_character_draw_recovery"
+PIPELINE_VERSION = "narrated_deck_v21_character_draw_handoff"
 ALIGNMENT_SEGMENTATION = "word-boundary-dtw-audio-v2"
 SUBTITLE_FONT = os.environ.get(
     "CS_BOARD_SUBTITLE_FONT",
@@ -472,6 +472,24 @@ def character_asset_record(asset_id: str) -> tuple[Path, dict[str, Any]]:
     except (OSError, json.JSONDecodeError) as exc:
         raise HTTPException(500, "角色资产记录损坏") from exc
     return manifest_path, item
+
+
+def unique_character_asset_label(style: str, requested: str, exclude_id: str = "") -> str:
+    """Keep human-facing labels distinct while asset IDs remain authoritative."""
+    base = re.sub(r"\s+", " ", requested).strip()[:30] or "角色候选"
+    used = {
+        str(item.get("label") or "").strip().casefold()
+        for item in character_asset_records(style, include_unapproved=True)
+        if str(item.get("id") or "") != exclude_id
+    }
+    if base.casefold() not in used:
+        return base
+    for number in range(2, 1000):
+        suffix = f" {number}"
+        candidate = f"{base[:30 - len(suffix)]}{suffix}"
+        if candidate.casefold() not in used:
+            return candidate
+    return f"{base[:25]} {uuid.uuid4().hex[:4]}"
 
 
 def style_only_reference_context(style: str) -> tuple[list[Path], str]:
@@ -4223,24 +4241,26 @@ def create_character_draw(payload: dict[str, Any]) -> dict[str, Any]:
     if len(description) < 4:
         raise HTTPException(400, "请填写至少 4 个字的人物外观描述")
     count = max(1, min(4, int(payload.get("count") or 1)))
-    label = re.sub(r"\s+", " ", str(payload.get("label") or "角色候选")).strip()[:30] or "角色候选"
+    requested_label = re.sub(r"\s+", " ", str(payload.get("label") or "角色候选")).strip()[:30] or "角色候选"
     created: list[dict[str, Any]] = []
     for _ in range(count):
-        asset_id = uuid.uuid4().hex[:12]
-        asset_dir = CHARACTER_LIBRARY_DIR / character_style_key(style) / asset_id
-        asset_dir.mkdir(parents=True, exist_ok=False)
-        item = {
-            "id": asset_id,
-            "style": style,
-            "label": label,
-            "description": description[:300],
-            "status": "queued",
-            "image": None,
-            "created_at": time.time(),
-            "updated_at": time.time(),
-            "error": None,
-        }
-        atomic_write_json(asset_dir / "asset.json", item)
+        with LOCK:
+            label = unique_character_asset_label(style, requested_label)
+            asset_id = uuid.uuid4().hex[:12]
+            asset_dir = CHARACTER_LIBRARY_DIR / character_style_key(style) / asset_id
+            asset_dir.mkdir(parents=True, exist_ok=False)
+            item = {
+                "id": asset_id,
+                "style": style,
+                "label": label,
+                "description": description[:300],
+                "status": "queued",
+                "image": None,
+                "created_at": time.time(),
+                "updated_at": time.time(),
+                "error": None,
+            }
+            atomic_write_json(asset_dir / "asset.json", item)
         threading.Thread(target=draw_character_asset, args=(asset_id,), daemon=True, name=f"character-draw-{asset_id}").start()
         created.append({**item, "image_url": None})
     return {"items": created}
@@ -4250,7 +4270,8 @@ def create_character_draw(payload: dict[str, Any]) -> dict[str, Any]:
 def update_character_asset(asset_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     manifest_path, item = character_asset_record(asset_id)
     if "label" in payload:
-        item["label"] = re.sub(r"\s+", " ", str(payload.get("label") or "")).strip()[:30] or item.get("label")
+        requested = re.sub(r"\s+", " ", str(payload.get("label") or "")).strip()[:30] or str(item.get("label") or "角色候选")
+        item["label"] = unique_character_asset_label(str(item.get("style") or DEFAULT_STYLE), requested, asset_id)
     if "description" in payload:
         description = re.sub(r"\s+", " ", str(payload.get("description") or "")).strip()
         if len(description) < 4:
@@ -4325,9 +4346,19 @@ description 用 25～80 个汉字写身份、年龄段、脸型、眼睛、发�
     for index, raw in enumerate(result[:8], 1):
         if not isinstance(raw, dict):
             continue
+        description = str(raw.get("description") or "普通人物形象").strip()[:300]
         asset_id = str(raw.get("asset_id") or "")
         if asset_id not in asset_map or asset_id in used_assets:
             asset_id = ""
+        if not asset_id:
+            normalized_description = re.sub(r"\s+", "", description)
+            exact = next((
+                item for item in assets
+                if str(item.get("id") or "") not in used_assets
+                and re.sub(r"\s+", "", str(item.get("description") or "")) == normalized_description
+            ), None)
+            if exact:
+                asset_id = str(exact.get("id") or "")
         if asset_id:
             used_assets.add(asset_id)
         bindings.append({
@@ -4335,8 +4366,9 @@ description 用 25～80 个汉字写身份、年龄段、脸型、眼睛、发�
             "story_name": str(raw.get("story_name") or f"人物{index}").strip()[:30],
             "gender": str(raw.get("gender") or "未知").strip()[:12],
             "age_group": str(raw.get("age_group") or "未知").strip()[:20],
-            "description": str(raw.get("description") or "普通人物形象").strip()[:300],
+            "description": description,
             "asset_id": asset_id or None,
+            "asset_label": str(asset_map.get(asset_id, {}).get("label") or "") if asset_id else None,
             "asset_image_url": f"/api/character-assets/{asset_id}/image" if asset_id else None,
         })
     return {"bindings": bindings, "missing_roles": [item for item in bindings if not item.get("asset_id")], "style": style}
@@ -4510,6 +4542,7 @@ async def create_job(
                 "gender": str(binding.get("gender") or "").strip()[:12],
                 "age_group": str(binding.get("age_group") or "").strip()[:20],
                 "asset_id": asset_id,
+                "asset_label": str(asset.get("label") or ""),
                 "image": filename,
             })
     scenes_per_image = max(1, min(4, scenes_per_image))
@@ -4661,7 +4694,7 @@ def get_job_parameters(job_id: str) -> dict[str, Any]:
         if not isinstance(raw, dict):
             continue
         character_bindings.append({
-            **{key: raw.get(key) for key in ("role_id", "story_name", "gender", "age_group", "description", "asset_id")},
+            **{key: raw.get(key) for key in ("role_id", "story_name", "gender", "age_group", "description", "asset_id", "asset_label")},
             "asset_image_url": (asset_descriptor(source_id, str(raw.get("image") or "")) or {}).get("url"),
         })
     reference_mode = str(source.get("reference_mode") or "standard")

@@ -395,6 +395,41 @@ class QueueResumeTests(unittest.TestCase):
         self.assertEqual(saved["status"], "error")
         self.assertIn("后台重启中断", saved["error"])
 
+    def test_character_draw_names_are_unique_within_one_style(self) -> None:
+        client = TestClient(SERVER.app)
+        with mock.patch.object(SERVER, "draw_character_asset", return_value=None):
+            first = client.post("/api/character-assets/draw", json={
+                "style": SERVER.DEFAULT_STYLE, "label": "青年女", "description": "青年女性，黑色中长发",
+            })
+            second = client.post("/api/character-assets/draw", json={
+                "style": SERVER.DEFAULT_STYLE, "label": "青年女", "description": "青年女性，黑色中长发",
+            })
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.json()["items"][0]["label"], "青年女")
+        self.assertEqual(second.json()["items"][0]["label"], "青年女 2")
+
+    def test_character_match_returns_both_story_name_and_asset_label(self) -> None:
+        asset_id = "abcdef123456"
+        asset_dir = SERVER.CHARACTER_LIBRARY_DIR / SERVER.character_style_key(SERVER.DEFAULT_STYLE) / asset_id
+        asset_dir.mkdir(parents=True)
+        SERVER.atomic_write_json(asset_dir / "asset.json", {
+            "id": asset_id, "style": SERVER.DEFAULT_STYLE, "label": "青年女",
+            "description": "青年女性，黑色中长发", "status": "approved", "image": "character-sheet.png", "created_at": 1,
+        })
+        model_result = [{
+            "role_id": "role_01", "story_name": "我", "gender": "女", "age_group": "青年",
+            "description": "青年女性，黑色中长发", "asset_id": None,
+        }]
+        with mock.patch.object(SERVER, "provider_text", return_value={"output_text": json.dumps(model_result, ensure_ascii=False)}):
+            response = TestClient(SERVER.app).post("/api/character-matches", json={
+                "copy": "我是一名青年女性，今天准备出门去公司上班。", "style": SERVER.DEFAULT_STYLE,
+            })
+        self.assertEqual(response.status_code, 200)
+        binding = response.json()["bindings"][0]
+        self.assertEqual(binding["story_name"], "我")
+        self.assertEqual(binding["asset_label"], "青年女")
+
     def test_standard_job_rejects_unmatched_character(self) -> None:
         response = TestClient(SERVER.app).post("/api/jobs", data={
             "copy": "小林走进房间，随后坐在桌边认真写下今天的计划。",
