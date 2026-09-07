@@ -494,6 +494,10 @@ export default function Home() {
   const [characterLibraryOpen, setCharacterLibraryOpen] = useState(false);
   const [characterAssets, setCharacterAssets] = useState<CharacterAsset[]>([]);
   const [characterBindings, setCharacterBindings] = useState<CharacterBinding[]>([]);
+  const [replacementRoleId, setReplacementRoleId] = useState<string | null>(null);
+  const [replacementAssets, setReplacementAssets] = useState<CharacterAsset[]>([]);
+  const [replacementLoading, setReplacementLoading] = useState(false);
+  const [replacementError, setReplacementError] = useState("");
   const [characterMatchReady, setCharacterMatchReady] = useState(false);
   const [characterBusy, setCharacterBusy] = useState(false);
   const [drawingRoleId, setDrawingRoleId] = useState<string | null>(null);
@@ -726,6 +730,7 @@ export default function Home() {
     } catch {}
   };
   useEffect(() => {
+    setReplacementRoleId(null);
     const restored = restoredCharacterState.current;
     if (restored) {
       if (restored.copy === copy && restored.style === style) {
@@ -818,6 +823,49 @@ export default function Home() {
     setDrawingRoleId(binding.role_id);
     setCharacterLibraryOpen(true);
     await submitCharacterDraw(label, description, 1, binding.role_id);
+  };
+  const openCharacterReplacement = async (binding: CharacterBinding) => {
+    setReplacementRoleId(binding.role_id);
+    setReplacementAssets([]);
+    setReplacementError("");
+    setReplacementLoading(true);
+    try {
+      const response = await fetch(`${API}/api/character-assets?style=${encodeURIComponent(style)}&approved_only=true`);
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "读取角色资产失败");
+      const approvedAssets = (payload.items || []).filter((asset: CharacterAsset) => asset.status === "approved" && asset.image_url);
+      if (binding.asset_id && binding.asset_image_url && !approvedAssets.some((asset: CharacterAsset) => asset.id === binding.asset_id)) {
+        approvedAssets.unshift({
+          id: binding.asset_id,
+          style,
+          label: binding.asset_label || binding.story_name,
+          description: binding.description,
+          status: "approved",
+          image_url: binding.asset_image_url,
+        });
+      }
+      setReplacementAssets(approvedAssets);
+    } catch (error) {
+      setReplacementError(error instanceof Error ? error.message : "读取角色资产失败");
+    } finally {
+      setReplacementLoading(false);
+    }
+  };
+  const replaceCharacterAsset = (asset: CharacterAsset) => {
+    if (!replacementRoleId) return;
+    const binding = characterBindings.find((item) => item.role_id === replacementRoleId);
+    setCharacterBindings((items) => items.map((item) => item.role_id === replacementRoleId ? {
+      ...item,
+      asset_id: asset.id,
+      asset_label: asset.label,
+      asset_image_url: asset.image_url || null,
+      description: asset.description,
+      persona_compatible: true,
+      match_confidence: undefined,
+      match_reason: `由你手动选择“${asset.label}”`,
+    } : item));
+    setCharacterMessage(`已将“${binding?.story_name || "该角色"}”更换为资产“${asset.label}”；其他人物不会改变。`);
+    setReplacementRoleId(null);
   };
   const reviewCharacterAsset = async (asset: CharacterAsset, status: "approved" | "rejected") => {
     const response = await fetch(`${API}/api/character-assets/${asset.id}`, {
@@ -1490,6 +1538,11 @@ export default function Home() {
   const selectedGalleryImage = selectedGalleryPage === null ? null : gallery.find((image) => image.page === selectedGalleryPage) || null;
   const textAvailability = serviceAvailability(config.text_services);
   const imageAvailability = serviceAvailability(config.image_services);
+  const replacementBinding = characterBindings.find((item) => item.role_id === replacementRoleId) || null;
+  const otherBoundAssetIds = new Set(
+    characterBindings.filter((item) => item.role_id !== replacementRoleId).map((item) => item.asset_id).filter(Boolean),
+  );
+  const selectableReplacementAssets = replacementAssets.filter((asset) => !otherBoundAssetIds.has(asset.id));
   return (
     <main className="shell">
       <header className="topbar">
@@ -1935,6 +1988,42 @@ export default function Home() {
           </section>
         </div>
       )}
+      {replacementBinding && (
+        <div className="settingsOverlay roleAssetPickerOverlay" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setReplacementRoleId(null)}>
+          <section className="roleAssetPickerDialog panel" role="dialog" aria-modal="true" aria-label={`更换角色：${replacementBinding.story_name}`}>
+            <header className="settingsModalHeader">
+              <div>
+                <span>人物资产</span>
+                <h2>为“{replacementBinding.story_name}”选择替换角色</h2>
+                <p>仅更换角色设定图；故事身份、性格、分镜和其他人物保持不变。</p>
+              </div>
+              <button type="button" className="settingsClose" onClick={() => setReplacementRoleId(null)}>取消更换</button>
+            </header>
+            <div className="roleAssetPickerGrid">
+              {replacementLoading && <div className="roleAssetPickerEmpty">正在读取“{style}”的已审核角色…</div>}
+              {!replacementLoading && replacementError && <div className="roleAssetPickerEmpty error">{replacementError}</div>}
+              {!replacementLoading && !replacementError && selectableReplacementAssets.map((asset) => {
+                const current = asset.id === replacementBinding.asset_id;
+                return (
+                  <article key={asset.id} className={`roleAssetChoice ${current ? "current" : ""}`}>
+                    <img src={`${API}${asset.image_url}`} alt={`${asset.label}角色设定图`} />
+                    <div>
+                      <strong>{asset.label}</strong>
+                      <p>{asset.description}</p>
+                    </div>
+                    <button type="button" disabled={current} onClick={() => replaceCharacterAsset(asset)}>
+                      {current ? "当前使用" : "选择此角色"}
+                    </button>
+                  </article>
+                );
+              })}
+              {!replacementLoading && !replacementError && selectableReplacementAssets.length === 0 && (
+                <div className="roleAssetPickerEmpty">当前画风没有其他可用角色，请先到角色抽卡库生成并审核。</div>
+              )}
+            </div>
+          </section>
+        </div>
+      )}
       <form className="workspace" onSubmit={create}>
         <section className="panel inputPanel">
           <Title n="01" title="提供素材" note={voiceMode === "none" ? "只填文案即可" : "选择声音并填写文案"} />
@@ -2183,7 +2272,34 @@ export default function Home() {
                 <button type="button" className="secondary" disabled={characterBusy || copy.trim().length < 10} onClick={matchCharacters}>{characterBusy ? "分析中…" : characterMatchReady ? "重新分析并匹配" : "AI 分析并挑选角色"}</button>
                 <button type="button" className="secondary" onClick={() => setCharacterLibraryOpen(true)}>打开角色抽卡库</button>
               </div>
-              {characterBindings.length > 0 && <div className="taskCharacterBindings">{characterBindings.map((binding) => <article key={binding.role_id} className={binding.asset_id ? "matched" : "missing"}>{binding.asset_image_url ? <img src={`${API}${binding.asset_image_url}`} alt="" /> : <span>缺</span>}<div><b>{binding.story_name}</b>{binding.asset_label && <small className="assetMatchName">已使用资产：{binding.asset_label}</small>}<small>{binding.age_group} · {binding.gender}</small>{binding.core_personality && <small>核心性格：{binding.core_personality}</small>}{binding.facial_persona && <small>固定脸相：{binding.facial_persona}</small>}<p>{binding.description}</p>{binding.match_reason && <small>{binding.asset_id ? "匹配理由" : "未匹配原因"}：{binding.match_reason}</small>}</div>{binding.asset_id ? <em>{binding.match_confidence != null ? `${Math.round(binding.match_confidence * 100)}% 匹配` : "已绑定"}</em> : <button type="button" className="drawMissingRole" disabled={characterBusy || Boolean(pendingDrawRoles[binding.role_id])} onClick={() => drawMissingCharacter(binding)}>{drawingRoleId === binding.role_id ? "提交中…" : pendingDrawRoles[binding.role_id] ? "等待审核" : "去抽卡"}</button>}</article>)}</div>}
+              {characterBindings.length > 0 && (
+                <div className="taskCharacterBindings">
+                  {characterBindings.map((binding) => (
+                    <article key={binding.role_id} className={binding.asset_id ? "matched" : "missing"}>
+                      {binding.asset_image_url ? <img src={`${API}${binding.asset_image_url}`} alt="" /> : <span>缺</span>}
+                      <div>
+                        <b>{binding.story_name}</b>
+                        {binding.asset_label && <small className="assetMatchName">已使用资产：{binding.asset_label}</small>}
+                        <small>{binding.age_group} · {binding.gender}</small>
+                        {binding.core_personality && <small>核心性格：{binding.core_personality}</small>}
+                        {binding.facial_persona && <small>固定脸相：{binding.facial_persona}</small>}
+                        <p>{binding.description}</p>
+                        {binding.match_reason && <small>{binding.asset_id ? "匹配理由" : "未匹配原因"}：{binding.match_reason}</small>}
+                      </div>
+                      {binding.asset_id ? (
+                        <div className="bindingStatusActions">
+                          <em>{binding.match_confidence != null ? `${Math.round(binding.match_confidence * 100)}% 匹配` : "已绑定"}</em>
+                          <button type="button" className="replaceBoundRole" onClick={() => void openCharacterReplacement(binding)}>更换该角色</button>
+                        </div>
+                      ) : (
+                        <button type="button" className="drawMissingRole" disabled={characterBusy || Boolean(pendingDrawRoles[binding.role_id])} onClick={() => drawMissingCharacter(binding)}>
+                          {drawingRoleId === binding.role_id ? "提交中…" : pendingDrawRoles[binding.role_id] ? "等待审核" : "去抽卡"}
+                        </button>
+                      )}
+                    </article>
+                  ))}
+                </div>
+              )}
               {characterMessage && <p className="characterMessage">{characterMessage}</p>}
             </section>
           )}

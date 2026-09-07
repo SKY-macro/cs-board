@@ -275,3 +275,13 @@ test("restores matched characters into a detached reusable task form", async () 
   assert.doesNotMatch(page, /constrestoreParameters=.*setJob\(source\).*constopenTaskDetail/s);
   assert.match(page, /binding\.match_confidence!=null.*%匹配.*已绑定/s);
 });
+
+test("allows manually replacing one bound role with another approved asset", async () => {
+  const page = await readPageSource();
+  assert.match(page, /constopenCharacterReplacement=.*approved_only=true/s);
+  assert.match(page, /binding\.asset_id.*approvedAssets\.some.*approvedAssets\.unshift/s);
+  assert.match(page, /constreplaceCharacterAsset=.*role_id===replacementRoleId.*description:asset\.description/s);
+  assert.match(page, /otherBoundAssetIds.*selectableReplacementAssets/s);
+  assert.match(page, /className="replaceBoundRole".*更换该角色/s);
+  assert.match(page, /className="roleAssetPickerDialogpanel".*选择替换角色.*当前使用.*选择此角色/s);
+});
