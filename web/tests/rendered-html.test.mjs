@@ -200,3 +200,19 @@ test("shows image relay RPM and in-flight statistics in API settings", async () 
   assert.match(page, /reset-rpm-memory/);
   assert.match(page, />解除档位记忆<\/button>/);
 });
+
+test("shows a live prompt structure panel for the selected visual style", async () => {
+  const [page, css] = await Promise.all([
+    readPageSource(),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+  assert.match(page, /fetch\(`\$\{API\}\/api\/styles`\)/);
+  assert.match(page, /onClick=\{\(\)=>setStyle\(item\.name\)\}/);
+  assert.match(page, /className="panelstylePromptPanel"/);
+  assert.match(page, /画风提示词结构/);
+  assert.match(page, /promptStructureLayers\.map/);
+  assert.match(page, /当前画风配方/);
+  assert.match(page, /分镜内容＋构图＋人物身份＋画风配方＋约束/);
+  assert.match(css, /\.stylePromptPanel\s*\{/);
+  assert.match(css, /\.styleRecipeBox\s*\{/);
+});

@@ -99,6 +99,14 @@ class QueueResumeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "后台未加载画面风格"):
             SERVER.style_recipe("不存在的风格")
 
+    def test_style_catalog_exposes_the_exact_prompt_recipe_for_the_ui(self) -> None:
+        catalog = SERVER.get_style_catalog()
+        styles = {item["name"]: item["recipe"] for item in catalog["styles"]}
+
+        self.assertEqual(styles["水墨写意"], SERVER.style_recipe("水墨写意"))
+        self.assertEqual(len(styles), len(SERVER.STYLE_PRESETS) - 1)
+        self.assertNotIn(SERVER.INFOGRAPHIC_STYLE, styles)
+
     def test_story_handdrawn_library_adds_exactly_twenty_styles(self) -> None:
         self.assertEqual(len(SERVER.HANDDRAWN_STYLE_PRESETS), 20)
         self.assertIn("彩铅日记漫画（默认）", SERVER.HANDDRAWN_STYLE_PRESETS)

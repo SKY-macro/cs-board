@@ -476,6 +476,7 @@ export default function Home() {
   const [voiceMode, setVoiceMode] = useState<VoiceMode>("clone");
   const [identityMode, setIdentityMode] = useState<IdentityMode>("consistent");
   const [style, setStyle] = useState("极简粗线简笔白板风");
+  const [styleRecipes, setStyleRecipes] = useState<Record<string, string>>({});
   const [scenesPerImage, setScenesPerImage] = useState(1);
   const [aspectRatio, setAspectRatio] = useState("16:9");
   const [presentationMode, setPresentationMode] = useState<"whiteboard" | "story-color">("whiteboard");
@@ -500,6 +501,19 @@ export default function Home() {
   const lastSavedConfig = useRef("");
   const saveRequest = useRef(0);
   const detectedServiceSignatures = useRef<Record<string, string>>({});
+  useEffect(() => {
+    let active = true;
+    fetch(`${API}/api/styles`)
+      .then((response) => (response.ok ? response.json() : Promise.reject()))
+      .then((payload) => {
+        if (!active || !Array.isArray(payload.styles)) return;
+        setStyleRecipes(Object.fromEntries(payload.styles.map((item: { name: string; recipe: string }) => [item.name, item.recipe])));
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, []);
   useEffect(() => {
     let active = true;
     let reconnectTimer: ReturnType<typeof setInterval> | null = null;
@@ -1109,6 +1123,19 @@ export default function Home() {
     if (previewImage) selectGalleryPrompt(previewImage);
   }, [previewImage]);
   const shownJob = job || sharedJob;
+  const selectedStyleOption = styleOptions.find((item) => item.name === style) || styleOptions[0];
+  const selectedStyleRecipe = pageMode === "custom" ? "读取你上传的风格参考图，只学习配色、线条、材质、造型比例与构图语言，不复制参考图中的人物和事件。" : styleRecipes[style] || selectedStyleOption.desc;
+  const selectedStyleRecipeParts = selectedStyleRecipe
+    .split(/[；。]\s*/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const promptStructureLayers = [
+    { code: "01", title: "分镜内容", text: pageMode === "infographic" ? "当前中心句、观点证据和插图元素" : `当前文案拆出的 ${presentationMode === "story-color" ? 1 : scenesPerImage} 个分镜` },
+    { code: "02", title: "构图版式", text: `${presentationMode === "story-color" ? "一幕一页" : `${scenesPerImage} 幕组合`} · ${presentationMode === "story-color" ? "3:4" : aspectRatio}` },
+    { code: "03", title: "人物约束", text: pageMode === "custom" ? "以人物参考图和人物描述为准" : identityModeDescriptions[identityMode] },
+    { code: "04", title: "画风配方", text: pageMode === "custom" ? "从上传参考图动态提取" : `${selectedStyleRecipeParts.length} 条视觉规则` },
+    { code: "05", title: "文字与禁用项", text: `${includeKeyText && pageMode !== "infographic" ? "允许一条重点短语" : "图片内不生成文字"} · 禁止复制参考图内容` },
+  ];
   const showingShared = !job && !!sharedJob;
   const selectedGalleryImage = selectedGalleryPage === null ? null : gallery.find((image) => image.page === selectedGalleryPage) || null;
   const textAvailability = serviceAvailability(config.text_services);
@@ -1978,6 +2005,44 @@ export default function Home() {
                 <li>合成音画成片</li>
               </ol>
             )}
+          </aside>
+          <aside className="panel stylePromptPanel" aria-live="polite">
+            <header className="stylePromptHeader">
+              <div>
+                <span>画风提示词结构</span>
+                <h3>{pageMode === "custom" ? "自定义参考" : selectedStyleOption.name}</h3>
+              </div>
+              {pageMode !== "custom" && <img src={selectedStyleOption.image} alt="" />}
+            </header>
+            <p className="stylePromptLead">
+              单击左侧任意画风即可切换。这里展示图片请求真正采用的结构，分镜内容会在生成时自动填入。
+            </p>
+            <div className="promptLayerList">
+              {promptStructureLayers.map((layer) => (
+                <div className="promptLayer" key={layer.code}>
+                  <b>{layer.code}</b>
+                  <span>
+                    <strong>{layer.title}</strong>
+                    <small>{layer.text}</small>
+                  </span>
+                </div>
+              ))}
+            </div>
+            <div className="styleRecipeBox">
+              <div>
+                <strong>当前画风配方</strong>
+                <span>{pageMode === "custom" ? "上传图片动态解析" : `${selectedStyleRecipeParts.length} 项`}</span>
+              </div>
+              <ol>
+                {selectedStyleRecipeParts.map((part, index) => (
+                  <li key={`${style}-${index}`}>{part}</li>
+                ))}
+              </ol>
+            </div>
+            <footer className="stylePromptFooter">
+              <span>最终提示词</span>
+              <strong>分镜内容 ＋ 构图 ＋ 人物身份 ＋ 画风配方 ＋ 约束</strong>
+            </footer>
           </aside>
         </div>
       </form>

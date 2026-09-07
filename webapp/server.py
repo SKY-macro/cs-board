@@ -35,7 +35,7 @@ PYTHON = Path(sys.executable)
 NODE = shutil.which("node") or "node"
 REMOTION_RENDERER = ROOT / "video_renderer"
 HAND = ROOT / "assets" / "drawing-hand-clean.png"
-PIPELINE_VERSION = "narrated_deck_v12_capacity_console"
+PIPELINE_VERSION = "narrated_deck_v13_style_prompt_panel"
 ALIGNMENT_SEGMENTATION = "word-boundary-dtw-audio-v2"
 SUBTITLE_FONT = os.environ.get(
     "CS_BOARD_SUBTITLE_FONT",
@@ -3604,6 +3604,18 @@ def health() -> dict[str, Any]:
 @app.get("/api/config")
 def get_config() -> dict[str, Any]:
     return safe_config(load_config())
+
+
+@app.get("/api/styles")
+def get_style_catalog() -> dict[str, Any]:
+    """Expose the exact visual recipes used by image prompts for the local UI."""
+    return {
+        "styles": [
+            {"name": name, "recipe": recipe}
+            for name, recipe in STYLE_PRESETS.items()
+            if name != INFOGRAPHIC_STYLE
+        ]
+    }
 
 
 @app.post("/api/image-nodes/{node_id}/reset-rpm-memory")
