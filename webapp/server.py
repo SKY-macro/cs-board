@@ -38,7 +38,7 @@ PYTHON = Path(sys.executable)
 NODE = shutil.which("node") or "node"
 REMOTION_RENDERER = ROOT / "video_renderer"
 HAND = ROOT / "assets" / "drawing-hand-clean.png"
-PIPELINE_VERSION = "narrated_deck_v15_history_naming"
+PIPELINE_VERSION = "narrated_deck_v16_concise_storybook_reference"
 ALIGNMENT_SEGMENTATION = "word-boundary-dtw-audio-v2"
 SUBTITLE_FONT = os.environ.get(
     "CS_BOARD_SUBTITLE_FONT",
@@ -335,8 +335,10 @@ def clear_storybook_reference_context() -> tuple[list[Path], str]:
     if not valid_image_file(CLEAR_STORYBOOK_REFERENCE_PATH):
         raise RuntimeError("清透日系生活绘本的本地风格参考图缺失")
     instruction = (
-        "输入图只定义人物造型、头身、五官、线条、人物与核心道具配色及背景纯线稿；"
-        "当前分镜决定内容，不得复制图中人物身份、数量、服装、动作、道具、场景或构图。"
+        "输入图仅作为清透日系生活绘本视觉语言参考，不提供人物身份或具体故事。"
+        "严格复现参考图的纯白留白背景、纤细轻盈的黑灰墨线、柔和低饱和局部设色、干净数字纸面、"
+        "自然修长的生活绘本头身比例、简洁圆点五官、细致日常道具与疏朗构图语言；"
+        "当前分镜决定内容，不得复制图中原有的人物身份、数量、服装、动作、道具、场景、事件或具体构图。"
     )
     return [CLEAR_STORYBOOK_REFERENCE_PATH], instruction
 
@@ -2343,8 +2345,10 @@ PPT 已确定的视觉策略：{scene.get('visual_strategy', '左侧文字，右
         panels.append("｜".join(fields))
     panel_text = "\n".join(panels)
     style_instruction = (
+        "参考图已经提供完整视觉样式，严格遵循上述视觉锚点，无需另行扩写或改造画风。"
+        if style == CLEAR_STORYBOOK_STYLE and reference_instruction else
         f"视觉配方：{style_recipe(style)}"
-        if style in {OIL_VISUAL_STYLE, CLEAR_STORYBOOK_STYLE} and reference_instruction else
+        if style == OIL_VISUAL_STYLE and reference_instruction else
         "严格复现输入风格参考图的配色、线条粗细、材质、造型比例与构图语言；不要复制风格图里原有的人物或事件。"
         if reference_instruction else
         f"视觉配方：{style_recipe(style)}\n必须严格执行这套视觉配方，不得自动改回其他白板风格；人物、物体和配色都要让所选风格一眼可辨。"
@@ -3779,7 +3783,13 @@ def preview_style_prompt(payload: dict[str, Any]) -> dict[str, Any]:
             }
             for i in range(1, scene_count + 1)
         ]
-    reference_instruction = "{{上传风格参考图：只学习视觉风格，不复制图中人物或事件}}" if page_mode == "custom" else ""
+    reference_instruction = (
+        "{{上传风格参考图：只学习视觉风格，不复制图中人物或事件}}"
+        if page_mode == "custom" else
+        clear_storybook_reference_context()[1]
+        if style == CLEAR_STORYBOOK_STYLE else
+        ""
+    )
     full_prompt = build_board_prompt(
         scenes,
         style if page_mode != "custom" else "自定义参考",

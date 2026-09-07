@@ -240,9 +240,14 @@ class QueueResumeTests(unittest.TestCase):
         paths, instruction = SERVER.clear_storybook_reference_context()
         self.assertEqual(paths, [SERVER.CLEAR_STORYBOOK_REFERENCE_PATH])
         self.assertTrue(paths[0].is_file())
-        self.assertIn("人物造型", instruction)
+        self.assertIn("清透日系生活绘本视觉语言", instruction)
+        self.assertIn("纯白留白背景", instruction)
+        self.assertIn("纤细轻盈的黑灰墨线", instruction)
+        self.assertIn("柔和低饱和局部设色", instruction)
+        self.assertIn("自然修长的生活绘本头身比例", instruction)
+        self.assertIn("简洁圆点五官", instruction)
         self.assertIn("不得复制", instruction)
-        self.assertIn("身份、数量、服装、动作、道具、场景或构图", instruction)
+        self.assertIn("人物身份、数量、服装、动作、道具、场景、事件或具体构图", instruction)
 
         prompt = SERVER.build_board_prompt(
             [{
@@ -256,10 +261,26 @@ class QueueResumeTests(unittest.TestCase):
             aspect_ratio="3:4",
             presentation_mode="story-color",
         )
-        self.assertLessEqual(len(prompt), 1000)
+        self.assertLessEqual(len(prompt), 700)
         self.assertEqual(prompt.count(instruction), 1)
+        self.assertNotIn("纯白面积不少于 80%", prompt)
+        self.assertNotIn("成年人约 5～6 头身", prompt)
+        self.assertIn("参考图已经提供完整视觉样式", prompt)
         self.assertIn("爸爸背着风筝", prompt)
         self.assertIn(SERVER.IDENTITY_PROMPTS["consistent"], prompt)
+
+    def test_clear_storybook_prompt_preview_uses_the_concise_built_in_reference_architecture(self) -> None:
+        preview = SERVER.preview_style_prompt({
+            "page_mode": "standard",
+            "style": SERVER.CLEAR_STORYBOOK_STYLE,
+            "scenes_per_image": 1,
+            "aspect_ratio": "3:4",
+            "presentation_mode": "story-color",
+        })
+        self.assertIn("清透日系生活绘本视觉语言参考", preview["full_prompt"])
+        self.assertIn("参考图已经提供完整视觉样式", preview["full_prompt"])
+        self.assertNotIn("纯白面积不少于 80%", preview["full_prompt"])
+        self.assertFalse(preview["truncated"])
 
     def test_identity_modes_are_mutually_exclusive_in_image_prompts(self) -> None:
         scene = [{"title": "相遇", "concept": "主角走进房间", "elements": ["主角推门"], "text": "主角回来了。"}]
