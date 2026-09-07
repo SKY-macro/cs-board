@@ -267,3 +267,11 @@ test("supports one-click missing-role draws and live green binding feedback", as
   assert.match(css, /\.taskCharacterBindings article\.matched/);
   assert.match(css, /\.drawMissingRole/);
 });
+
+test("restores matched characters into a detached reusable task form", async () => {
+  const page = await readPageSource();
+  assert.match(page, /constrestoredCharacterState=useRef/);
+  assert.match(page, /constrestoreParameters=.*focusedJobId\.current=null.*setJob\(null\).*setRerenderSource\(null\)/s);
+  assert.doesNotMatch(page, /constrestoreParameters=.*setJob\(source\).*constopenTaskDetail/s);
+  assert.match(page, /binding\.match_confidence!=null.*%匹配.*已绑定/s);
+});

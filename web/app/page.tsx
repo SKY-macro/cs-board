@@ -554,6 +554,7 @@ export default function Home() {
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
   const focusedJobId = useRef<string | null>(null);
+  const restoredCharacterState = useRef<{ copy: string; style: string; bindings: CharacterBinding[]; ready: boolean } | null>(null);
   const configHydrated = useRef(false);
   const lastSavedConfig = useRef("");
   const saveRequest = useRef(0);
@@ -725,6 +726,15 @@ export default function Home() {
     } catch {}
   };
   useEffect(() => {
+    const restored = restoredCharacterState.current;
+    if (restored) {
+      if (restored.copy === copy && restored.style === style) {
+        setCharacterBindings(restored.bindings);
+        setCharacterMatchReady(restored.ready);
+        restoredCharacterState.current = null;
+      }
+      return;
+    }
     setCharacterMatchReady(false);
     setCharacterBindings([]);
   }, [copy, style]);
@@ -1325,6 +1335,19 @@ export default function Home() {
           files: await Promise.all(item.images.map(assetFile)),
         })),
       );
+      const restoredBindings = data.character_bindings || [];
+      if (copy === data.copy && style === data.style) {
+        restoredCharacterState.current = null;
+        setCharacterBindings(restoredBindings);
+        setCharacterMatchReady(data.reference_mode === "standard");
+      } else {
+        restoredCharacterState.current = {
+          copy: data.copy,
+          style: data.style,
+          bindings: restoredBindings,
+          ready: data.reference_mode === "standard",
+        };
+      }
       setCopy(data.copy);
       setReference(restoredReference);
       setVoiceMode(restoredVoiceMode);
@@ -1340,8 +1363,6 @@ export default function Home() {
       setIncludeSubtitles(data.include_subtitles);
       setStrokeDetail(data.stroke_detail);
       setStyleReference(restoredStyle);
-      setCharacterBindings(data.character_bindings || []);
-      setCharacterMatchReady(data.reference_mode === "standard");
       setCharacters(
         restoredCharacters.length
           ? restoredCharacters
@@ -1354,8 +1375,10 @@ export default function Home() {
               },
             ],
       );
-      setJob(source);
-      if (["queued", "running"].includes(source.status)) poll(source.id);
+      focusedJobId.current = null;
+      if (timer.current) clearInterval(timer.current);
+      setJob(null);
+      setRerenderSource(null);
       setDetailJobId(null);
       setPreviewImage(null);
       setMessage(`已将“${source.task_name || source.id}”的设置和素材填入制作页`);
@@ -2160,7 +2183,7 @@ export default function Home() {
                 <button type="button" className="secondary" disabled={characterBusy || copy.trim().length < 10} onClick={matchCharacters}>{characterBusy ? "分析中…" : characterMatchReady ? "重新分析并匹配" : "AI 分析并挑选角色"}</button>
                 <button type="button" className="secondary" onClick={() => setCharacterLibraryOpen(true)}>打开角色抽卡库</button>
               </div>
-              {characterBindings.length > 0 && <div className="taskCharacterBindings">{characterBindings.map((binding) => <article key={binding.role_id} className={binding.asset_id ? "matched" : "missing"}>{binding.asset_image_url ? <img src={`${API}${binding.asset_image_url}`} alt="" /> : <span>缺</span>}<div><b>{binding.story_name}</b>{binding.asset_label && <small className="assetMatchName">已使用资产：{binding.asset_label}</small>}<small>{binding.age_group} · {binding.gender}</small>{binding.core_personality && <small>核心性格：{binding.core_personality}</small>}{binding.facial_persona && <small>固定脸相：{binding.facial_persona}</small>}<p>{binding.description}</p>{binding.match_reason && <small>{binding.asset_id ? "匹配理由" : "未匹配原因"}：{binding.match_reason}</small>}</div>{binding.asset_id ? <em>{Math.round((binding.match_confidence || 0) * 100)}% 匹配</em> : <button type="button" className="drawMissingRole" disabled={characterBusy || Boolean(pendingDrawRoles[binding.role_id])} onClick={() => drawMissingCharacter(binding)}>{drawingRoleId === binding.role_id ? "提交中…" : pendingDrawRoles[binding.role_id] ? "等待审核" : "去抽卡"}</button>}</article>)}</div>}
+              {characterBindings.length > 0 && <div className="taskCharacterBindings">{characterBindings.map((binding) => <article key={binding.role_id} className={binding.asset_id ? "matched" : "missing"}>{binding.asset_image_url ? <img src={`${API}${binding.asset_image_url}`} alt="" /> : <span>缺</span>}<div><b>{binding.story_name}</b>{binding.asset_label && <small className="assetMatchName">已使用资产：{binding.asset_label}</small>}<small>{binding.age_group} · {binding.gender}</small>{binding.core_personality && <small>核心性格：{binding.core_personality}</small>}{binding.facial_persona && <small>固定脸相：{binding.facial_persona}</small>}<p>{binding.description}</p>{binding.match_reason && <small>{binding.asset_id ? "匹配理由" : "未匹配原因"}：{binding.match_reason}</small>}</div>{binding.asset_id ? <em>{binding.match_confidence != null ? `${Math.round(binding.match_confidence * 100)}% 匹配` : "已绑定"}</em> : <button type="button" className="drawMissingRole" disabled={characterBusy || Boolean(pendingDrawRoles[binding.role_id])} onClick={() => drawMissingCharacter(binding)}>{drawingRoleId === binding.role_id ? "提交中…" : pendingDrawRoles[binding.role_id] ? "等待审核" : "去抽卡"}</button>}</article>)}</div>}
               {characterMessage && <p className="characterMessage">{characterMessage}</p>}
             </section>
           )}
