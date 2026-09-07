@@ -35,7 +35,7 @@ PYTHON = Path(sys.executable)
 NODE = shutil.which("node") or "node"
 REMOTION_RENDERER = ROOT / "video_renderer"
 HAND = ROOT / "assets" / "drawing-hand-clean.png"
-PIPELINE_VERSION = "narrated_deck_v9_image_rpm"
+PIPELINE_VERSION = "narrated_deck_v10_adaptive_rpm"
 ALIGNMENT_SEGMENTATION = "word-boundary-dtw-audio-v2"
 SUBTITLE_FONT = os.environ.get(
     "CS_BOARD_SUBTITLE_FONT",
@@ -360,7 +360,10 @@ RENDER_ACTIVE_LOCK = threading.Lock()
 RUNNING_PROCESSES: dict[str, set[subprocess.Popen[str]]] = {}
 RUNNING_PROCESSES_LOCK = threading.Lock()
 MODEL_CONCURRENCY = 4
-IMAGE_GENERATION_RPM = max(1, min(60, int(os.environ.get("IMAGE_GENERATION_RPM", "3"))))
+IMAGE_GENERATION_RPM = max(1, min(10, int(os.environ.get("IMAGE_GENERATION_RPM", "3"))))
+IMAGE_GENERATION_MAX_RPM = max(IMAGE_GENERATION_RPM, min(10, int(os.environ.get("IMAGE_GENERATION_MAX_RPM", "10"))))
+IMAGE_GENERATION_GLOBAL_RPM = max(IMAGE_GENERATION_MAX_RPM, min(60, int(os.environ.get("IMAGE_GENERATION_GLOBAL_RPM", "60"))))
+IMAGE_GLOBAL_IN_FLIGHT_LIMIT = max(20, min(200, int(os.environ.get("IMAGE_GLOBAL_IN_FLIGHT_LIMIT", "80"))))
 WHITEBOARD_RENDER_CONCURRENCY = max(1, min(4, int(os.environ.get("WHITEBOARD_RENDER_CONCURRENCY", "3"))))
 RENDER_JOB_CONCURRENCY = max(1, min(3, int(os.environ.get("RENDER_JOB_CONCURRENCY", "2"))))
 RENDER_JOB_SEMAPHORE = threading.BoundedSemaphore(RENDER_JOB_CONCURRENCY)
@@ -428,14 +431,39 @@ class ImageNodeCoolingDown(RuntimeError):
 
 
 class AdaptiveImageNodePool:
-    """Pace image request starts per relay without waiting for earlier responses."""
+    """Fair, multi-relay RPM scheduler with adaptive tiers and circuit breakers."""
 
-    def __init__(self, stats_path: Path, default_rpm: int = 3, window_seconds: float = 60.0):
+    RPM_TIERS = (1, 3, 5, 8, 10)
+
+    def __init__(
+        self,
+        stats_path: Path,
+        default_rpm: int = 3,
+        window_seconds: float = 60.0,
+        *,
+        max_rpm: int = 10,
+        global_rpm_limit: int = 60,
+        promotion_window_seconds: float = 600.0,
+        promotion_successes: int = 30,
+        minimum_in_flight_limit: int = 30,
+        in_flight_minutes: float = 10.0,
+        global_in_flight_limit: int = 80,
+    ):
         self.stats_path = stats_path
-        self.default_rpm = max(1, min(60, int(default_rpm)))
+        self.max_rpm = max(1, min(10, int(max_rpm)))
+        self.default_rpm = max(1, min(self.max_rpm, int(default_rpm)))
+        self.global_rpm_limit = max(self.max_rpm, min(60, int(global_rpm_limit)))
         self.window_seconds = max(0.0, float(window_seconds))
+        self.promotion_window_seconds = max(0.0, float(promotion_window_seconds))
+        self.promotion_successes = max(1, int(promotion_successes))
+        self.minimum_in_flight_limit = max(1, int(minimum_in_flight_limit))
+        self.in_flight_minutes = max(0.0, float(in_flight_minutes))
+        self.global_in_flight_limit = max(1, int(global_in_flight_limit))
         self.condition = threading.Condition()
         self.states: dict[str, dict[str, Any]] = {}
+        self.waiters: list[object] = []
+        self.global_in_flight = 0
+        self.next_global_request_at = 0.0
         self._load()
 
     def _load(self) -> None:
@@ -443,21 +471,29 @@ class AdaptiveImageNodePool:
             payload = json.loads(self.stats_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return
+        now = time.monotonic()
         for key, raw in (payload.get("nodes") or {}).items():
             if not isinstance(raw, dict):
                 continue
+            rpm_limit = max(1, min(self.max_rpm, int(raw.get("rpm_limit") or self.max_rpm)))
             self.states[str(key)] = {
                 "node_id": str(raw.get("node_id") or ""),
                 "base_url": str(raw.get("base_url") or ""),
-                "rpm": max(1, min(60, int(raw.get("rpm") or raw.get("limit") or self.default_rpm))),
+                "rpm_limit": rpm_limit,
+                "rpm": max(1, min(rpm_limit, int(raw.get("rpm") or raw.get("limit") or self.default_rpm))),
                 "in_flight": 0,
                 "success_streak": max(0, int(raw.get("success_streak") or 0)),
                 "success_count": max(0, int(raw.get("success_count") or 0)),
                 "rate_limit_count": max(0, int(raw.get("rate_limit_count") or 0)),
+                "rate_limit_strikes": max(0, int(raw.get("rate_limit_strikes") or 0)),
                 "unavailable_count": max(0, int(raw.get("unavailable_count") or 0)),
+                "consecutive_unavailable": 0,
                 "average_latency": max(0.0, float(raw.get("average_latency") or 0.0)),
+                "tier_successes": max(0, int(raw.get("tier_successes") or 0)),
+                "tier_started_at": now,
                 "cooldown_until": 0.0,
                 "next_request_at": 0.0,
+                "circuit_reason": "",
                 "last_status": raw.get("last_status"),
             }
 
@@ -470,30 +506,44 @@ class AdaptiveImageNodePool:
 
     def _state(self, config: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         key = self.node_key(config)
+        now = time.monotonic()
+        rpm_limit = max(1, min(self.max_rpm, int(config.get("rpm_limit") or self.max_rpm)))
         state = self.states.setdefault(key, {
             "node_id": str(config.get("id") or ""),
             "base_url": str(config.get("base_url") or "").strip().rstrip("/"),
-            "rpm": self.default_rpm,
+            "rpm_limit": rpm_limit,
+            "rpm": min(self.default_rpm, rpm_limit),
             "in_flight": 0,
             "success_streak": 0,
             "success_count": 0,
             "rate_limit_count": 0,
+            "rate_limit_strikes": 0,
             "unavailable_count": 0,
+            "consecutive_unavailable": 0,
             "average_latency": 0.0,
+            "tier_successes": 0,
+            "tier_started_at": now,
             "cooldown_until": 0.0,
             "next_request_at": 0.0,
+            "circuit_reason": "",
             "last_status": None,
         })
+        state["node_id"] = str(config.get("id") or state["node_id"])
+        state["base_url"] = str(config.get("base_url") or state["base_url"]).strip().rstrip("/")
+        state["rpm_limit"] = rpm_limit
+        state["rpm"] = min(int(state["rpm"]), rpm_limit)
         return key, state
 
     def _persist(self) -> None:
         with self.condition:
             nodes = {
-                key: {field: value for field, value in state.items() if field not in {"in_flight", "cooldown_until", "next_request_at"}}
+                key: {field: value for field, value in state.items() if field not in {
+                    "in_flight", "cooldown_until", "next_request_at", "tier_started_at", "circuit_reason", "consecutive_unavailable",
+                }}
                 for key, state in self.states.items()
             }
         try:
-            atomic_write_json(self.stats_path, {"version": 1, "nodes": nodes})
+            atomic_write_json(self.stats_path, {"version": 2, "nodes": nodes})
         except OSError:
             pass
 
@@ -502,7 +552,32 @@ class AdaptiveImageNodePool:
             if stats_path is not None:
                 self.stats_path = stats_path
             self.states.clear()
+            self.waiters.clear()
+            self.global_in_flight = 0
+            self.next_global_request_at = 0.0
             self.condition.notify_all()
+
+    def _in_flight_limit(self, state: dict[str, Any]) -> int:
+        return max(self.minimum_in_flight_limit, math.ceil(int(state["rpm"]) * self.in_flight_minutes))
+
+    def _next_tier(self, rpm: int, rpm_limit: int) -> int:
+        tiers = [value for value in self.RPM_TIERS if value <= rpm_limit]
+        if rpm_limit not in tiers:
+            tiers.append(rpm_limit)
+        for value in sorted(set(tiers)):
+            if value > rpm:
+                return value
+        return rpm
+
+    @staticmethod
+    def _downgrade_rpm(rpm: int) -> int:
+        if rpm >= 10:
+            return 5
+        if rpm >= 8:
+            return 5
+        if rpm >= 5:
+            return 3
+        return 1
 
     def snapshot(self) -> list[dict[str, Any]]:
         now = time.monotonic()
@@ -511,84 +586,205 @@ class AdaptiveImageNodePool:
                 "node_id": state["node_id"],
                 "base_url": state["base_url"],
                 "rpm": int(state["rpm"]),
+                "rpm_limit": int(state["rpm_limit"]),
                 "in_flight": int(state["in_flight"]),
+                "in_flight_limit": self._in_flight_limit(state),
                 "success_streak": int(state["success_streak"]),
                 "success_count": int(state["success_count"]),
                 "rate_limit_count": int(state["rate_limit_count"]),
+                "rate_limit_strikes": int(state["rate_limit_strikes"]),
                 "unavailable_count": int(state["unavailable_count"]),
+                "consecutive_unavailable": int(state["consecutive_unavailable"]),
                 "average_latency": round(float(state["average_latency"]), 2),
                 "cooldown_seconds": round(max(0.0, float(state["cooldown_until"]) - now), 1),
+                "next_request_seconds": round(max(0.0, float(state["next_request_at"]) - now), 1),
+                "tier_successes": int(state["tier_successes"]),
+                "tier_elapsed_seconds": round(max(0.0, now - float(state["tier_started_at"])), 1),
+                "circuit_reason": state["circuit_reason"] if float(state["cooldown_until"]) > now else "",
                 "last_status": state["last_status"],
             } for state in self.states.values()]
 
-    def call(self, config: dict[str, Any], invoke: Any, *, retry_rate_limit: bool, skip_cooldown: bool, job_id: str | None = None) -> dict[str, Any]:
-        rate_limit_retries = 0
-        while True:
-            with self.condition:
-                key, state = self._state(config)
+    def overview(self) -> dict[str, int]:
+        """Return queue-wide counters under the scheduler lock."""
+        with self.condition:
+            return {
+                "global_in_flight": int(self.global_in_flight),
+                "global_in_flight_limit": int(self.global_in_flight_limit),
+                "waiting": len(self.waiters),
+            }
+
+    def _reserve_any(self, configs: list[dict[str, Any]], job_id: str | None, skip_cooldown: bool = False) -> tuple[dict[str, Any], str]:
+        ticket = object()
+        with self.condition:
+            self.waiters.append(ticket)
+            try:
                 while True:
+                    if job_id:
+                        ensure_job_active(job_id)
+                    if self.waiters[0] is not ticket:
+                        self.condition.wait(timeout=0.5)
+                        continue
                     now = time.monotonic()
-                    cooldown = max(0.0, float(state["cooldown_until"]) - now)
-                    if cooldown and skip_cooldown:
-                        raise ImageNodeCoolingDown(cooldown)
-                    rate_wait = max(0.0, float(state["next_request_at"]) - now)
-                    wait_seconds = max(cooldown, rate_wait)
-                    if not wait_seconds:
-                        interval = self.window_seconds / max(1, int(state["rpm"]))
-                        state["next_request_at"] = now + interval
-                        state["in_flight"] = int(state["in_flight"]) + 1
-                        break
-                    self.condition.wait(timeout=max(0.01, min(wait_seconds, 1.0)))
+                    if self.global_in_flight >= self.global_in_flight_limit:
+                        self.condition.wait(timeout=0.5)
+                        continue
+                    candidates: list[tuple[float, int, int, dict[str, Any], str, dict[str, Any]]] = []
+                    for index, config in enumerate(configs):
+                        key, state = self._state(config)
+                        cooldown = max(0.0, float(state["cooldown_until"]) - now)
+                        if cooldown and skip_cooldown and len(configs) == 1:
+                            raise ImageNodeCoolingDown(cooldown)
+                        if int(state["in_flight"]) >= self._in_flight_limit(state):
+                            continue
+                        ready_at = max(float(state["cooldown_until"]), float(state["next_request_at"]), self.next_global_request_at)
+                        candidates.append((ready_at, int(state["in_flight"]), index, config, key, state))
+                    if not candidates:
+                        self.condition.wait(timeout=0.5)
+                        continue
+                    ready_at, _active, _index, config, key, state = min(candidates, key=lambda item: (item[0], item[1], item[2]))
+                    wait_seconds = max(0.0, ready_at - now)
+                    if wait_seconds:
+                        self.condition.wait(timeout=max(0.01, min(wait_seconds, 1.0)))
+                        continue
+                    state["next_request_at"] = now + self.window_seconds / max(1, int(state["rpm"]))
+                    state["in_flight"] = int(state["in_flight"]) + 1
+                    self.next_global_request_at = now + self.window_seconds / self.global_rpm_limit
+                    self.global_in_flight += 1
+                    self.waiters.pop(0)
+                    self.condition.notify_all()
+                    return config, key
+            finally:
+                if ticket in self.waiters:
+                    self.waiters.remove(ticket)
+                    self.condition.notify_all()
+
+    def _record_failure(self, key: str, exc: Exception, job_id: str | None) -> None:
+        status = exc.status_code if isinstance(exc, ProviderHTTPError) else None
+        now = time.monotonic()
+        with self.condition:
+            state = self.states[key]
+            state["in_flight"] = max(0, int(state["in_flight"]) - 1)
+            self.global_in_flight = max(0, self.global_in_flight - 1)
+            state["success_streak"] = 0
+            state["tier_successes"] = 0
+            state["tier_started_at"] = now
+            state["last_status"] = status or "error"
+            cooldown_seconds = 0.0
+            if status == 429:
+                state["rate_limit_count"] = int(state["rate_limit_count"]) + 1
+                state["rate_limit_strikes"] = int(state["rate_limit_strikes"]) + 1
+                retry_after = max(0.0, float(exc.retry_after or 0.0)) if isinstance(exc, ProviderHTTPError) else 0.0
+                if int(state["rate_limit_strikes"]) >= 2:
+                    state["rpm"] = 1
+                    cooldown_seconds = max(retry_after, 900.0)
+                    state["circuit_reason"] = "rate_limit"
+                else:
+                    state["rpm"] = self._downgrade_rpm(int(state["rpm"]))
+                    cooldown_seconds = max(retry_after, 60.0, self.window_seconds / max(1, int(state["rpm"])))
+                    state["circuit_reason"] = "rate_limit_cooldown"
+            elif status in {500, 502, 503, 504} or status is None:
+                state["unavailable_count"] = int(state["unavailable_count"]) + 1
+                state["consecutive_unavailable"] = int(state["consecutive_unavailable"]) + 1
+                if int(state["consecutive_unavailable"]) >= 3:
+                    cooldown_seconds = 300.0
+                    state["circuit_reason"] = "unavailable"
+            elif status in {401, 403}:
+                cooldown_seconds = 3600.0
+                state["circuit_reason"] = "authentication"
+            if cooldown_seconds:
+                state["cooldown_until"] = max(float(state["cooldown_until"]), now + cooldown_seconds)
+            self.condition.notify_all()
+        self._persist()
+        if status == 429 and job_id and job_id in JOBS:
+            update_job(
+                job_id,
+                stage=(
+                    f"图片节点连续 429，已降为 1 RPM 并熔断 {math.ceil(cooldown_seconds / 60)} 分钟"
+                    if int(self.states[key]["rate_limit_strikes"]) >= 2
+                    else f"图片节点触发 429，已降为 {self.states[key]['rpm']} RPM 并冷却 {math.ceil(cooldown_seconds)} 秒"
+                ),
+            )
+
+    def _record_success(self, key: str, latency: float) -> None:
+        now = time.monotonic()
+        with self.condition:
+            state = self.states[key]
+            state["in_flight"] = max(0, int(state["in_flight"]) - 1)
+            self.global_in_flight = max(0, self.global_in_flight - 1)
+            previous_count = int(state["success_count"])
+            state["success_count"] = previous_count + 1
+            state["average_latency"] = (float(state["average_latency"]) * previous_count + latency) / (previous_count + 1)
+            state["success_streak"] = int(state["success_streak"]) + 1
+            state["tier_successes"] = int(state["tier_successes"]) + 1
+            state["consecutive_unavailable"] = 0
+            state["last_status"] = 200
+            stable = (
+                int(state["tier_successes"]) >= self.promotion_successes
+                and now - float(state["tier_started_at"]) >= self.promotion_window_seconds
+                and float(state["cooldown_until"]) <= now
+            )
+            if stable:
+                state["rate_limit_strikes"] = 0
+                promoted = self._next_tier(int(state["rpm"]), int(state["rpm_limit"]))
+                if promoted != int(state["rpm"]):
+                    state["rpm"] = promoted
+                    state["success_streak"] = 0
+                state["tier_successes"] = 0
+                state["tier_started_at"] = now
+                state["circuit_reason"] = ""
+            self.condition.notify_all()
+        self._persist()
+
+    def call_any(self, configs: list[dict[str, Any]], invoke: Any, *, job_id: str | None = None) -> dict[str, Any]:
+        if not configs:
+            raise RuntimeError("没有可调用的图片中转站")
+        remaining = list(configs)
+        errors: list[str] = []
+        last_exception: Exception | None = None
+        while remaining:
+            service, key = self._reserve_any(remaining, job_id)
+            started = time.monotonic()
+            try:
+                result = invoke(service)
+            except Exception as exc:
+                last_exception = exc
+                self._record_failure(key, exc, job_id)
+                position = int(service.get("_position") or configs.index(service) + 1)
+                status = f"{exc.status_code} " if isinstance(exc, ProviderHTTPError) else ""
+                errors.append(f"节点 {position}: {status}{exc}")
+                remaining = [item for item in remaining if self.node_key(item) != key]
+            else:
+                self._record_success(key, max(0.0, time.monotonic() - started))
+                return result
+        if len(configs) == 1 and last_exception is not None:
+            raise last_exception
+        raise RuntimeError(f"所有可调用的图片中转站均失败（{len(configs)}）：{'；'.join(errors)}")
+
+    def call(self, config: dict[str, Any], invoke: Any, *, retry_rate_limit: bool, skip_cooldown: bool, job_id: str | None = None) -> dict[str, Any]:
+        attempts = 0
+        while True:
+            service, key = self._reserve_any([config], job_id, skip_cooldown=skip_cooldown)
             started = time.monotonic()
             try:
                 result = invoke()
             except Exception as exc:
-                latency = max(0.0, time.monotonic() - started)
-                status = exc.status_code if isinstance(exc, ProviderHTTPError) else None
-                with self.condition:
-                    state = self.states[key]
-                    state["in_flight"] = max(0, int(state["in_flight"]) - 1)
-                    state["success_streak"] = 0
-                    state["last_status"] = status or "error"
-                    if status == 429:
-                        state["rate_limit_count"] = int(state["rate_limit_count"]) + 1
-                        state["rpm"] = 1
-                        wait_seconds = max(0.5, float(exc.retry_after or provider_retry_delay(rate_limit_retries)))
-                        state["cooldown_until"] = max(float(state["cooldown_until"]), time.monotonic() + wait_seconds)
-                    elif status == 503:
-                        state["unavailable_count"] = int(state["unavailable_count"]) + 1
-                    self.condition.notify_all()
-                self._persist()
-                if status == 429 and job_id and job_id in JOBS:
-                    update_job(job_id, stage=f"图片节点触发 429，已降为 1 RPM 并按 Retry-After 等待 {math.ceil(wait_seconds)} 秒")
-                if status == 429 and retry_rate_limit and rate_limit_retries < 2:
-                    rate_limit_retries += 1
+                self._record_failure(key, exc, job_id)
+                attempts += 1
+                if isinstance(exc, ProviderHTTPError) and exc.status_code == 429 and retry_rate_limit and attempts < 3:
                     continue
                 raise
             else:
-                latency = max(0.0, time.monotonic() - started)
-                with self.condition:
-                    state = self.states[key]
-                    state["in_flight"] = max(0, int(state["in_flight"]) - 1)
-                    previous_count = int(state["success_count"])
-                    state["success_count"] = previous_count + 1
-                    state["average_latency"] = (
-                        (float(state["average_latency"]) * previous_count + latency) / (previous_count + 1)
-                    )
-                    state["success_streak"] = int(state["success_streak"]) + 1
-                    state["last_status"] = 200
-                    if int(state["rpm"]) == 1 and self.default_rpm >= 2 and int(state["success_streak"]) >= 3:
-                        state["rpm"] = 2
-                        state["success_streak"] = 0
-                    elif int(state["rpm"]) == 2 and self.default_rpm >= 3 and int(state["success_streak"]) >= 6:
-                        state["rpm"] = self.default_rpm
-                        state["success_streak"] = 0
-                    self.condition.notify_all()
-                self._persist()
+                self._record_success(key, max(0.0, time.monotonic() - started))
                 return result
 
 
-IMAGE_NODE_POOL = AdaptiveImageNodePool(IMAGE_NODE_STATS_PATH, IMAGE_GENERATION_RPM)
+IMAGE_NODE_POOL = AdaptiveImageNodePool(
+    IMAGE_NODE_STATS_PATH,
+    IMAGE_GENERATION_RPM,
+    max_rpm=IMAGE_GENERATION_MAX_RPM,
+    global_rpm_limit=IMAGE_GENERATION_GLOBAL_RPM,
+    global_in_flight_limit=IMAGE_GLOBAL_IN_FLIGHT_LIMIT,
+)
 
 
 def valid_image_file(path: Path) -> bool:
@@ -1074,36 +1270,35 @@ def provider_text(config: dict[str, Any], model: str, prompt: str, timeout: floa
 
 
 def provider_image_single(config: dict[str, Any], endpoint: str, payload: dict[str, Any], timeout: float = 1800, job_id: str | None = None, attempts: int = 3) -> dict[str, Any]:
-    """Call an image endpoint using the candidates advertised by that image provider."""
+    """Call exactly one selected model; relay/model failover happens outside the RPM gate."""
     selected = str(payload.get("model") or config.get("image_model") or "")
-    advertised = [str(item) for item in config.get("_image_models", []) if str(item)]
-    candidates = [selected, *(item for item in advertised if item != selected)]
-    last_error: Exception | None = None
-    for index, candidate in enumerate(candidates):
-        request_payload = {**payload, "model": candidate}
-        try:
-            response_payload = provider_post(config, endpoint, request_payload, timeout=timeout, job_id=job_id, attempts=attempts)
-            actual_model = str(response_payload.get("model") or candidate)
-            if job_id and job_id in JOBS:
-                update_job(job_id, image_model=actual_model)
-            return response_payload
-        except ProviderHTTPError as exc:
-            last_error = exc
-            unavailable = exc.status_code in {429, 500, 502, 503, 504}
-            if not unavailable or index == len(candidates) - 1:
-                raise
-            if job_id and job_id in JOBS:
-                update_job(job_id, stage=f"图片模型 {candidate} 暂不可用，自动切换到 {candidates[index + 1]}")
-    raise RuntimeError(f"没有可用的图片模型：{last_error}")
+    response_payload = provider_post(
+        config,
+        endpoint,
+        {**payload, "model": selected},
+        timeout=timeout,
+        job_id=job_id,
+        attempts=attempts,
+    )
+    actual_model = str(response_payload.get("model") or selected)
+    if job_id and job_id in JOBS:
+        update_job(job_id, image_model=actual_model)
+    return response_payload
 
 
 def provider_image(config: dict[str, Any], endpoint: str, payload: dict[str, Any], timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
     plan = provider_service_plan(config, "image")
-    attempts = 1 if plan["ready_count"] > 1 else 3
-    return provider_service_failover(
-        plan,
-        "图片中转站",
-        lambda service: IMAGE_NODE_POOL.call(
+    ready = [dict(item["service"], _position=int(item["position"])) for item in plan["ready"]]
+    if not ready:
+        skipped = "，".join(f"节点 {item['position']} {item['reason']}" for item in plan["skipped"])
+        raise RuntimeError(f"没有可调用的图片中转站{'：' + skipped if skipped else ''}")
+    # Every outbound image HTTP start must pass through the RPM scheduler.
+    # Internal provider retries would bypass that gate, so each reservation
+    # always represents exactly one upstream request.
+    attempts = 1
+    if len(ready) == 1:
+        service = ready[0]
+        return IMAGE_NODE_POOL.call(
             service,
             lambda: provider_image_single(
                 service,
@@ -1113,9 +1308,19 @@ def provider_image(config: dict[str, Any], endpoint: str, payload: dict[str, Any
                 job_id=job_id,
                 attempts=attempts,
             ),
-            retry_rate_limit=plan["ready_count"] == 1,
-            skip_cooldown=plan["ready_count"] > 1,
+            retry_rate_limit=True,
+            skip_cooldown=False,
             job_id=job_id,
+        )
+    return IMAGE_NODE_POOL.call_any(
+        ready,
+        lambda service: provider_image_single(
+                service,
+                endpoint,
+                {**payload, "model": str(service.get("model") or payload.get("model") or config.get("image_model") or "")},
+                timeout=timeout,
+                job_id=job_id,
+                attempts=attempts,
         ),
         job_id=job_id,
     )
@@ -1143,10 +1348,13 @@ def provider_image_edit_once(config: dict[str, Any], form_data: dict[str, str], 
 
 def provider_image_edit(config: dict[str, Any], form_data: dict[str, str], raw_files: list[tuple[str, bytes, str]], timeout: float = 1800, job_id: str | None = None) -> dict[str, Any]:
     plan = provider_service_plan(config, "image")
-    return provider_service_failover(
-        plan,
-        "参考图中转站",
-        lambda service: IMAGE_NODE_POOL.call(
+    ready = [dict(item["service"], _position=int(item["position"])) for item in plan["ready"]]
+    if not ready:
+        skipped = "，".join(f"节点 {item['position']} {item['reason']}" for item in plan["skipped"])
+        raise RuntimeError(f"没有可调用的参考图中转站{'：' + skipped if skipped else ''}")
+    if len(ready) == 1:
+        service = ready[0]
+        return IMAGE_NODE_POOL.call(
             service,
             lambda: provider_image_edit_once(
                 service,
@@ -1154,9 +1362,17 @@ def provider_image_edit(config: dict[str, Any], form_data: dict[str, str], raw_f
                 raw_files,
                 timeout=timeout,
             ),
-            retry_rate_limit=plan["ready_count"] == 1,
-            skip_cooldown=plan["ready_count"] > 1,
+            retry_rate_limit=True,
+            skip_cooldown=False,
             job_id=job_id,
+        )
+    return IMAGE_NODE_POOL.call_any(
+        ready,
+        lambda service: provider_image_edit_once(
+                service,
+                {**form_data, "model": str(service.get("model") or form_data.get("model") or "")},
+                raw_files,
+                timeout=timeout,
         ),
         job_id=job_id,
     )
@@ -1276,6 +1492,8 @@ def provider_service_plan(config: dict[str, Any], kind: str) -> dict[str, Any]:
     raw_services = config.get(key)
     if not isinstance(raw_services, list) or not raw_services:
         fallback = dict(config) if kind == "text" else image_provider_config(config)
+        if kind == "image":
+            fallback["rpm_limit"] = max(1, min(IMAGE_GENERATION_MAX_RPM, int(fallback.get("rpm_limit") or IMAGE_GENERATION_MAX_RPM)))
         return {"configured_count": 1, "ready_count": 1, "ready": [{"position": 1, "service": fallback}], "skipped": []}
 
     ready: list[dict[str, Any]] = []
@@ -1295,7 +1513,13 @@ def provider_service_plan(config: dict[str, Any], kind: str) -> dict[str, Any]:
         if missing:
             skipped.append({"position": position, "reason": f"缺少 {'、'.join(missing)}"})
             continue
-        ready.append({"position": position, "service": dict(item)})
+        service = dict(item)
+        if kind == "image":
+            try:
+                service["rpm_limit"] = max(1, min(IMAGE_GENERATION_MAX_RPM, int(service.get("rpm_limit") or IMAGE_GENERATION_MAX_RPM)))
+            except (TypeError, ValueError):
+                service["rpm_limit"] = IMAGE_GENERATION_MAX_RPM
+        ready.append({"position": position, "service": service})
     return {"configured_count": len(services), "ready_count": len(ready), "ready": ready, "skipped": skipped}
 
 
@@ -3148,12 +3372,19 @@ def health() -> dict[str, Any]:
             {"index": index + 1, "url": url, "active": bool(VOICE_NODE_JOBS.get(index)), "job_id": VOICE_NODE_JOBS.get(index)}
             for index, url in enumerate(nodes)
         ]
+    image_overview = IMAGE_NODE_POOL.overview()
     return {
         "status": "ok", "pipeline_version": PIPELINE_VERSION, "renderer": PYTHON.exists(), "tts": nodes,
         "queues": {
             "voice": {"concurrency": len(nodes), "waiting": VOICE_QUEUE.qsize(), "nodes": voice_nodes},
             "model": {"concurrency": MODEL_CONCURRENCY, "waiting": MODEL_QUEUE.qsize()},
-            "image": {"default_rpm": IMAGE_GENERATION_RPM, "nodes": IMAGE_NODE_POOL.snapshot()},
+            "image": {
+                "default_rpm": IMAGE_GENERATION_RPM,
+                "max_rpm": IMAGE_GENERATION_MAX_RPM,
+                "global_rpm_limit": IMAGE_GENERATION_GLOBAL_RPM,
+                **image_overview,
+                "nodes": IMAGE_NODE_POOL.snapshot(),
+            },
             "render": {"concurrency": RENDER_JOB_CONCURRENCY, "active": render_active, "waiting": max(0, render_waiting - render_active)},
         },
     }

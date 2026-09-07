@@ -170,9 +170,14 @@ test("keeps running jobs in the background while creating another task", async (
 
 test("shows image relay RPM and in-flight statistics in API settings", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
-  assert.match(page, /image:\{default_rpm\?:number;default_concurrency\?:number;nodes:/);
+  assert.match(page, /image:\{default_rpm\?:number;default_concurrency\?:number;max_rpm\?:number;global_rpm_limit\?:number/);
   assert.match(page, /health\.queues\.image\.default_rpm!==undefined/);
   assert.match(page, /RPM · 在途/);
   assert.match(page, /429 \{node\.rate_limit_count\} 次/);
   assert.match(page, /均耗 \{node\.average_latency\.toFixed\(1\)\} 秒/);
+  assert.match(page, /最高 RPM<select/);
+  assert.match(page, /10 RPM（最高）/);
+  assert.match(page, /各节点独立限速并主动分流/);
+  assert.match(page, /global_in_flight_limit/);
+  assert.match(page, /imageCircuitLabel/);
 });

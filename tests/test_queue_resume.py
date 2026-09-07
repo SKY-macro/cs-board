@@ -281,9 +281,15 @@ class QueueResumeTests(unittest.TestCase):
         self.assertEqual(raised.exception.retry_after, 17)
         sleep.assert_not_called()
 
-    def test_image_node_drops_to_one_after_429_and_recovers_in_steps(self) -> None:
-        pool = SERVER.AdaptiveImageNodePool(Path(self.temporary.name) / "adaptive.json", 3, window_seconds=0)
-        config = {"id": "primary", "base_url": "https://relay.example/v1", "api_key": "secret"}
+    def test_image_node_drops_to_one_after_429_and_recovers_by_stable_tier(self) -> None:
+        pool = SERVER.AdaptiveImageNodePool(
+            Path(self.temporary.name) / "adaptive.json",
+            3,
+            window_seconds=0,
+            promotion_window_seconds=0,
+            promotion_successes=3,
+        )
+        config = {"id": "primary", "base_url": "https://relay.example/v1", "api_key": "secret", "rpm_limit": 5}
         with self.assertRaises(SERVER.ProviderHTTPError):
             pool.call(
                 config,
@@ -301,12 +307,12 @@ class QueueResumeTests(unittest.TestCase):
             pool.states[pool.node_key(config)]["cooldown_until"] = 0
         for _ in range(3):
             pool.call(config, lambda: {"ok": True}, retry_rate_limit=False, skip_cooldown=False)
-        self.assertEqual(pool.snapshot()[0]["rpm"], 2)
-        for _ in range(6):
+        self.assertEqual(pool.snapshot()[0]["rpm"], 3)
+        for _ in range(3):
             pool.call(config, lambda: {"ok": True}, retry_rate_limit=False, skip_cooldown=False)
         recovered = pool.snapshot()[0]
-        self.assertEqual(recovered["rpm"], 3)
-        self.assertEqual(recovered["success_count"], 9)
+        self.assertEqual(recovered["rpm"], 5)
+        self.assertEqual(recovered["success_count"], 6)
 
     def test_image_node_rpm_paces_starts_without_waiting_for_responses(self) -> None:
         pool = SERVER.AdaptiveImageNodePool(Path(self.temporary.name) / "shared.json", 3, window_seconds=0.12)
@@ -344,6 +350,217 @@ class QueueResumeTests(unittest.TestCase):
         self.assertEqual(captured_active, 4)
         self.assertEqual(len(captured_starts), 4)
         self.assertTrue(all(later - earlier >= 0.025 for earlier, later in zip(captured_starts, captured_starts[1:])))
+
+    def test_image_nodes_actively_combine_independent_rpm_capacity(self) -> None:
+        pool = SERVER.AdaptiveImageNodePool(
+            Path(self.temporary.name) / "multi.json",
+            3,
+            window_seconds=0.12,
+            global_rpm_limit=60,
+        )
+        configs = [
+            {"id": "first", "base_url": "https://one.example/v1", "api_key": "one", "rpm_limit": 10},
+            {"id": "second", "base_url": "https://two.example/v1", "api_key": "two", "rpm_limit": 10},
+        ]
+        release = threading.Event()
+        started: list[str] = []
+        lock = threading.Lock()
+
+        def invoke(service: dict) -> dict:
+            with lock:
+                started.append(service["id"])
+            release.wait(2)
+            return {"ok": True}
+
+        threads = [threading.Thread(target=lambda: pool.call_any(configs, invoke)) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        deadline = time.time() + 1
+        while time.time() < deadline:
+            with lock:
+                if len(started) == 2:
+                    break
+            time.sleep(0.01)
+        with lock:
+            selected = set(started)
+        release.set()
+        for thread in threads:
+            thread.join(2)
+        self.assertEqual(selected, {"first", "second"})
+
+    def test_image_scheduler_releases_waiters_in_fifo_order(self) -> None:
+        pool = SERVER.AdaptiveImageNodePool(
+            Path(self.temporary.name) / "fifo.json",
+            3,
+            window_seconds=0,
+            minimum_in_flight_limit=1,
+            in_flight_minutes=0,
+            global_in_flight_limit=1,
+        )
+        config = {"id": "primary", "base_url": "https://relay.example/v1", "api_key": "secret", "rpm_limit": 3}
+        permits = threading.Semaphore(0)
+        starts: list[str] = []
+        lock = threading.Lock()
+
+        def worker(label: str) -> None:
+            def invoke() -> dict:
+                with lock:
+                    starts.append(label)
+                permits.acquire(timeout=2)
+                return {"ok": True}
+
+            pool.call(config, invoke, retry_rate_limit=False, skip_cooldown=False)
+
+        threads: list[threading.Thread] = []
+        for index, label in enumerate(("first", "second", "third")):
+            thread = threading.Thread(target=worker, args=(label,))
+            threads.append(thread)
+            thread.start()
+            deadline = time.time() + 1
+            if index == 0:
+                while time.time() < deadline:
+                    with lock:
+                        if starts == ["first"]:
+                            break
+                    time.sleep(0.005)
+            else:
+                while time.time() < deadline and pool.overview()["waiting"] < index:
+                    time.sleep(0.005)
+
+        for _ in threads:
+            permits.release()
+            time.sleep(0.03)
+        for thread in threads:
+            thread.join(2)
+        self.assertEqual(starts, ["first", "second", "third"])
+
+    def test_second_rate_limit_strike_forces_one_rpm_and_circuit_breaker(self) -> None:
+        pool = SERVER.AdaptiveImageNodePool(Path(self.temporary.name) / "strikes.json", 3, window_seconds=0)
+        config = {"id": "primary", "base_url": "https://relay.example/v1", "api_key": "secret", "rpm_limit": 10}
+        with pool.condition:
+            _key, state = pool._state(config)
+            state["rpm"] = 10
+        for strike in range(2):
+            with self.assertRaises(SERVER.ProviderHTTPError):
+                pool.call(
+                    config,
+                    lambda: (_ for _ in ()).throw(SERVER.ProviderHTTPError(429, "rate limited", retry_after=1)),
+                    retry_rate_limit=False,
+                    skip_cooldown=False,
+                )
+            if strike == 0:
+                first = pool.snapshot()[0]
+                self.assertEqual(first["rpm"], 5)
+                self.assertEqual(first["rate_limit_strikes"], 1)
+                with pool.condition:
+                    state["cooldown_until"] = 0
+                    state["next_request_at"] = 0
+        second = pool.snapshot()[0]
+        self.assertEqual(second["rpm"], 1)
+        self.assertEqual(second["rate_limit_strikes"], 2)
+        self.assertEqual(second["circuit_reason"], "rate_limit")
+        self.assertGreaterEqual(second["cooldown_seconds"], 899)
+
+    def test_image_node_promotes_only_one_tier_after_stable_window(self) -> None:
+        pool = SERVER.AdaptiveImageNodePool(
+            Path(self.temporary.name) / "promotion.json",
+            3,
+            window_seconds=0,
+            promotion_window_seconds=0,
+            promotion_successes=3,
+        )
+        config = {"id": "primary", "base_url": "https://relay.example/v1", "api_key": "secret", "rpm_limit": 10}
+        for _ in range(3):
+            pool.call(config, lambda: {"ok": True}, retry_rate_limit=False, skip_cooldown=False)
+        snapshot = pool.snapshot()[0]
+        self.assertEqual(snapshot["rpm"], 5)
+        self.assertEqual(snapshot["tier_successes"], 0)
+
+    def test_image_node_never_promotes_above_ten_rpm(self) -> None:
+        pool = SERVER.AdaptiveImageNodePool(
+            Path(self.temporary.name) / "maximum.json",
+            3,
+            window_seconds=0,
+            promotion_window_seconds=0,
+            promotion_successes=1,
+        )
+        config = {"id": "primary", "base_url": "https://relay.example/v1", "api_key": "secret", "rpm_limit": 999}
+        for _ in range(8):
+            pool.call(config, lambda: {"ok": True}, retry_rate_limit=False, skip_cooldown=False)
+        snapshot = pool.snapshot()[0]
+        self.assertEqual(snapshot["rpm"], 10)
+        self.assertEqual(snapshot["rpm_limit"], 10)
+
+    def test_three_consecutive_503s_open_five_minute_circuit_without_lowering_rpm(self) -> None:
+        pool = SERVER.AdaptiveImageNodePool(Path(self.temporary.name) / "unavailable.json", 3, window_seconds=0)
+        config = {"id": "primary", "base_url": "https://relay.example/v1", "api_key": "secret", "rpm_limit": 10}
+        for attempt in range(3):
+            with self.assertRaises(SERVER.ProviderHTTPError):
+                pool.call(
+                    config,
+                    lambda: (_ for _ in ()).throw(SERVER.ProviderHTTPError(503, "unavailable")),
+                    retry_rate_limit=False,
+                    skip_cooldown=False,
+                )
+            if attempt < 2:
+                with pool.condition:
+                    _key, state = pool._state(config)
+                    state["cooldown_until"] = 0
+                    state["next_request_at"] = 0
+        snapshot = pool.snapshot()[0]
+        self.assertEqual(snapshot["rpm"], 3)
+        self.assertEqual(snapshot["consecutive_unavailable"], 3)
+        self.assertEqual(snapshot["circuit_reason"], "unavailable")
+        self.assertGreaterEqual(snapshot["cooldown_seconds"], 299)
+
+    def test_image_node_emergency_in_flight_limit_pauses_then_resumes(self) -> None:
+        pool = SERVER.AdaptiveImageNodePool(
+            Path(self.temporary.name) / "capacity.json",
+            3,
+            window_seconds=0,
+            minimum_in_flight_limit=2,
+            in_flight_minutes=0,
+            global_in_flight_limit=10,
+        )
+        config = {"id": "primary", "base_url": "https://relay.example/v1", "api_key": "secret", "rpm_limit": 3}
+        permits = threading.Semaphore(0)
+        lock = threading.Lock()
+        active = 0
+        maximum = 0
+
+        def invoke() -> dict:
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            permits.acquire(timeout=2)
+            with lock:
+                active -= 1
+            return {"ok": True}
+
+        threads = [threading.Thread(target=lambda: pool.call(config, invoke, retry_rate_limit=False, skip_cooldown=False)) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        deadline = time.time() + 1
+        while time.time() < deadline:
+            with lock:
+                if active == 2:
+                    break
+            time.sleep(0.01)
+        time.sleep(0.05)
+        with lock:
+            self.assertEqual(active, 2)
+        permits.release()
+        deadline = time.time() + 1
+        while time.time() < deadline:
+            with lock:
+                if maximum == 2 and active == 2:
+                    break
+            time.sleep(0.01)
+        permits.release(2)
+        for thread in threads:
+            thread.join(2)
+        self.assertEqual(maximum, 2)
 
     def test_text_provider_falls_back_to_chat_completions(self) -> None:
         unsupported = mock.Mock(is_error=True, status_code=404, text="responses endpoint not found")
@@ -451,6 +668,15 @@ class QueueResumeTests(unittest.TestCase):
         self.assertEqual(plan["ready_count"], 2)
         self.assertEqual([item["position"] for item in plan["ready"]], [1, 2])
         self.assertEqual(plan["skipped"], [{"position": 3, "reason": "缺少 API Key"}])
+
+    def test_image_relay_plan_clamps_each_node_rpm_limit(self) -> None:
+        plan = SERVER.provider_service_plan({
+            "image_services": [
+                {"id": "first", "base_url": "https://one.example/v1", "api_key": "one", "model": "gpt-image-2", "enabled": True, "rpm_limit": 5},
+                {"id": "second", "base_url": "https://two.example/v1", "api_key": "two", "model": "gpt-image-2", "enabled": True, "rpm_limit": 999},
+            ]
+        }, "image")
+        self.assertEqual([item["service"]["rpm_limit"] for item in plan["ready"]], [5, 10])
 
     def test_text_relay_switch_status_uses_total_configured_node_count(self) -> None:
         unavailable = SERVER.ProviderHTTPError(503, "Service temporarily unavailable")
@@ -623,19 +849,19 @@ class QueueResumeTests(unittest.TestCase):
         self.assertEqual(resolved["_text_models"], ["gpt-5.5"])
         self.assertEqual(resolved["_image_models"], ["gpt-image-2"])
 
-    def test_image_provider_uses_response_candidates_and_records_actual_model(self) -> None:
-        unavailable = SERVER.ProviderHTTPError(503, "Service temporarily unavailable")
+    def test_image_provider_uses_only_selected_model_and_records_actual_model(self) -> None:
         SERVER.JOBS["image-job"] = self.job("image-job")
-        with mock.patch.object(SERVER, "provider_post", side_effect=[unavailable, {"model": "gpt-image-2-live", "data": [{}]}]) as request:
+        with mock.patch.object(SERVER, "provider_post", return_value={"model": "gpt-image-1-live", "data": [{}]}) as request:
             payload = SERVER.provider_image(
                 {"api_key": "test", "base_url": "https://relay.example/v1", "image_model": "gpt-image-1", "_image_models": ["gpt-image-1", "gpt-image-2"]},
                 "images/generations",
                 {"model": "gpt-image-1", "prompt": "hello"},
                 job_id="image-job",
             )
-        self.assertEqual(payload["model"], "gpt-image-2-live")
-        self.assertEqual([call.args[2]["model"] for call in request.call_args_list], ["gpt-image-1", "gpt-image-2"])
-        self.assertEqual(SERVER.JOBS["image-job"]["image_model"], "gpt-image-2-live")
+        self.assertEqual(payload["model"], "gpt-image-1-live")
+        self.assertEqual([call.args[2]["model"] for call in request.call_args_list], ["gpt-image-1"])
+        self.assertEqual(request.call_args.kwargs["attempts"], 1)
+        self.assertEqual(SERVER.JOBS["image-job"]["image_model"], "gpt-image-1-live")
 
     def test_config_returns_full_keys_for_plaintext_settings(self) -> None:
         visible = SERVER.safe_config({"api_key": "text-secret", "image_api_key": "image-secret"})
