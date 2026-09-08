@@ -215,9 +215,12 @@ class QueueResumeTests(unittest.TestCase):
         self.assertIn("哑光平涂", recipe)
         self.assertIn("颜色只用于人物服装和剧情核心道具", recipe)
         self.assertIn("背景建筑、家具、地面、天空和植物一律不着色", recipe)
+        self.assertIn("剧情必要的小面积语义色", recipe)
+        self.assertIn("细微纸张颗粒", recipe)
+        self.assertIn("禁止水彩晕染", recipe)
         self.assertIn("纯白面积不少于 80%", recipe)
         self.assertIn("蜡笔或炭笔颗粒", recipe)
-        self.assertIn("泛黄纸纹", recipe)
+        self.assertIn("禁止泛黄", recipe)
         self.assertIn("禁止 Q 版", recipe)
         self.assertIn("风景绘本式铺满背景", recipe)
         self.assertIn("只能来自当前分镜", recipe)
@@ -515,7 +518,7 @@ class QueueResumeTests(unittest.TestCase):
             )
         self.assertEqual(scenes[0]["cast_ids"], ["role_01"])
 
-    def test_clear_japanese_storybook_uses_built_in_style_reference(self) -> None:
+    def test_clear_japanese_storybook_keeps_style_reference_for_character_draws_only(self) -> None:
         paths, instruction = SERVER.clear_storybook_reference_context()
         self.assertEqual(paths, [SERVER.CLEAR_STORYBOOK_REFERENCE_PATH])
         self.assertTrue(paths[0].is_file())
@@ -528,6 +531,17 @@ class QueueResumeTests(unittest.TestCase):
         self.assertIn("不得复制", instruction)
         self.assertIn("人物身份、数量、服装、动作、道具、场景、事件或具体构图", instruction)
 
+        draw_paths, draw_instruction = SERVER.style_only_reference_context(SERVER.CLEAR_STORYBOOK_STYLE)
+        self.assertEqual(draw_paths, paths)
+        self.assertEqual(draw_instruction, instruction)
+
+        production_paths, production_instruction = SERVER.board_style_reference_context(
+            SERVER.CLEAR_STORYBOOK_STYLE,
+            [{"concept": "爸爸牵着七岁乐乐去公园"}],
+        )
+        self.assertEqual(production_paths, [])
+        self.assertEqual(production_instruction, "")
+
         prompt = SERVER.build_board_prompt(
             [{
                 "title": "出门",
@@ -536,19 +550,19 @@ class QueueResumeTests(unittest.TestCase):
                 "text": "周六早晨，爸爸答应带七岁的乐乐去公园放风筝。",
             }],
             SERVER.CLEAR_STORYBOOK_STYLE,
-            instruction,
             aspect_ratio="3:4",
             presentation_mode="story-color",
         )
-        self.assertLessEqual(len(prompt), 700)
-        self.assertEqual(prompt.count(instruction), 1)
-        self.assertNotIn("纯白面积不少于 80%", prompt)
-        self.assertNotIn("成年人约 5～6 头身", prompt)
-        self.assertIn("参考图已经提供完整视觉样式", prompt)
+        self.assertIn("纯白面积不少于 80%", prompt)
+        self.assertIn("成年人约 5～6 头身", prompt)
+        self.assertNotIn("参考图说明", prompt)
+        self.assertNotIn("参考图已经提供完整视觉样式", prompt)
+        self.assertIn("内容约束决定画什么；视觉配方决定如何画，二者必须同时满足", prompt)
+        self.assertNotIn("优先级高于风格修饰", prompt)
         self.assertIn("爸爸背着风筝", prompt)
         self.assertIn(SERVER.IDENTITY_PROMPTS["consistent"], prompt)
 
-    def test_clear_storybook_prompt_preview_uses_the_concise_built_in_reference_architecture(self) -> None:
+    def test_clear_storybook_prompt_preview_uses_text_recipe_without_style_image(self) -> None:
         preview = SERVER.preview_style_prompt({
             "page_mode": "standard",
             "style": SERVER.CLEAR_STORYBOOK_STYLE,
@@ -556,10 +570,190 @@ class QueueResumeTests(unittest.TestCase):
             "aspect_ratio": "3:4",
             "presentation_mode": "story-color",
         })
-        self.assertIn("清透日系生活绘本视觉语言参考", preview["full_prompt"])
-        self.assertIn("参考图已经提供完整视觉样式", preview["full_prompt"])
-        self.assertNotIn("纯白面积不少于 80%", preview["full_prompt"])
+        self.assertNotIn("清透日系生活绘本视觉语言参考", preview["full_prompt"])
+        self.assertNotIn("参考图已经提供完整视觉样式", preview["full_prompt"])
+        self.assertIn("纯白面积不少于 80%", preview["full_prompt"])
         self.assertFalse(preview["truncated"])
+
+    def test_clear_storybook_board_spec_uses_cast_character_without_style_image(self) -> None:
+        from PIL import Image
+
+        job_id = "clear-board-spec"
+        job_dir = SERVER.JOBS_DIR / job_id
+        job_dir.mkdir(parents=True)
+        Image.effect_noise((128, 128), 20).convert("RGB").save(job_dir / "library-character-01.png")
+        SERVER.JOBS[job_id] = {
+            **self.job(job_id),
+            "style": SERVER.CLEAR_STORYBOOK_STYLE,
+            "aspect_ratio": "3:4",
+            "presentation_mode": "story-color",
+            "character_bindings": [{
+                "role_id": "role_01", "story_name": "乐乐", "description": "七岁短发女孩",
+                "image": "library-character-01.png",
+            }],
+        }
+        board = [{"concept": "乐乐撑伞回家", "elements": ["乐乐撑伞"], "text": "乐乐走进雨里。", "cast_ids": ["role_01"]}]
+        images, instruction, prompt = SERVER.build_board_generation_spec(
+            job_id, board, SERVER.CLEAR_STORYBOOK_STYLE, False, "3:4", "story-color", "consistent",
+        )
+        self.assertEqual([path.name for path in images], ["library-character-01.png"])
+        self.assertIn("输入图1定义人物“乐乐”", instruction)
+        self.assertNotIn("清透日系生活绘本视觉语言参考", instruction)
+        self.assertIn("视觉配方：", prompt)
+        self.assertIn("输入图1定义人物“乐乐”", prompt)
+        self.assertNotIn("严格复现输入风格参考图", prompt)
+
+    def test_character_only_references_do_not_masquerade_as_a_style_reference(self) -> None:
+        from PIL import Image
+
+        job_id = "retro-character-only"
+        job_dir = SERVER.JOBS_DIR / job_id
+        job_dir.mkdir(parents=True)
+        Image.effect_noise((128, 128), 20).convert("RGB").save(job_dir / "library-character-01.png")
+        SERVER.JOBS[job_id] = {
+            **self.job(job_id),
+            "style": "复古报纸拼贴风",
+            "character_bindings": [{
+                "role_id": "role_01", "story_name": "我", "description": "青年女性，黑色直发",
+                "image": "library-character-01.png",
+            }],
+        }
+        board = [{"concept": "我站在门口", "elements": ["我挥手"], "text": "我回来了。", "cast_ids": ["role_01"]}]
+        images, instruction, prompt = SERVER.build_board_generation_spec(
+            job_id, board, "复古报纸拼贴风", False, "3:4", "story-color", "consistent",
+        )
+        self.assertEqual([path.name for path in images], ["library-character-01.png"])
+        self.assertIn("输入图1定义人物“我”", instruction)
+        self.assertIn("视觉配方：", prompt)
+        self.assertNotIn("严格复现输入风格参考图", prompt)
+
+    def test_clear_storybook_recipe_has_a_version_for_automatic_upgrade(self) -> None:
+        self.assertEqual(SERVER.style_recipe_version(SERVER.CLEAR_STORYBOOK_STYLE), "clear-storybook-text-v2")
+
+    def test_old_clear_storybook_regeneration_auto_upgrades_prompt_and_keeps_cast_image(self) -> None:
+        from PIL import Image
+
+        job_id = "clear-auto-upgrade"
+        job_dir = SERVER.JOBS_DIR / job_id
+        job_dir.mkdir(parents=True)
+        scene = {"concept": "乐乐撑伞回家", "elements": ["乐乐撑伞"], "text": "乐乐走进雨里。", "cast_ids": ["role_01"], "key_text": "雨中回家"}
+        (job_dir / "plan.json").write_text(json.dumps([scene], ensure_ascii=False), encoding="utf-8")
+        (job_dir / "boards.json").write_text(json.dumps([{"scene_numbers": [1], "image_prompt": "旧版日系提示词"}], ensure_ascii=False), encoding="utf-8")
+        Image.effect_noise((128, 128), 10).convert("RGB").save(job_dir / "board-01.png")
+        Image.effect_noise((128, 128), 20).convert("RGB").save(job_dir / "board-01.source.png")
+        Image.effect_noise((128, 128), 30).convert("RGB").save(job_dir / "library-character-01.png")
+        SERVER.JOBS[job_id] = {
+            **self.job(job_id),
+            "status": "done",
+            "style": SERVER.CLEAR_STORYBOOK_STYLE,
+            "aspect_ratio": "3:4",
+            "presentation_mode": "story-color",
+            "include_key_text": False,
+            "character_bindings": [{
+                "role_id": "role_01", "story_name": "乐乐", "description": "七岁短发女孩",
+                "image": "library-character-01.png",
+            }],
+        }
+        captured = {}
+
+        def fake_generate(_config, prompt, target, reference_images, *_args):
+            captured["prompt"] = prompt
+            captured["references"] = [path.name for path in reference_images]
+            Image.effect_noise((128, 128), 40).convert("RGB").save(target)
+
+        with mock.patch.object(SERVER, "load_config", return_value={"image_model": "gpt-image-2"}), mock.patch.object(SERVER, "generate_image", side_effect=fake_generate):
+            SERVER.regenerate_board_image(job_id, 1, "旧版日系提示词")
+
+        self.assertEqual(captured["references"], ["library-character-01.png"])
+        self.assertIn("视觉配方：", captured["prompt"])
+        self.assertNotIn("清透日系生活绘本视觉语言参考", captured["prompt"])
+        self.assertEqual(SERVER.JOBS[job_id]["style_recipe_version"], "clear-storybook-text-v2")
+        self.assertEqual(SERVER.JOBS[job_id]["image_generation_audit"]["board-01"]["reference_images"], ["library-character-01.png"])
+        saved = json.loads((job_dir / "boards.json").read_text(encoding="utf-8"))[0]
+        self.assertEqual(saved["image_prompt"], captured["prompt"])
+        self.assertEqual(saved["reference_images"], ["library-character-01.png"])
+
+    def test_manual_prompt_edit_wins_over_clear_storybook_auto_upgrade(self) -> None:
+        from PIL import Image
+
+        job_id = "clear-manual-prompt"
+        job_dir = SERVER.JOBS_DIR / job_id
+        job_dir.mkdir(parents=True)
+        scene = {"concept": "女孩站在门口", "elements": ["女孩挥手"], "text": "她回来了。", "cast_ids": []}
+        (job_dir / "plan.json").write_text(json.dumps([scene], ensure_ascii=False), encoding="utf-8")
+        (job_dir / "boards.json").write_text(json.dumps([{"scene_numbers": [1], "image_prompt": "旧版提示词"}], ensure_ascii=False), encoding="utf-8")
+        Image.effect_noise((128, 128), 10).convert("RGB").save(job_dir / "board-01.png")
+        SERVER.JOBS[job_id] = {**self.job(job_id), "status": "done", "style": SERVER.CLEAR_STORYBOOK_STYLE, "include_key_text": False}
+        captured = {}
+
+        def fake_generate(_config, prompt, target, _reference_images, *_args):
+            captured["prompt"] = prompt
+            Image.effect_noise((128, 128), 20).convert("RGB").save(target)
+
+        with mock.patch.object(SERVER, "load_config", return_value={"image_model": "gpt-image-2"}), mock.patch.object(SERVER, "generate_image", side_effect=fake_generate):
+            SERVER.regenerate_board_image(job_id, 1, "我手动改写的提示词")
+        self.assertEqual(captured["prompt"], "我手动改写的提示词")
+
+    def test_new_clear_storybook_job_persists_current_recipe_version(self) -> None:
+        response = TestClient(SERVER.app).post("/api/jobs", data={
+            "copy": "女孩下班后撑着雨伞走回家，路灯照亮了门前的一小片路。",
+            "voice_mode": "none",
+            "style": SERVER.CLEAR_STORYBOOK_STYLE,
+            "character_bindings": "[]",
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(SERVER.JOBS[response.json()["id"]]["style_recipe_version"], "clear-storybook-text-v2")
+
+    def test_character_redraw_archives_approved_sheet_before_review(self) -> None:
+        from PIL import Image
+
+        asset_id = "abcdef123456"
+        asset_dir = SERVER.CHARACTER_LIBRARY_DIR / SERVER.character_style_key(SERVER.CLEAR_STORYBOOK_STYLE) / asset_id
+        asset_dir.mkdir(parents=True)
+        Image.effect_noise((128, 128), 10).convert("RGB").save(asset_dir / "character-sheet.png")
+        (asset_dir / "asset.json").write_text(json.dumps({
+            "id": asset_id,
+            "style": SERVER.CLEAR_STORYBOOK_STYLE,
+            "label": "青年女",
+            "description": "青年女性，黑色中长发，温和自然",
+            "status": "approved",
+            "image": "character-sheet.png",
+        }, ensure_ascii=False), encoding="utf-8")
+
+        def fake_generate(_config, _prompt, target, _reference_images, *_args):
+            Image.effect_noise((128, 128), 40).convert("RGB").save(target)
+
+        with mock.patch.object(SERVER, "load_config", return_value={}), mock.patch.object(SERVER, "generate_image", side_effect=fake_generate):
+            SERVER.draw_character_asset(asset_id)
+
+        item = json.loads((asset_dir / "asset.json").read_text(encoding="utf-8"))
+        self.assertEqual(item["status"], "review")
+        self.assertEqual(item["style_recipe_version"], "clear-storybook-text-v2")
+        self.assertEqual(len(list((asset_dir / "revisions").glob("character-sheet-*.png"))), 1)
+
+    def test_style_rebuild_queues_only_outdated_existing_character_sheets(self) -> None:
+        from PIL import Image
+
+        style_root = SERVER.CHARACTER_LIBRARY_DIR / SERVER.character_style_key(SERVER.CLEAR_STORYBOOK_STYLE)
+        for asset_id, version in (("aaaaaaaaaaaa", ""), ("bbbbbbbbbbbb", "clear-storybook-text-v2")):
+            asset_dir = style_root / asset_id
+            asset_dir.mkdir(parents=True)
+            Image.effect_noise((128, 128), 20).convert("RGB").save(asset_dir / "character-sheet.png")
+            (asset_dir / "asset.json").write_text(json.dumps({
+                "id": asset_id, "style": SERVER.CLEAR_STORYBOOK_STYLE, "label": asset_id,
+                "description": "青年角色，黑色短发，普通日常衣着", "status": "approved",
+                "image": "character-sheet.png", "style_recipe_version": version,
+            }, ensure_ascii=False), encoding="utf-8")
+        with mock.patch.object(SERVER, "start_character_asset_worker") as start:
+            response = TestClient(SERVER.app).post("/api/character-assets/rebuild-style", json={"style": SERVER.CLEAR_STORYBOOK_STYLE})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["queued"], ["aaaaaaaaaaaa"])
+        self.assertEqual(start.call_count, 1)
+        outdated = json.loads((style_root / "aaaaaaaaaaaa" / "asset.json").read_text(encoding="utf-8"))
+        current = json.loads((style_root / "bbbbbbbbbbbb" / "asset.json").read_text(encoding="utf-8"))
+        self.assertTrue(outdated["rebuild_pending"])
+        self.assertEqual(outdated["status"], "approved")
+        self.assertNotIn("rebuild_pending", current)
 
     def test_identity_modes_are_mutually_exclusive_in_image_prompts(self) -> None:
         scene = [{"title": "相遇", "concept": "主角走进房间", "elements": ["主角推门"], "text": "主角回来了。"}]

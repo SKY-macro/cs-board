@@ -39,7 +39,7 @@ PYTHON = Path(sys.executable)
 NODE = shutil.which("node") or "node"
 REMOTION_RENDERER = ROOT / "video_renderer"
 HAND = ROOT / "assets" / "drawing-hand-clean.png"
-PIPELINE_VERSION = "narrated_deck_v22_persona_matching"
+PIPELINE_VERSION = "narrated_deck_v23_storybook_text_recipe"
 ALIGNMENT_SEGMENTATION = "word-boundary-dtw-audio-v2"
 SUBTITLE_FONT = os.environ.get(
     "CS_BOARD_SUBTITLE_FONT",
@@ -147,14 +147,15 @@ STYLE_PRESETS = {
         "同时确保人物面部和关键物体清楚可读。"
     ),
     CLEAR_STORYBOOK_STYLE: (
-        "纯白无纸纹数字页；纤细清晰、略有手绘起伏的黑灰墨线，外轮廓克制，内部仅少量发丝、衣褶和接地线。"
-        "人物为自然纤细的现代生活绘本比例：成年人约 5～6 头身，儿童约 4～5 头身；头部仅轻度放大，肩颈、手脚和四肢完整，绝不短胖幼态。"
-        "柔和短椭圆脸、大面积面部留白；小型黑色竖椭圆或圆点眼，一笔短鼻、细小嘴眉；无彩色虹膜、大眼、浓睫毛和尖下巴。"
-        "头发为轮廓明确的深色块面，以少量细碎发束收边，不画蓬松尖刺发型。肤色极淡，腮红近乎不可见。"
-        "颜色只用于人物服装和剧情核心道具：整洁的低饱和哑光平涂、局部极淡排线；无水彩、颗粒和体积光。"
+        "中性纯白纸面，仅有细微纸张颗粒；禁止泛黄、污渍和复古旧纸。"
+        "纤细清晰、略有手绘起伏的黑灰墨线，内部只画必要发丝、衣褶和接地线。"
+        "人物自然纤细：成年人约 5～6 头身，儿童约 4～5 头身；头部仅轻度放大，手脚与四肢完整，绝不短胖幼态。"
+        "柔和短椭圆脸与大面积面部留白；小型黑色竖椭圆或圆点眼，一笔短鼻和细小嘴眉；无彩色虹膜、大眼、浓睫毛或尖下巴。"
+        "头发为明确的深色块面，仅以少量细发束收边，不蓬松尖刺；肤色极淡，腮红几乎不可见。"
+        "颜色只用于人物服装和剧情核心道具：低饱和哑光平涂与极淡排线；禁止水彩晕染、渐变和体积光。"
         "构图服从剧情，优先完整全身或四分之三身平视群像。背景建筑、家具、地面、天空和植物一律不着色，仅留黑灰细线；纯白面积不少于 80%。"
-        "人物场景内容只能来自当前分镜，不继承风格图内容。"
-        "禁止 Q 版、chibi、短胖身体、默认背影、电影运镜、风景绘本式铺满背景、空气透视、柔焦、渐变、泛黄纸纹、蜡笔或炭笔颗粒、强光影、3D、写实摄影、文字和水印。"
+        "仅允许剧情必要的小面积语义色，例如雨伞、路灯光或火焰，但不得扩散成背景铺色。"
+        "人物与场景只能来自当前分镜。禁止 Q 版、chibi、默认背影、电影运镜、风景绘本式铺满背景、空气透视、柔焦、蜡笔或炭笔颗粒、强光影、3D、写实摄影、文字和水印。"
     ),
 }
 
@@ -242,6 +243,13 @@ def style_recipe(style: str) -> str:
     if style not in STYLE_PRESETS:
         raise RuntimeError(f"后台未加载画面风格：{style}，请重启后台后重新提交任务")
     return STYLE_PRESETS[style]
+
+
+def style_recipe_version(style: str) -> str:
+    """Return a persisted version for styles whose production recipe can migrate."""
+    if style == CLEAR_STORYBOOK_STYLE:
+        return "clear-storybook-text-v2"
+    return "1"
 
 
 def is_infographic_job(job_id: str) -> bool:
@@ -342,6 +350,23 @@ def clear_storybook_reference_context() -> tuple[list[Path], str]:
         "当前分镜决定内容，不得复制图中原有的人物身份、数量、服装、动作、道具、场景、事件或具体构图。"
     )
     return [CLEAR_STORYBOOK_REFERENCE_PATH], instruction
+
+
+def board_style_reference_context(
+    style: str,
+    scenes: list[dict[str, Any]],
+    infographic: bool = False,
+) -> tuple[list[Path], str]:
+    """Return built-in style inputs used by production boards.
+
+    Clear Japanese storybook intentionally uses its text recipe in production;
+    its style image remains available only to reusable character-sheet draws.
+    """
+    if style == PAPER_METAPHOR_STYLE:
+        return paper_metaphor_reference_context(scenes)
+    if style == OIL_VISUAL_STYLE:
+        return oil_visual_reference_context(scenes, infographic)
+    return [], ""
 
 app = FastAPI(title="白板声画工坊", version="0.1.0")
 app.add_middleware(
@@ -2491,8 +2516,10 @@ def build_image_prompt(scene: dict[str, Any], style: str, aspect_ratio: str = "1
 禁止任何文字、字母、数字、Logo、水印、边框、对话框和装饰性填充。画面底部保留约 16% 空白作为字幕安全区。"""
 
 
-def build_board_prompt(scenes: list[dict[str, Any]], style: str, reference_instruction: str = "", use_character_references: bool = False, infographic: bool = False, aspect_ratio: str = "16:9", presentation_mode: str = "whiteboard", identity_mode: str = DEFAULT_IDENTITY_MODE) -> str:
+def build_board_prompt(scenes: list[dict[str, Any]], style: str, reference_instruction: str = "", use_character_references: bool = False, infographic: bool = False, aspect_ratio: str = "16:9", presentation_mode: str = "whiteboard", identity_mode: str = DEFAULT_IDENTITY_MODE, use_style_reference: bool | None = None) -> str:
     aspect_ratio = normalize_aspect_ratio(aspect_ratio)
+    if use_style_reference is None:
+        use_style_reference = style == "自定义参考" or bool(reference_instruction and not use_character_references)
     layout_direction = "从上到下" if aspect_ratio in {"9:16", "3:4"} else "从左到右"
     if infographic:
         scene = scenes[0]
@@ -2521,12 +2548,10 @@ PPT 已确定的视觉策略：{scene.get('visual_strategy', '左侧文字，右
         panels.append("｜".join(fields))
     panel_text = "\n".join(panels)
     style_instruction = (
-        "参考图已经提供完整视觉样式，严格遵循上述视觉锚点，无需另行扩写或改造画风。"
-        if style == CLEAR_STORYBOOK_STYLE and reference_instruction else
         f"视觉配方：{style_recipe(style)}"
-        if style == OIL_VISUAL_STYLE and reference_instruction else
+        if style == OIL_VISUAL_STYLE and use_style_reference else
         "严格复现输入风格参考图的配色、线条粗细、材质、造型比例与构图语言；不要复制风格图里原有的人物或事件。"
-        if reference_instruction else
+        if use_style_reference else
         f"视觉配方：{style_recipe(style)}\n必须严格执行这套视觉配方，不得自动改回其他白板风格；人物、物体和配色都要让所选风格一眼可辨。"
     )
     character_instruction = (
@@ -2534,6 +2559,7 @@ PPT 已确定的视觉策略：{scene.get('visual_strategy', '左侧文字，右
         if use_character_references else identity_prompt(identity_mode)
     )
     reference_block = f"参考图说明：\n{reference_instruction}\n" if reference_instruction else ""
+    input_duty_rule = "输入图职责以说明为准，不得混用或复制其事件构图。\n" if reference_instruction else ""
     region_rule = (
         "完整场景，不分栏、不画边框。"
         if len(scenes) == 1 else
@@ -2544,10 +2570,9 @@ PPT 已确定的视觉策略：{scene.get('visual_strategy', '左侧文字，右
     else:
         layout_rule = "所有区域的主体垂直居中并略微靠上，主要人物和物体中心位于画面高度 42%～48%，顶部不得出现大面积无意义空白。画面底部保留约 16% 空白作为字幕安全区。"
     return f"""生成一张用于中文口播的 {aspect_ratio} 白板动画原画，一张图承载 {len(scenes)} 个连续分镜。
-当前分镜内容（须完整表现，优先级高于风格修饰）：
+当前分镜内容（内容约束决定画什么；视觉配方决定如何画，二者必须同时满足）：
 {panel_text}
-{reference_block}输入图职责以说明为准，不得混用或复制其事件构图。
-风格名称：{style}。
+{reference_block}{input_duty_rule}风格名称：{style}。
 {character_instruction}
 {style_instruction}
 {region_rule}
@@ -2708,6 +2733,45 @@ def task_character_reference_context(
         for item in bindings
     )
     return paths, "\n".join(lines), context
+
+
+def build_board_generation_spec(
+    job_id: str,
+    board: list[dict[str, Any]],
+    style: str,
+    infographic: bool,
+    aspect_ratio: str,
+    presentation_mode: str,
+    identity_mode: str,
+) -> tuple[list[Path], str, str]:
+    """Build the exact images, image-role instruction and prompt for one board."""
+    reference_images, reference_instruction, character_context = custom_reference_context(job_id)
+    board_images = list(reference_images)
+    board_instruction = reference_instruction
+    use_style_reference = bool(reference_images)
+    use_character_references = bool(character_context)
+    if not board_images:
+        board_images, board_instruction = board_style_reference_context(style, board, infographic)
+        use_style_reference = bool(board_images)
+        use_character_references = False
+    if not reference_images:
+        character_images, character_instruction, _context = task_character_reference_context(job_id, board, len(board_images))
+        if character_images:
+            board_images = [*board_images, *character_images]
+            board_instruction = "\n".join(value for value in (board_instruction, character_instruction) if value)
+            use_character_references = True
+    board_prompt = build_board_prompt(
+        board,
+        style,
+        board_instruction,
+        use_character_references,
+        infographic,
+        aspect_ratio,
+        presentation_mode,
+        identity_mode,
+        use_style_reference,
+    )
+    return board_images, board_instruction, board_prompt
 
 
 def _synthesize_voice_once(config: dict[str, Any], reference: Path, copy: str, target: Path) -> None:
@@ -3375,26 +3439,15 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path | None, scen
         boards = [scenes[i:i + scenes_per_image] for i in range(0, len(scenes), scenes_per_image)]
         board_specs: list[tuple[list[Path], str, str]] = []
         for board in boards:
-            board_images = list(reference_images)
-            board_instruction = reference_instruction
-            use_character_references = bool(character_context)
-            if style == PAPER_METAPHOR_STYLE and not board_images:
-                board_images, board_instruction = paper_metaphor_reference_context(board)
-                use_character_references = False
-            elif style == OIL_VISUAL_STYLE and not board_images:
-                board_images, board_instruction = oil_visual_reference_context(board, infographic)
-                use_character_references = False
-            elif style == CLEAR_STORYBOOK_STYLE and not board_images:
-                board_images, board_instruction = clear_storybook_reference_context()
-                use_character_references = False
-            if not reference_images:
-                character_images, character_instruction, _context = task_character_reference_context(job_id, board, len(board_images))
-                if character_images:
-                    board_images = [*board_images, *character_images]
-                    board_instruction = "\n".join(value for value in (board_instruction, character_instruction) if value)
-                    use_character_references = True
-            board_prompt = build_board_prompt(board, style, board_instruction, use_character_references, infographic, aspect_ratio, presentation_mode, identity_mode)
-            board_specs.append((board_images, board_instruction, board_prompt))
+            board_specs.append(build_board_generation_spec(
+                job_id,
+                board,
+                style,
+                infographic,
+                aspect_ratio,
+                presentation_mode,
+                identity_mode,
+            ))
         update_job(job_id, duration=duration, scenes=len(scenes), boards=len(boards), checkpoint="plan_done")
         atomic_write_json(job_dir / "boards.json", [
             {
@@ -3739,17 +3792,38 @@ def regenerate_board_image(job_id: str, page: int, prompt: str) -> None:
         if page < 1 or page > len(boards):
             raise RuntimeError(f"第 {page} 张图片不存在")
 
-        begin_phase(job_id, "images", "单图重生成", f"正在按修改后的提示词重新生成第 {page} 张图片", 50)
-        config = load_config()
+        try:
+            existing_manifest = json.loads(boards_path.read_text(encoding="utf-8")) if boards_path.exists() else []
+        except (OSError, json.JSONDecodeError):
+            existing_manifest = []
+        existing_board = existing_manifest[page - 1] if isinstance(existing_manifest, list) and page <= len(existing_manifest) and isinstance(existing_manifest[page - 1], dict) else {}
+        existing_prompt = str(existing_board.get("image_prompt") or "").strip()
         board = boards[page - 1]
-        reference_images, _reference_instruction, _character_context = custom_reference_context(source_id)
         style = str(source.get("style") or DEFAULT_STYLE)
-        if style == PAPER_METAPHOR_STYLE and not reference_images:
-            reference_images, _reference_instruction = paper_metaphor_reference_context(board)
-        elif style == OIL_VISUAL_STYLE and not reference_images:
-            reference_images, _reference_instruction = oil_visual_reference_context(board, is_infographic_job(job_id))
-        elif style == CLEAR_STORYBOOK_STYLE and not reference_images:
-            reference_images, _reference_instruction = clear_storybook_reference_context()
+        aspect_ratio = normalize_aspect_ratio(source.get("aspect_ratio"))
+        presentation_mode = normalize_presentation_mode(selected.get("presentation_mode", source.get("presentation_mode")))
+        identity_mode = normalize_identity_mode(source.get("identity_mode"))
+        reference_images, _reference_instruction, latest_prompt = build_board_generation_spec(
+            source_id,
+            board,
+            style,
+            is_infographic_job(job_id),
+            aspect_ratio,
+            presentation_mode,
+            identity_mode,
+        )
+        current_recipe_version = style_recipe_version(style)
+        auto_upgraded = (
+            style == CLEAR_STORYBOOK_STYLE
+            and str(source.get("style_recipe_version") or "") != current_recipe_version
+            and bool(existing_prompt)
+            and prompt == existing_prompt
+        )
+        if auto_upgraded:
+            prompt = latest_prompt
+
+        begin_phase(job_id, "images", "单图重生成", f"正在按最新画风配方重新生成第 {page} 张图片" if auto_upgraded else f"正在按修改后的提示词重新生成第 {page} 张图片", 50)
+        config = load_config()
 
         stem = f"board-{page:02d}"
         image = job_dir / f"{stem}.png"
@@ -3759,7 +3833,7 @@ def regenerate_board_image(job_id: str, page: int, prompt: str) -> None:
         for attempt in range(3):
             partial_image.unlink(missing_ok=True)
             try:
-                generate_image(config, prompt, partial_image, reference_images, job_id, normalize_aspect_ratio(source.get("aspect_ratio")))
+                generate_image(config, prompt, partial_image, reference_images, job_id, aspect_ratio)
                 ensure_job_active(job_id)
                 if valid_image_file(partial_image):
                     break
@@ -3776,6 +3850,19 @@ def regenerate_board_image(job_id: str, page: int, prompt: str) -> None:
                 time.sleep(provider_retry_delay(attempt))
         if not valid_image_file(partial_image):
             raise RuntimeError(f"第 {page} 张图片连续 3 次生成无效：{last_error}")
+
+        with LOCK:
+            current_job = JOBS.get(job_id)
+            if current_job is not None:
+                audit = current_job.setdefault("image_generation_audit", {})
+                audit[f"board-{page:02d}"] = {
+                    "node_id": str(current_job.get("image_affinity_node_id") or ""),
+                    "model": str(current_job.get("image_model") or config.get("image_model") or ""),
+                    "reference_images": [path.name for path in reference_images],
+                    "style_recipe_version": current_recipe_version,
+                    "regenerated_at": time.time(),
+                }
+                _persist_job_locked(job_id)
 
         revision_dir = job_dir / "revisions" / time.strftime("%Y%m%d-%H%M%S")
         revision_dir.mkdir(parents=True, exist_ok=True)
@@ -3803,6 +3890,7 @@ def regenerate_board_image(job_id: str, page: int, prompt: str) -> None:
                 "image_prompt": "",
             })
         manifest[page - 1]["image_prompt"] = prompt
+        manifest[page - 1]["reference_images"] = [path.name for path in reference_images]
         atomic_write_json(boards_path, manifest)
         finish_timing(job_id)
         update_job(
@@ -3812,6 +3900,7 @@ def regenerate_board_image(job_id: str, page: int, prompt: str) -> None:
             progress=100,
             completed_boards=len([path for path in job_dir.glob("board-*.png") if re.fullmatch(r"board-\d+\.png", path.name)]),
             board_regeneration=None,
+            style_recipe_version=current_recipe_version,
             error=None,
             can_rerender=True,
             needs_rerender=True,
@@ -4050,10 +4139,7 @@ def preview_style_prompt(payload: dict[str, Any]) -> dict[str, Any]:
         ]
     reference_instruction = (
         "{{上传风格参考图：只学习视觉风格，不复制图中人物或事件}}"
-        if page_mode == "custom" else
-        clear_storybook_reference_context()[1]
-        if style == CLEAR_STORYBOOK_STYLE else
-        ""
+        if page_mode == "custom" else ""
     )
     full_prompt = build_board_prompt(
         scenes,
@@ -4064,6 +4150,7 @@ def preview_style_prompt(payload: dict[str, Any]) -> dict[str, Any]:
         aspect_ratio,
         presentation_mode,
         identity_mode,
+        page_mode == "custom",
     )
     sent_prompt = compact_image_prompt(full_prompt)
     return {
@@ -4200,13 +4287,27 @@ def draw_character_asset(asset_id: str) -> None:
         generate_image(load_config(), prompt, partial, references, None, "3:4")
         if not valid_image_file(partial):
             raise RuntimeError("角色设定图文件无效")
+        if valid_image_file(output):
+            revision_dir = asset_dir / "revisions"
+            revision_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(output, revision_dir / f"character-sheet-{time.time_ns()}.png")
         partial.replace(output)
-        item.update(status="review", image=output.name, finished_at=time.time(), error=None)
+        item.update(
+            status="review",
+            image=output.name,
+            style_recipe_version=style_recipe_version(style),
+            rebuild_pending=False,
+            finished_at=time.time(),
+            updated_at=time.time(),
+            error=None,
+        )
         atomic_write_json(manifest_path, item)
     except Exception as exc:
         try:
             manifest_path, item = character_asset_record(asset_id)
-            item.update(status="error", error=str(exc)[:800], finished_at=time.time())
+            existing_output = manifest_path.parent / str(item.get("image") or "")
+            fallback_status = "approved" if item.get("status") == "approved" and valid_image_file(existing_output) else "error"
+            item.update(status=fallback_status, rebuild_pending=False, error=str(exc)[:800], finished_at=time.time(), updated_at=time.time())
             atomic_write_json(manifest_path, item)
         except Exception:
             pass
@@ -4231,6 +4332,11 @@ def recover_interrupted_character_draws() -> None:
 
 
 recover_interrupted_character_draws()
+
+
+def start_character_asset_worker(asset_id: str, *, rebuild: bool = False) -> None:
+    prefix = "character-rebuild" if rebuild else "character-draw"
+    threading.Thread(target=draw_character_asset, args=(asset_id,), daemon=True, name=f"{prefix}-{asset_id}").start()
 
 
 @app.get("/api/character-assets")
@@ -4258,6 +4364,7 @@ def create_character_draw(payload: dict[str, Any]) -> dict[str, Any]:
             item = {
                 "id": asset_id,
                 "style": style,
+                "style_recipe_version": style_recipe_version(style),
                 "label": label,
                 "description": description[:300],
                 "status": "queued",
@@ -4267,9 +4374,32 @@ def create_character_draw(payload: dict[str, Any]) -> dict[str, Any]:
                 "error": None,
             }
             atomic_write_json(asset_dir / "asset.json", item)
-        threading.Thread(target=draw_character_asset, args=(asset_id,), daemon=True, name=f"character-draw-{asset_id}").start()
+        start_character_asset_worker(asset_id)
         created.append({**item, "image_url": None})
     return {"items": created}
+
+
+@app.post("/api/character-assets/rebuild-style")
+def rebuild_character_style_assets(payload: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild outdated sheets while retaining the approved image until replacement succeeds."""
+    style = str(payload.get("style") or "").strip()
+    if style not in STYLE_PRESETS or style == INFOGRAPHIC_STYLE:
+        raise HTTPException(400, "未知画面风格")
+    version = style_recipe_version(style)
+    queued: list[str] = []
+    for record in character_asset_records(style, include_unapproved=True):
+        asset_id = str(record.get("id") or "")
+        if not asset_id or record.get("style_recipe_version") == version or record.get("rebuild_pending"):
+            continue
+        manifest_path, item = character_asset_record(asset_id)
+        image_path = manifest_path.parent / str(item.get("image") or "")
+        if not valid_image_file(image_path):
+            continue
+        item.update(rebuild_pending=True, rebuild_requested_at=time.time(), updated_at=time.time(), error=None)
+        atomic_write_json(manifest_path, item)
+        start_character_asset_worker(asset_id, rebuild=True)
+        queued.append(asset_id)
+    return {"style": style, "style_recipe_version": version, "queued": queued, "count": len(queued)}
 
 
 @app.patch("/api/character-assets/{asset_id}")
@@ -4599,6 +4729,7 @@ async def create_job(
             "job_type": "infographic" if reference_mode == "infographic" else "generate", "style": style, "scenes_per_image": scenes_per_image,
             "pipeline_version": PIPELINE_VERSION if reference_mode == "infographic" else "standard_v2_character_assets",
             "reference_mode": reference_mode,
+            "style_recipe_version": style_recipe_version(style),
             "aspect_ratio": aspect_ratio,
             "visual_references": visual_references,
             "character_bindings": saved_character_bindings,
