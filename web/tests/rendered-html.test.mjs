@@ -278,9 +278,25 @@ test("uses a selected character asset as the source for a new draw", async () =>
   assert.match(page, /selectedSourceAssetId/);
   assert.match(page, /source_asset_id:sourceAssetId/);
   assert.match(page, /submitCharacterDraw\(drawLabel,drawDescription,drawCount,undefined,selectedSourceAssetId\|\|undefined\)/);
-  assert.match(page, /onClick=\{\(\)=>selectCharacterDrawSource\(asset\)\}/);
-  assert.match(page, /基于此角色继续抽卡/);
+  assert.match(page, /以此角色为原型创建新角色/);
+  assert.match(page, /sourceLockedOut/);
+  assert.doesNotMatch(page, /基于此角色继续抽卡/);
+  assert.doesNotMatch(page, /<article[^>]*onClick=\{\(\)=>selectCharacterDrawSource\(asset\)\}/);
   assert.match(css, /\.characterAssetCard\.selected/);
+  assert.match(css, /\.characterAssetCard\.sourceLockedOut/);
+});
+
+test("starts standard jobs with automatic character preparation and no library shortcut", async () => {
+  const page = await readPageSource();
+  assert.doesNotMatch(page, /请先点击.“AI 分析并挑选角色”/);
+  assert.doesNotMatch(page, /仍有角色没有资产，请先到抽卡区/);
+  assert.doesNotMatch(page, />打开角色抽卡库</);
+  assert.match(page, /自动分析、匹配并补齐角色资产/);
+  assert.match(page, /AbortController/);
+  assert.match(page, /300_000/);
+  assert.match(page, /角色分析等待超过5分钟/);
+  assert.match(page, /以此角色为原型创建新角色/);
+  assert.match(page, /openCharacterSourceCreator/);
 });
 
 test("restores matched characters into a detached reusable task form", async () => {

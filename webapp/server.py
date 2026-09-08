@@ -3333,6 +3333,7 @@ def model_stage(job_id: str, copy: str, style: str, reference: Path | None, scen
         # Models are resolved when settings are saved. Do not delay every job
         # by re-reading remote catalogs before the first generation request.
         config = load_config()
+        ensure_standard_job_character_assets(job_id, copy, style)
         aspect_ratio = normalize_aspect_ratio(JOBS.get(job_id, {}).get("aspect_ratio"))
         voice = job_dir / "voice.wav"
         duration = probe_duration(voice)
@@ -3913,18 +3914,20 @@ def model_queue_worker() -> None:
         task = work_queue.get()
         try:
             command = str(task[0])
-            job_id = str(task[1]) if command == "regenerate_board" else command
+            job_id = str(task[1]) if command in {"regenerate_board", "prepare_characters"} else command
             with LOCK:
                 should_run = JOBS.get(job_id, {}).get("status") in {"queued", "running"}
             if not should_run:
                 continue
             if command == "regenerate_board":
                 regenerate_board_image(job_id, int(task[2]), str(task[3]))
+            elif command == "prepare_characters":
+                prepare_character_stage(*task[1:])
             else:
                 model_stage(*task)
         except Exception as exc:
             command = str(task[0])
-            job_id = str(task[1]) if command == "regenerate_board" else command
+            job_id = str(task[1]) if command in {"regenerate_board", "prepare_characters"} else command
             if job_id in JOBS:
                 fail_job(job_id, "模型队列异常", exc)
         finally:
@@ -4030,6 +4033,10 @@ def enqueue_job_from_checkpoint(job_id: str, item: dict[str, Any]) -> None:
     voice_mode = str(item.get("voice_mode") or "clone")
     voice_mode = voice_mode if voice_mode in {"none", "uploaded", "clone"} else "clone"
     task = (job_id, copy, str(item.get("style", DEFAULT_STYLE)), reference, scenes_per_image, pen_text, include_key_text, include_subtitles, stroke_detail)
+    if item.get("reference_mode") == "standard" and not item.get("characters_prepared") and not valid_media_file(job_dir / "voice.wav"):
+        queue_for_stage(job_id, "model", "等待自动分析并装配角色资产", max(1, int(item.get("progress", 1))))
+        MODEL_QUEUE.put(("prepare_characters", *task, voice_mode))
+        return
     if valid_media_file(job_dir / "voice.wav"):
         queue_for_stage(job_id, "model", "已恢复配音，等待继续模型任务", max(14, int(item.get("progress", 14))))
         MODEL_QUEUE.put(task)
@@ -4052,10 +4059,6 @@ def resume_pending_jobs() -> None:
         except Exception as exc:
             fail_job(job_id, "任务恢复失败", exc)
     ensure_pipeline_workers()
-
-
-restore_jobs()
-resume_pending_jobs()
 
 
 @app.get("/api/health")
@@ -4302,7 +4305,8 @@ def draw_character_asset(asset_id: str) -> None:
 画面只包含这个角色，姿势中性，表情自然，视图彼此分开且无遮挡。禁止场景、道具、其他人物、文字、字母、数字、Logo、水印、边框、表格线和摄影写实。""")
         partial = asset_dir / "character-sheet.partial.png"
         partial.unlink(missing_ok=True)
-        generate_image(load_config(), prompt, partial, references, None, "3:4")
+        origin_job_id = str(item.get("origin_job_id") or "") or None
+        generate_image(load_config(), prompt, partial, references, origin_job_id, "3:4")
         if not valid_image_file(partial):
             raise RuntimeError("角色设定图文件无效")
         if valid_image_file(output):
@@ -4311,7 +4315,7 @@ def draw_character_asset(asset_id: str) -> None:
             shutil.copy2(output, revision_dir / f"character-sheet-{time.time_ns()}.png")
         partial.replace(output)
         item.update(
-            status="review",
+            status="approved" if item.get("auto_approve") else "review",
             image=output.name,
             style_recipe_version=style_recipe_version(style),
             rebuild_pending=False,
@@ -4362,8 +4366,7 @@ def list_character_assets(style: str = "", approved_only: bool = False) -> dict[
     return {"items": character_asset_records(style.strip() or None, not approved_only)}
 
 
-@app.post("/api/character-assets/draw")
-def create_character_draw(payload: dict[str, Any]) -> dict[str, Any]:
+def _create_character_draw(payload: dict[str, Any], *, start_workers: bool) -> dict[str, Any]:
     style = str(payload.get("style") or DEFAULT_STYLE).strip()
     if style not in STYLE_PRESETS or style == INFOGRAPHIC_STYLE:
         raise HTTPException(400, "未知画面风格")
@@ -4409,14 +4412,25 @@ def create_character_draw(payload: dict[str, Any]) -> dict[str, Any]:
                     "source_asset_id": source_asset_id or None,
                     "source_asset_label": str(source_asset.get("label") or "") if source_asset else None,
                     "source_image": source_image_name,
+                    "auto_approve": bool(payload.get("auto_approve")),
+                    "origin_job_id": str(payload.get("origin_job_id") or "") or None,
+                    "origin_role_id": str(payload.get("origin_role_id") or "") or None,
                 }
                 atomic_write_json(asset_dir / "asset.json", item)
             except Exception:
                 shutil.rmtree(asset_dir, ignore_errors=True)
                 raise
-        start_character_asset_worker(asset_id)
+        if start_workers:
+            start_character_asset_worker(asset_id)
         created.append({**item, "image_url": None})
     return {"items": created}
+
+
+@app.post("/api/character-assets/draw")
+def create_character_draw(payload: dict[str, Any]) -> dict[str, Any]:
+    # Manual draws always remain reviewable. Automatic approval is reserved
+    # for the task pipeline and cannot be enabled by a browser payload.
+    return _create_character_draw({**payload, "auto_approve": False, "origin_job_id": None, "origin_role_id": None}, start_workers=True)
 
 
 @app.post("/api/character-assets/rebuild-style")
@@ -4574,6 +4588,155 @@ match_reason 简述全文人物本性与候选脸相为什么相符或冲突；m
     return {"bindings": bindings, "missing_roles": [item for item in bindings if not item.get("asset_id")], "style": style}
 
 
+def _automatic_character_label(binding: dict[str, Any]) -> str:
+    age = str(binding.get("age_group") or "").replace("阶段", "").replace("人群", "").strip()
+    gender_value = str(binding.get("gender") or "").strip()
+    gender = "女" if gender_value in {"女", "女性"} else "男" if gender_value in {"男", "男性"} else ""
+    return f"{age}{gender}".strip() or "角色候选"
+
+
+def _freeze_standard_character_bindings(job_id: str, style: str, bindings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Copy approved public assets into a job so later library edits cannot alter it."""
+    job_dir = JOBS_DIR / job_id
+    frozen: list[dict[str, Any]] = []
+    seen_role_ids: set[str] = set()
+    seen_asset_ids: set[str] = set()
+    resolved: list[tuple[dict[str, Any], dict[str, Any], Path]] = []
+    for index, binding in enumerate(bindings, 1):
+        role_id = str(binding.get("role_id") or f"role_{index:02d}").strip()[:30]
+        asset_id = str(binding.get("asset_id") or "").strip()
+        if not role_id or role_id in seen_role_ids:
+            raise RuntimeError("角色 ID 重复")
+        if not asset_id or asset_id in seen_asset_ids:
+            raise RuntimeError("自动角色准备没有为每个角色分配独立资产")
+        manifest_path, asset = character_asset_record(asset_id)
+        source = manifest_path.parent / str(asset.get("image") or "")
+        if asset.get("status") != "approved" or asset.get("style") != style or not valid_image_file(source):
+            raise RuntimeError(f"角色“{binding.get('story_name') or role_id}”的资产不可用")
+        seen_role_ids.add(role_id)
+        seen_asset_ids.add(asset_id)
+        resolved.append(({**binding, "role_id": role_id, "asset_id": asset_id}, asset, source))
+    for index, (binding, asset, source) in enumerate(resolved, 1):
+        suffix = source.suffix.lower() if source.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"} else ".png"
+        filename = f"library-character-{index:02d}{suffix}"
+        shutil.copy2(source, job_dir / filename)
+        frozen.append({
+            "role_id": binding["role_id"],
+            "story_name": str(binding.get("story_name") or asset.get("label") or f"人物{index}").strip()[:30],
+            "description": str(binding.get("description") or asset.get("description") or "").strip()[:300],
+            "core_personality": str(binding.get("core_personality") or "").strip()[:120],
+            "facial_persona": str(binding.get("facial_persona") or "").strip()[:120],
+            "temporary_behavior": str(binding.get("temporary_behavior") or "").strip()[:160],
+            "gender": str(binding.get("gender") or "").strip()[:12],
+            "age_group": str(binding.get("age_group") or "").strip()[:20],
+            "asset_id": binding["asset_id"],
+            "asset_label": str(asset.get("label") or ""),
+            "image": filename,
+        })
+    return frozen
+
+
+def ensure_standard_job_character_assets(job_id: str, copy: str, style: str) -> None:
+    """Analyze, fill missing character sheets, auto-approve them, and freeze the result."""
+    with LOCK:
+        job = JOBS.get(job_id, {}).copy()
+    if job.get("reference_mode") != "standard" or job.get("characters_prepared"):
+        return
+    existing_bindings = [item for item in (job.get("character_bindings") or []) if isinstance(item, dict)]
+    if existing_bindings and all(
+        item.get("asset_id") and item.get("image") and valid_image_file(JOBS_DIR / job_id / str(item.get("image")))
+        for item in existing_bindings
+    ):
+        update_job(job_id, characters_prepared=True, character_count=len(existing_bindings))
+        return
+    begin_phase(job_id, "characters", "角色资产", "AI 正在分析文案并挑选角色", 15)
+    try:
+        result = match_character_assets({"copy": copy, "style": style})
+    except HTTPException as exc:
+        raise RuntimeError(f"角色分析失败：{exc.detail}") from exc
+    bindings = [dict(item) for item in (result.get("bindings") or []) if isinstance(item, dict)]
+    existing_by_role = {
+        str(item.get("role_id") or ""): item
+        for item in existing_bindings
+        if isinstance(item, dict) and item.get("asset_id")
+    }
+    for binding in bindings:
+        current = existing_by_role.get(str(binding.get("role_id") or ""))
+        if current:
+            binding.update({
+                "asset_id": current.get("asset_id"),
+                "asset_label": current.get("asset_label"),
+                "asset_image_url": current.get("asset_image_url"),
+            })
+    missing = [item for item in bindings if not item.get("asset_id")]
+    for position, binding in enumerate(missing, 1):
+        ensure_job_active(job_id)
+        story_name = str(binding.get("story_name") or f"人物{position}")
+        update_job(job_id, stage=f"正在为“{story_name}”创建角色资产 {position}/{len(missing)}", progress=16 + round(position * 5 / max(1, len(missing))))
+        description = "；".join(filter(None, [
+            str(binding.get("description") or ""),
+            f"核心性格：{binding.get('core_personality')}" if binding.get("core_personality") else "",
+            f"固定脸相：{binding.get('facial_persona')}" if binding.get("facial_persona") else "",
+        ]))
+        created = _create_character_draw({
+            "style": style,
+            "label": _automatic_character_label(binding),
+            "description": description,
+            "count": 1,
+            "auto_approve": True,
+            "origin_job_id": job_id,
+            "origin_role_id": binding.get("role_id"),
+        }, start_workers=False)["items"][0]
+        asset_id = str(created["id"])
+        draw_character_asset(asset_id)
+        _manifest, asset = character_asset_record(asset_id)
+        if asset.get("status") != "approved":
+            raise RuntimeError(f"角色“{story_name}”自动创建失败：{asset.get('error') or '没有生成有效设定图'}")
+        binding.update(
+            asset_id=asset_id,
+            asset_label=str(asset.get("label") or ""),
+            asset_image_url=f"/api/character-assets/{asset_id}/image",
+            persona_compatible=True,
+            match_confidence=1.0,
+            match_reason="当前画风资产库无合适角色，已按本文角色设定自动创建并装载",
+        )
+    frozen = _freeze_standard_character_bindings(job_id, style, bindings) if bindings else []
+    update_job(
+        job_id,
+        character_bindings=frozen,
+        character_count=len(frozen),
+        characters_prepared=True,
+        checkpoint="characters_done",
+        stage=f"角色资产已自动装配（{len(frozen)} 个）",
+        progress=22,
+    )
+
+
+def prepare_character_stage(
+    job_id: str,
+    copy: str,
+    style: str,
+    reference: Path | None,
+    scenes_per_image: int,
+    pen_text: str,
+    include_key_text: bool,
+    include_subtitles: bool,
+    stroke_detail: str,
+    voice_mode: str,
+) -> None:
+    """Run standard character preparation before voice and the remaining pipeline."""
+    ensure_standard_job_character_assets(job_id, copy, style)
+    ensure_job_active(job_id)
+    queue_for_stage(
+        job_id,
+        "voice",
+        "等待建立无旁白时间轴" if voice_mode == "none" else "等待处理上传旁白" if voice_mode == "uploaded" else "等待语音克隆",
+        23,
+    )
+    VOICE_QUEUE.put((job_id, copy, style, reference, scenes_per_image, pen_text, include_key_text, include_subtitles, stroke_detail, voice_mode))
+    ensure_pipeline_workers()
+
+
 @app.get("/api/preferences")
 def get_preferences() -> dict[str, Any]:
     if not PREFERENCES_PATH.exists():
@@ -4717,12 +4880,25 @@ async def create_job(
                 continue
             role_id = str(binding.get("role_id") or f"role_{index:02d}").strip()
             asset_id = str(binding.get("asset_id") or "").strip()
-            if not asset_id:
-                shutil.rmtree(job_dir, ignore_errors=True)
-                raise HTTPException(400, "存在尚未匹配角色资产的人物，请先前往抽卡区生成并审核")
             if role_id in seen_role_ids:
                 shutil.rmtree(job_dir, ignore_errors=True)
                 raise HTTPException(400, "角色 ID 重复")
+            seen_role_ids.add(role_id)
+            if not asset_id:
+                saved_character_bindings.append({
+                    "role_id": role_id[:30],
+                    "story_name": str(binding.get("story_name") or f"人物{index}").strip()[:30],
+                    "description": str(binding.get("description") or "").strip()[:300],
+                    "core_personality": str(binding.get("core_personality") or "").strip()[:120],
+                    "facial_persona": str(binding.get("facial_persona") or "").strip()[:120],
+                    "temporary_behavior": str(binding.get("temporary_behavior") or "").strip()[:160],
+                    "gender": str(binding.get("gender") or "").strip()[:12],
+                    "age_group": str(binding.get("age_group") or "").strip()[:20],
+                    "asset_id": None,
+                    "asset_label": None,
+                    "image": None,
+                })
+                continue
             manifest_path, asset = character_asset_record(asset_id)
             if asset.get("status") != "approved" or asset.get("style") != style:
                 shutil.rmtree(job_dir, ignore_errors=True)
@@ -4734,7 +4910,6 @@ async def create_job(
             suffix = source.suffix.lower() if source.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"} else ".png"
             filename = f"library-character-{index:02d}{suffix}"
             shutil.copy2(source, job_dir / filename)
-            seen_role_ids.add(role_id)
             saved_character_bindings.append({
                 "role_id": role_id[:30],
                 "story_name": str(binding.get("story_name") or asset.get("label") or f"人物{index}").strip()[:30],
@@ -4762,9 +4937,9 @@ async def create_job(
     now = time.time()
     with LOCK:
         JOBS[job_id] = {
-            "id": job_id, "status": "queued", "stage": "等待建立无旁白时间轴" if voice_mode == "none" else "等待处理上传旁白" if voice_mode == "uploaded" else "等待语音克隆", "progress": 1,
+            "id": job_id, "status": "queued", "stage": "等待自动分析并装配角色资产" if reference_mode == "standard" and not (bool(saved_character_bindings) and all(item.get("asset_id") and item.get("image") for item in saved_character_bindings)) else "等待建立无旁白时间轴" if voice_mode == "none" else "等待处理上传旁白" if voice_mode == "uploaded" else "等待语音克隆", "progress": 1,
             "created_at": now, "started_at": now, "timings": {},
-            "queue_stage": "voice", "queue_order": time.time_ns(),
+            "queue_stage": "model" if reference_mode == "standard" and not (bool(saved_character_bindings) and all(item.get("asset_id") and item.get("image") for item in saved_character_bindings)) else "voice", "queue_order": time.time_ns(),
             "client_ip": request_client_ip(request),
             "job_type": "infographic" if reference_mode == "infographic" else "generate", "style": style, "scenes_per_image": scenes_per_image,
             "pipeline_version": PIPELINE_VERSION if reference_mode == "infographic" else "standard_v2_character_assets",
@@ -4774,6 +4949,7 @@ async def create_job(
             "visual_references": visual_references,
             "character_bindings": saved_character_bindings,
             "character_count": len(saved_character_bindings) if reference_mode == "standard" else len(visual_references.get("characters", [])),
+            "characters_prepared": reference_mode != "standard" or bool(saved_character_bindings) and all(item.get("asset_id") and item.get("image") for item in saved_character_bindings),
             "task_name": task_name,
             "voice_mode": voice_mode,
             "identity_mode": identity_mode,
@@ -4784,7 +4960,11 @@ async def create_job(
             "current_phase": None, "phase_started_at": None, "total_elapsed": 0.0,
         }
         _persist_job_locked(job_id)
-    VOICE_QUEUE.put((job_id, script.strip(), style, reference_path, scenes_per_image, pen_text.strip()[:12], include_key_text, include_subtitles, stroke_detail, voice_mode))
+    task = (job_id, script.strip(), style, reference_path, scenes_per_image, pen_text.strip()[:12], include_key_text, include_subtitles, stroke_detail)
+    if reference_mode == "standard" and not JOBS[job_id].get("characters_prepared"):
+        MODEL_QUEUE.put(("prepare_characters", *task, voice_mode))
+    else:
+        VOICE_QUEUE.put((*task, voice_mode))
     ensure_pipeline_workers()
     return job_snapshot(job_id)
 
@@ -5181,3 +5361,9 @@ def download_job(job_id: str) -> FileResponse:
     if not path.exists():
         raise HTTPException(404, "视频尚未生成")
     return FileResponse(path, media_type="video/mp4", filename=f"whiteboard-{job_id}.mp4")
+
+
+# Resume only after every pipeline handler has been defined. This matters for
+# persisted jobs waiting in the new pre-voice character preparation stage.
+restore_jobs()
+resume_pending_jobs()

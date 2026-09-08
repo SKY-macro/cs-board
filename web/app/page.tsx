@@ -500,6 +500,7 @@ export default function Home() {
   const [replacementError, setReplacementError] = useState("");
   const [characterMatchReady, setCharacterMatchReady] = useState(false);
   const [characterBusy, setCharacterBusy] = useState(false);
+  const characterMatchController = useRef<AbortController | null>(null);
   const [drawingRoleId, setDrawingRoleId] = useState<string | null>(null);
   const [pendingDrawRoles, setPendingDrawRoles] = useState<Record<string, string>>({});
   const drawOriginRoles = useRef<Record<string, string>>({});
@@ -707,7 +708,7 @@ export default function Home() {
       return changed ? next : items;
     });
   };
-  const loadCharacterAssets = async () => {
+  const loadCharacterAssets = async (): Promise<CharacterAsset[]> => {
     try {
       const response = await fetch(`${API}/api/character-assets?style=${encodeURIComponent(style)}`);
       if (response.ok) {
@@ -727,10 +728,16 @@ export default function Home() {
           }
           return changed ? next : items;
         });
+        return assets;
       }
     } catch {}
+    return [];
   };
   useEffect(() => {
+    const pendingMatch = characterMatchController.current;
+    characterMatchController.current = null;
+    pendingMatch?.abort();
+    setCharacterBusy(false);
     setReplacementRoleId(null);
     const restored = restoredCharacterState.current;
     if (restored) {
@@ -759,11 +766,16 @@ export default function Home() {
     if (copy.trim().length < 10) return setMessage("请先填写至少 10 个字的文案，再分析角色");
     setCharacterBusy(true);
     setCharacterMessage("AI 正在分析文案并匹配当前画风的角色资产…");
+    characterMatchController.current?.abort();
+    const controller = new AbortController();
+    characterMatchController.current = controller;
+    const timeout = window.setTimeout(() => controller.abort(), 300_000);
     try {
       const response = await fetch(`${API}/api/character-matches`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ copy, style }),
+        signal: controller.signal,
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail || "角色匹配失败");
@@ -777,9 +789,14 @@ export default function Home() {
         setCharacterMessage(bindings.length ? `已匹配 ${bindings.length} 个角色；生成时会按分镜只上传实际出镜角色。` : "文案中没有需要固定形象的出镜角色，可直接生成。");
       }
     } catch (error) {
-      setCharacterMessage(error instanceof Error ? error.message : "角色匹配失败");
+      if (characterMatchController.current !== controller) return;
+      setCharacterMessage(error instanceof Error && error.name === "AbortError" ? "角色分析等待超过 5 分钟，已停止本次等待；也可以直接开始生成，由任务在后台自动完成角色准备。" : error instanceof Error ? error.message : "角色匹配失败");
     } finally {
-      setCharacterBusy(false);
+      window.clearTimeout(timeout);
+      if (characterMatchController.current === controller) {
+        characterMatchController.current = null;
+        setCharacterBusy(false);
+      }
     }
   };
   const submitCharacterDraw = async (label: string, description: string, count: number, originRoleId?: string, sourceAssetId?: string) => {
@@ -810,15 +827,27 @@ export default function Home() {
   const drawCharacterAssets = async () => submitCharacterDraw(drawLabel, drawDescription, drawCount, undefined, selectedSourceAssetId || undefined);
   const selectCharacterDrawSource = (asset: CharacterAsset) => {
     if (!asset.image_url) return;
-    if (selectedSourceAssetId === asset.id) {
-      setSelectedSourceAssetId(null);
-      setCharacterMessage("已取消角色图片参考；下一次抽卡只使用当前画风和文字说明。");
-      return;
-    }
     setSelectedSourceAssetId(asset.id);
     setDrawLabel(`${asset.label}变体`);
     setDrawDescription(asset.description);
     setCharacterMessage(`已选择“${asset.label}”作为人物参考；修改左侧说明后，可在该人物基础上生成新的角色设定图。`);
+  };
+  const cancelCharacterDrawSource = () => {
+    setSelectedSourceAssetId(null);
+    setCharacterMessage("已取消角色原型锁定；现在可以选择其他角色。");
+  };
+  const openCharacterSourceCreator = async (binding: CharacterBinding) => {
+    if (!binding.asset_id) return;
+    setCharacterLibraryOpen(true);
+    setCharacterMessage(`正在载入“${binding.asset_label || binding.story_name}”作为新角色原型…`);
+    const assets = await loadCharacterAssets();
+    const source = assets.find((asset) => asset.id === binding.asset_id && asset.image_url);
+    if (!source) {
+      setSelectedSourceAssetId(null);
+      setCharacterMessage("当前绑定来自任务冻结副本，公共资产原图已不可用，无法以它为原型创建；请先更换为公共库中的可用角色。");
+      return;
+    }
+    selectCharacterDrawSource(source);
   };
   const reusableAssetLabel = (binding: CharacterBinding) => {
     const age = binding.age_group && binding.age_group !== "未知" ? binding.age_group.replace(/阶段|人群/g, "") : "";
@@ -1103,8 +1132,6 @@ export default function Home() {
     const readyCharacters = characters.filter((item) => item.name.trim() && item.files.length);
     if (pageMode === "custom" && !styleReference) return setMessage("请上传一张画面风格参考图");
     if (pageMode === "custom" && !readyCharacters.length) return setMessage("请至少添加一个带参考图片的人物");
-    if (pageMode === "standard" && !characterMatchReady) return setMessage("请先点击“AI 分析并挑选角色”，确认当前文案的人物资产");
-    if (pageMode === "standard" && characterBindings.some((item) => !item.asset_id)) return setMessage("仍有角色没有资产，请先到抽卡区生成、审核并重新匹配");
     const body = new FormData();
     body.append("copy", copy);
     body.append("voice_mode", voiceMode);
@@ -1987,19 +2014,20 @@ export default function Home() {
                 <label>资产名称<input value={drawLabel} maxLength={30} onChange={(e) => setDrawLabel(e.target.value)} placeholder="例如：青年母亲候选" /></label>
                 <label>详细外观说明<textarea value={drawDescription} maxLength={300} onChange={(e) => setDrawDescription(e.target.value)} placeholder="年龄、脸型、眼睛、发型发色、体型、服装和标志特征" /></label>
                 <label>候选数量<select value={drawCount} onChange={(e) => setDrawCount(Number(e.target.value))}><option value={1}>1 张</option><option value={2}>2 张</option><option value={3}>3 张</option><option value={4}>4 张</option></select></label>
-                {selectedSourceAssetId && <div className="selectedDrawSource">基于此角色继续抽卡：<strong>{characterAssets.find((asset) => asset.id === selectedSourceAssetId)?.label || "已选角色"}</strong><button type="button" onClick={() => setSelectedSourceAssetId(null)}>取消</button></div>}
-                <button type="button" className="primary" disabled={characterBusy || drawDescription.trim().length < 4} onClick={drawCharacterAssets}>{characterBusy ? "处理中…" : selectedSourceAssetId ? "基于此角色继续抽卡" : "开始针对性抽卡"}</button>
+                {selectedSourceAssetId && <div className="selectedDrawSource">以此角色为原型创建新角色：<strong>{characterAssets.find((asset) => asset.id === selectedSourceAssetId)?.label || "已选角色"}</strong><button type="button" onClick={cancelCharacterDrawSource}>取消</button></div>}
+                <button type="button" className="primary" disabled={characterBusy || drawDescription.trim().length < 4} onClick={drawCharacterAssets}>{characterBusy ? "处理中…" : selectedSourceAssetId ? "以此角色为原型创建新角色" : "开始针对性抽卡"}</button>
                 <p>每张候选图包含同一角色的正面、四分之三侧面、纯侧面和全身视图；审核通过后才进入公共资产库。</p>
               </section>
               <section className="characterAssetGrid">
                 {characterAssets.length ? characterAssets.map((asset) => (
-                  <article key={asset.id} className={`characterAssetCard ${asset.status} ${asset.image_url ? "selectable" : ""} ${selectedSourceAssetId === asset.id ? "selected" : ""}`} onClick={() => selectCharacterDrawSource(asset)} onKeyDown={(event) => { if (asset.image_url && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); selectCharacterDrawSource(asset); } }} role={asset.image_url ? "button" : undefined} tabIndex={asset.image_url ? 0 : undefined} aria-pressed={asset.image_url ? selectedSourceAssetId === asset.id : undefined}>
+                  <article key={asset.id} className={`characterAssetCard ${asset.status} ${selectedSourceAssetId === asset.id ? "selected" : ""} ${selectedSourceAssetId && selectedSourceAssetId !== asset.id ? "sourceLockedOut" : ""}`} aria-disabled={Boolean(selectedSourceAssetId && selectedSourceAssetId !== asset.id)}>
                     {asset.image_url ? <img src={`${API}${asset.image_url}`} alt={`${asset.label}角色设定图`} /> : <div className="characterAssetWaiting">{asset.status === "error" ? "生成失败" : "正在生成角色设定图…"}</div>}
                     <strong>{asset.label}</strong>
                     <span>{asset.description}</span>
                     <small>{asset.status === "approved" ? "已审核，可被任务匹配" : asset.status === "review" ? "待你审核" : asset.status === "error" ? asset.error : "生成队列中"}</small>
                     {selectedSourceAssetId === asset.id && <small className="selectedSourceHint">已选为新设定图的人物参考</small>}
                     <div onClick={(event) => event.stopPropagation()}>
+                      {asset.image_url && <button type="button" className="createFromCharacter" disabled={Boolean(selectedSourceAssetId && selectedSourceAssetId !== asset.id)} onClick={() => selectCharacterDrawSource(asset)}>以此角色为原型创建新角色</button>}
                       {asset.status === "review" && <><button type="button" className="approveAsset" onClick={() => reviewCharacterAsset(asset, "approved")}>审核并保存</button><button type="button" onClick={() => reviewCharacterAsset(asset, "rejected")}>不采用</button></>}
                       {asset.status === "approved" && <button type="button" onClick={() => reviewCharacterAsset(asset, "rejected")}>停用</button>}
                       {asset.status === "rejected" && <button type="button" className="approveAsset" onClick={() => reviewCharacterAsset(asset, "approved")}>重新启用</button>}
@@ -2292,10 +2320,9 @@ export default function Home() {
         <div className="rightStack">
           {pageMode === "standard" && (
             <section className="panel taskCharacterMatcher">
-              <div><strong>本任务角色资产</strong><span>AI 只匹配“{style}”的已审核角色；每个分镜只上传本幕实际出镜人物。</span></div>
+              <div><strong>本任务角色资产</strong><span>可提前查看或调整；直接开始生成时，系统也会自动分析、匹配并补齐角色资产。</span></div>
               <div className="taskCharacterActions">
                 <button type="button" className="secondary" disabled={characterBusy || copy.trim().length < 10} onClick={matchCharacters}>{characterBusy ? "分析中…" : characterMatchReady ? "重新分析并匹配" : "AI 分析并挑选角色"}</button>
-                <button type="button" className="secondary" onClick={() => setCharacterLibraryOpen(true)}>打开角色抽卡库</button>
               </div>
               {characterBindings.length > 0 && (
                 <div className="taskCharacterBindings">
@@ -2315,6 +2342,7 @@ export default function Home() {
                         <div className="bindingStatusActions">
                           <em>匹配</em>
                           <button type="button" className="replaceBoundRole" onClick={() => void openCharacterReplacement(binding)}>更换该角色</button>
+                          <button type="button" className="createFromBoundRole" onClick={() => void openCharacterSourceCreator(binding)}>以此角色为原型创建新角色</button>
                         </div>
                       ) : (
                         <button type="button" className="drawMissingRole" disabled={drawingRoleId === binding.role_id} onClick={() => handleMissingCharacterAction(binding)}>

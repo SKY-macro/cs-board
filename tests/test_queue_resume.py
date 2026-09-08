@@ -582,14 +582,105 @@ class QueueResumeTests(unittest.TestCase):
         self.assertNotIn("库中只有一个同类候选时，都必须填 null", captured["prompt"])
         self.assertIn("候选数量不影响匹配结论", captured["prompt"])
 
-    def test_standard_job_rejects_unmatched_character(self) -> None:
+    def test_standard_job_accepts_unmatched_characters_for_automatic_preparation(self) -> None:
         response = TestClient(SERVER.app).post("/api/jobs", data={
             "copy": "小林走进房间，随后坐在桌边认真写下今天的计划。",
             "voice_mode": "none", "style": SERVER.DEFAULT_STYLE,
             "character_bindings": json.dumps([{"role_id": "role_01", "story_name": "小林", "asset_id": None}], ensure_ascii=False),
         })
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("抽卡区", response.text)
+        self.assertEqual(response.status_code, 200, response.text)
+        saved = SERVER.JOBS[response.json()["id"]]
+        self.assertFalse(saved["characters_prepared"])
+        self.assertIsNone(saved["character_bindings"][0]["asset_id"])
+
+    def test_automatic_character_preparation_draws_approves_and_freezes_missing_roles(self) -> None:
+        from PIL import Image
+
+        job_id = "auto-character"
+        job_dir = SERVER.JOBS_DIR / job_id
+        job_dir.mkdir(parents=True)
+        SERVER.JOBS[job_id] = {
+            **self.job(job_id),
+            "reference_mode": "standard",
+            "character_bindings": [],
+            "characters_prepared": False,
+        }
+        analyzed = {
+            "role_id": "role_01", "story_name": "小林", "gender": "男性", "age_group": "青年",
+            "description": "青年男性，短黑发，眉眼温和，身形清瘦，穿深色外套",
+            "core_personality": "真诚可靠", "facial_persona": "温和克制",
+            "temporary_behavior": "认真做计划", "asset_id": None,
+        }
+
+        def fake_generate(_config, _prompt, target, _references, _job_id, _aspect_ratio):
+            Image.effect_noise((256, 384), 45).convert("RGB").save(target)
+
+        with mock.patch.object(SERVER, "match_character_assets", return_value={"bindings": [analyzed]}), \
+                mock.patch.object(SERVER, "load_config", return_value={}), \
+                mock.patch.object(SERVER, "generate_image", side_effect=fake_generate):
+            SERVER.ensure_standard_job_character_assets(job_id, SERVER.JOBS[job_id]["copy"], SERVER.DEFAULT_STYLE)
+
+        saved = SERVER.JOBS[job_id]
+        self.assertTrue(saved["characters_prepared"])
+        self.assertEqual(saved["character_count"], 1)
+        binding = saved["character_bindings"][0]
+        self.assertTrue(binding["asset_id"])
+        self.assertEqual(binding["story_name"], "小林")
+        self.assertTrue((job_dir / binding["image"]).is_file())
+        _manifest, asset = SERVER.character_asset_record(binding["asset_id"])
+        self.assertEqual(asset["status"], "approved")
+        self.assertEqual(asset["origin_job_id"], job_id)
+
+    def test_automatic_character_preparation_preserves_a_complete_manual_binding(self) -> None:
+        from PIL import Image
+
+        asset_id = "manual123456"
+        asset_dir = SERVER.CHARACTER_LIBRARY_DIR / SERVER.character_style_key(SERVER.DEFAULT_STYLE) / asset_id
+        asset_dir.mkdir(parents=True)
+        Image.new("RGB", (96, 128), "white").save(asset_dir / "character-sheet.png")
+        SERVER.atomic_write_json(asset_dir / "asset.json", {
+            "id": asset_id, "style": SERVER.DEFAULT_STYLE, "label": "手选青年男",
+            "description": "青年男性，短黑发，眉眼温和", "status": "approved",
+            "image": "character-sheet.png", "created_at": 1,
+        })
+        job_id = "manual-character"
+        (SERVER.JOBS_DIR / job_id).mkdir(parents=True)
+        SERVER.JOBS[job_id] = {
+            **self.job(job_id), "reference_mode": "standard", "characters_prepared": True,
+            "character_bindings": [{
+                "role_id": "role_01", "story_name": "小林", "asset_id": asset_id,
+                "asset_label": "手选青年男", "description": "青年男性，短黑发，眉眼温和",
+                "image": "library-character-01.png",
+            }],
+        }
+        Image.new("RGB", (96, 128), "white").save(SERVER.JOBS_DIR / job_id / "library-character-01.png")
+
+        with mock.patch.object(SERVER, "match_character_assets") as match:
+            SERVER.ensure_standard_job_character_assets(job_id, SERVER.JOBS[job_id]["copy"], SERVER.DEFAULT_STYLE)
+
+        match.assert_not_called()
+        self.assertEqual(SERVER.JOBS[job_id]["character_bindings"][0]["asset_id"], asset_id)
+
+    def test_legacy_frozen_bindings_are_marked_prepared_without_reanalysis(self) -> None:
+        from PIL import Image
+
+        job_id = "legacy-character"
+        job_dir = SERVER.JOBS_DIR / job_id
+        job_dir.mkdir(parents=True)
+        Image.effect_noise((256, 384), 30).convert("RGB").save(job_dir / "library-character-01.png")
+        SERVER.JOBS[job_id] = {
+            **self.job(job_id), "reference_mode": "standard",
+            "character_bindings": [{
+                "role_id": "role_01", "story_name": "小林", "asset_id": "removed-public-asset",
+                "image": "library-character-01.png",
+            }],
+        }
+
+        with mock.patch.object(SERVER, "match_character_assets") as match:
+            SERVER.ensure_standard_job_character_assets(job_id, SERVER.JOBS[job_id]["copy"], SERVER.DEFAULT_STYLE)
+
+        match.assert_not_called()
+        self.assertTrue(SERVER.JOBS[job_id]["characters_prepared"])
 
     def test_character_plan_requires_scene_cast_ids(self) -> None:
         payload = [{"title": "小林进门", "key_text": "回到家", "concept": "小林走进房间", "elements": ["小林推门", "房间桌椅", "小林坐下"], "cast_ids": ["role_01"]}]
@@ -1714,7 +1805,9 @@ class QueueResumeTests(unittest.TestCase):
         job_id = response.json()["id"]
         self.assertEqual(SERVER.JOBS[job_id]["voice_mode"], "none")
         self.assertEqual(list((SERVER.JOBS_DIR / job_id).glob("reference.*")), [])
-        self.assertIsNone(SERVER.VOICE_QUEUE.get_nowait()[3])
+        task = SERVER.MODEL_QUEUE.get_nowait()
+        self.assertEqual(task[0], "prepare_characters")
+        self.assertIsNone(task[4])
 
     def test_model_catalog_classifies_and_selects_available_models(self) -> None:
         catalog = SERVER.build_model_catalog(
