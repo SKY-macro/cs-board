@@ -417,6 +417,80 @@ class QueueResumeTests(unittest.TestCase):
         self.assertEqual(first.json()["items"][0]["label"], "青年女")
         self.assertEqual(second.json()["items"][0]["label"], "青年女 2")
 
+    def test_character_draw_can_freeze_an_existing_asset_as_its_identity_source(self) -> None:
+        from PIL import Image
+
+        source_id = "abcdef123456"
+        source_dir = SERVER.CHARACTER_LIBRARY_DIR / SERVER.character_style_key(SERVER.DEFAULT_STYLE) / source_id
+        source_dir.mkdir(parents=True)
+        Image.effect_noise((128, 128), 25).convert("RGB").save(source_dir / "character-sheet.png")
+        SERVER.atomic_write_json(source_dir / "asset.json", {
+            "id": source_id, "style": SERVER.DEFAULT_STYLE, "label": "青年男",
+            "description": "青年男性，短黑发，朴素深色外套", "status": "approved",
+            "image": "character-sheet.png", "created_at": 1,
+        })
+
+        with mock.patch.object(SERVER, "start_character_asset_worker") as start:
+            response = TestClient(SERVER.app).post("/api/character-assets/draw", json={
+                "style": SERVER.DEFAULT_STYLE,
+                "label": "青年男变体",
+                "description": "保留原人物脸型和短黑发，服装改为浅色针织衫",
+                "source_asset_id": source_id,
+            })
+
+        self.assertEqual(response.status_code, 200, response.text)
+        created = response.json()["items"][0]
+        manifest_path, saved = SERVER.character_asset_record(created["id"])
+        self.assertEqual(saved["source_asset_id"], source_id)
+        self.assertEqual(saved["source_asset_label"], "青年男")
+        self.assertEqual(saved["source_image"], "source-character.png")
+        self.assertEqual((manifest_path.parent / "source-character.png").read_bytes(), (source_dir / "character-sheet.png").read_bytes())
+        start.assert_called_once_with(created["id"])
+
+    def test_character_draw_uses_the_frozen_source_image_as_character_reference(self) -> None:
+        from PIL import Image
+
+        asset_id = "abcdef123456"
+        asset_dir = SERVER.CHARACTER_LIBRARY_DIR / SERVER.character_style_key(SERVER.DEFAULT_STYLE) / asset_id
+        asset_dir.mkdir(parents=True)
+        Image.effect_noise((128, 128), 25).convert("RGB").save(asset_dir / "source-character.png")
+        SERVER.atomic_write_json(asset_dir / "asset.json", {
+            "id": asset_id, "style": SERVER.DEFAULT_STYLE, "label": "青年男变体",
+            "description": "保留原人物身份，服装改为浅色针织衫", "status": "queued",
+            "image": None, "source_image": "source-character.png", "created_at": 1,
+        })
+        captured: dict[str, object] = {}
+
+        def fake_generate(_config, prompt, target, references, *_args):
+            captured["prompt"] = prompt
+            captured["references"] = [path.name for path in references]
+            Image.effect_noise((128, 128), 45).convert("RGB").save(target)
+
+        with mock.patch.object(SERVER, "load_config", return_value={}), mock.patch.object(SERVER, "generate_image", side_effect=fake_generate):
+            SERVER.draw_character_asset(asset_id)
+
+        self.assertEqual(captured["references"], ["source-character.png"])
+        self.assertIn("输入图1定义基础角色身份", str(captured["prompt"]))
+        self.assertIn("只改变角色要求明确提出的属性", str(captured["prompt"]))
+
+    def test_character_draw_stops_instead_of_losing_a_missing_identity_source(self) -> None:
+        asset_id = "abcdef123456"
+        asset_dir = SERVER.CHARACTER_LIBRARY_DIR / SERVER.character_style_key(SERVER.DEFAULT_STYLE) / asset_id
+        asset_dir.mkdir(parents=True)
+        SERVER.atomic_write_json(asset_dir / "asset.json", {
+            "id": asset_id, "style": SERVER.DEFAULT_STYLE, "label": "青年男变体",
+            "description": "保留原人物身份，服装改为浅色针织衫", "status": "queued",
+            "image": None, "source_image": "missing-source.png", "created_at": 1,
+        })
+
+        with mock.patch.object(SERVER, "generate_image") as generate:
+            SERVER.draw_character_asset(asset_id)
+
+        _manifest, saved = SERVER.character_asset_record(asset_id)
+        self.assertEqual(saved["status"], "error")
+        self.assertIn("来源角色图缺失", saved["error"])
+        generate.assert_not_called()
+
     def test_character_match_returns_both_story_name_and_asset_label(self) -> None:
         asset_id = "abcdef123456"
         asset_dir = SERVER.CHARACTER_LIBRARY_DIR / SERVER.character_style_key(SERVER.DEFAULT_STYLE) / asset_id
@@ -491,7 +565,13 @@ class QueueResumeTests(unittest.TestCase):
             "asset_id": asset_id, "persona_compatible": True, "match_confidence": 0.91,
             "match_reason": "年龄、外观与温和克制的固定脸相均一致",
         }]
-        with mock.patch.object(SERVER, "provider_text", return_value={"output_text": json.dumps(model_result, ensure_ascii=False)}):
+        captured: dict[str, str] = {}
+
+        def fake_provider(_config, _model, prompt):
+            captured["prompt"] = prompt
+            return {"output_text": json.dumps(model_result, ensure_ascii=False)}
+
+        with mock.patch.object(SERVER, "provider_text", side_effect=fake_provider):
             response = TestClient(SERVER.app).post("/api/character-matches", json={
                 "copy": "他省下自己的生活费，最后把自己能给的全给了我。", "style": SERVER.DEFAULT_STYLE,
             })
@@ -499,6 +579,8 @@ class QueueResumeTests(unittest.TestCase):
         self.assertEqual(binding["asset_id"], asset_id)
         self.assertEqual(binding["asset_label"], "温厚青年男")
         self.assertEqual(binding["match_confidence"], 0.91)
+        self.assertNotIn("库中只有一个同类候选时，都必须填 null", captured["prompt"])
+        self.assertIn("候选数量不影响匹配结论", captured["prompt"])
 
     def test_standard_job_rejects_unmatched_character(self) -> None:
         response = TestClient(SERVER.app).post("/api/jobs", data={

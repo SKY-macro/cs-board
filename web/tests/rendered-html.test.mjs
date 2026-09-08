@@ -257,7 +257,9 @@ test("supports one-click missing-role draws and live green binding feedback", as
   assert.match(page, /核心性格：/);
   assert.match(page, /固定脸相：/);
   assert.match(page, /constdrawMissingCharacter=/);
-  assert.match(page, /"去抽卡"/);
+  assert.match(page, /"开始抽卡"/);
+  assert.match(page, /"开始审核"/);
+  assert.match(page, /pendingDrawRoles\[binding\.role_id\].*setCharacterLibraryOpen\(true\)/s);
   assert.match(page, /story_name.*asset_label/s);
   assert.match(page, /setCharacterBindings\(\(items\)=>items\.map/);
   assert.ok(
@@ -268,12 +270,26 @@ test("supports one-click missing-role draws and live green binding feedback", as
   assert.match(css, /\.drawMissingRole/);
 });
 
+test("uses a selected character asset as the source for a new draw", async () => {
+  const [page, css] = await Promise.all([
+    readPageSource(),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+  assert.match(page, /selectedSourceAssetId/);
+  assert.match(page, /source_asset_id:sourceAssetId/);
+  assert.match(page, /submitCharacterDraw\(drawLabel,drawDescription,drawCount,undefined,selectedSourceAssetId\|\|undefined\)/);
+  assert.match(page, /onClick=\{\(\)=>selectCharacterDrawSource\(asset\)\}/);
+  assert.match(page, /基于此角色继续抽卡/);
+  assert.match(css, /\.characterAssetCard\.selected/);
+});
+
 test("restores matched characters into a detached reusable task form", async () => {
   const page = await readPageSource();
   assert.match(page, /constrestoredCharacterState=useRef/);
   assert.match(page, /constrestoreParameters=.*focusedJobId\.current=null.*setJob\(null\).*setRerenderSource\(null\)/s);
   assert.doesNotMatch(page, /constrestoreParameters=.*setJob\(source\).*constopenTaskDetail/s);
-  assert.match(page, /binding\.match_confidence!=null.*%匹配.*已绑定/s);
+  assert.match(page, /<em>匹配<\/em>/);
+  assert.doesNotMatch(page, /%匹配/);
 });
 
 test("allows manually replacing one bound role with another approved asset", async () => {

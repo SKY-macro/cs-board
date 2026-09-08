@@ -39,7 +39,7 @@ PYTHON = Path(sys.executable)
 NODE = shutil.which("node") or "node"
 REMOTION_RENDERER = ROOT / "video_renderer"
 HAND = ROOT / "assets" / "drawing-hand-clean.png"
-PIPELINE_VERSION = "narrated_deck_v23_storybook_text_recipe"
+PIPELINE_VERSION = "narrated_deck_v24_character_draw_source"
 ALIGNMENT_SEGMENTATION = "word-boundary-dtw-audio-v2"
 SUBTITLE_FONT = os.environ.get(
     "CS_BOARD_SUBTITLE_FONT",
@@ -3911,7 +3911,10 @@ def regenerate_board_image(job_id: str, page: int, prompt: str) -> None:
 
 def model_queue_worker() -> None:
     while True:
-        task = MODEL_QUEUE.get()
+        # Tests and controlled reloads may replace the global queue. Always
+        # acknowledge the same queue instance from which this task was read.
+        work_queue = MODEL_QUEUE
+        task = work_queue.get()
         try:
             command = str(task[0])
             job_id = str(task[1]) if command == "regenerate_board" else command
@@ -3929,7 +3932,7 @@ def model_queue_worker() -> None:
             if job_id in JOBS:
                 fail_job(job_id, "模型队列异常", exc)
         finally:
-            MODEL_QUEUE.task_done()
+            work_queue.task_done()
 
 
 def start_render_task(target: Any, *args: Any) -> None:
@@ -4276,7 +4279,22 @@ def draw_character_asset(asset_id: str) -> None:
         asset_dir = manifest_path.parent
         output = asset_dir / "character-sheet.png"
         references, reference_instruction = style_only_reference_context(style)
-        reference_block = f"参考图规则：{reference_instruction}\n" if reference_instruction else ""
+        reference_rules: list[str] = []
+        source_image_name = str(item.get("source_image") or "")
+        if reference_instruction:
+            numbered_instruction = reference_instruction.replace("输入图", "输入图1", 1) if source_image_name and references else reference_instruction
+            reference_rules.append(numbered_instruction)
+        source_image = asset_dir / source_image_name
+        if source_image_name:
+            if not valid_image_file(source_image):
+                raise RuntimeError("抽卡来源角色图缺失或无效")
+            source_index = len(references) + 1
+            references = [*references, source_image]
+            reference_rules.append(
+                f"输入图{source_index}定义基础角色身份。严格保留其脸型、眼睛形状、五官间距、发型发色、年龄、体型和标志特征；"
+                "只改变角色要求明确提出的属性，不得重新设计成另一个人。"
+            )
+        reference_block = f"参考图规则：{' '.join(reference_rules)}\n" if reference_rules else ""
         prompt = compact_image_prompt(f"""生成一张 3:4 的可复用角色设定图，不是故事分镜。
 画面风格：{style}。视觉配方：{style_recipe(style)}
 {reference_block}角色要求：{str(item.get('description') or '')[:260]}
@@ -4354,6 +4372,16 @@ def create_character_draw(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(400, "请填写至少 4 个字的人物外观描述")
     count = max(1, min(4, int(payload.get("count") or 1)))
     requested_label = re.sub(r"\s+", " ", str(payload.get("label") or "角色候选")).strip()[:30] or "角色候选"
+    source_asset_id = str(payload.get("source_asset_id") or "").strip()
+    source_asset: dict[str, Any] | None = None
+    source_path: Path | None = None
+    if source_asset_id:
+        source_manifest, source_asset = character_asset_record(source_asset_id)
+        if str(source_asset.get("style") or "") != style:
+            raise HTTPException(400, "来源角色资产不属于当前画面风格")
+        source_path = source_manifest.parent / str(source_asset.get("image") or "")
+        if not valid_image_file(source_path):
+            raise HTTPException(400, "来源角色设定图尚不可用")
     created: list[dict[str, Any]] = []
     for _ in range(count):
         with LOCK:
@@ -4361,19 +4389,31 @@ def create_character_draw(payload: dict[str, Any]) -> dict[str, Any]:
             asset_id = uuid.uuid4().hex[:12]
             asset_dir = CHARACTER_LIBRARY_DIR / character_style_key(style) / asset_id
             asset_dir.mkdir(parents=True, exist_ok=False)
-            item = {
-                "id": asset_id,
-                "style": style,
-                "style_recipe_version": style_recipe_version(style),
-                "label": label,
-                "description": description[:300],
-                "status": "queued",
-                "image": None,
-                "created_at": time.time(),
-                "updated_at": time.time(),
-                "error": None,
-            }
-            atomic_write_json(asset_dir / "asset.json", item)
+            try:
+                source_image_name: str | None = None
+                if source_path is not None:
+                    suffix = source_path.suffix.lower() if source_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"} else ".png"
+                    source_image_name = f"source-character{suffix}"
+                    shutil.copy2(source_path, asset_dir / source_image_name)
+                item = {
+                    "id": asset_id,
+                    "style": style,
+                    "style_recipe_version": style_recipe_version(style),
+                    "label": label,
+                    "description": description[:300],
+                    "status": "queued",
+                    "image": None,
+                    "created_at": time.time(),
+                    "updated_at": time.time(),
+                    "error": None,
+                    "source_asset_id": source_asset_id or None,
+                    "source_asset_label": str(source_asset.get("label") or "") if source_asset else None,
+                    "source_image": source_image_name,
+                }
+                atomic_write_json(asset_dir / "asset.json", item)
+            except Exception:
+                shutil.rmtree(asset_dir, ignore_errors=True)
+                raise
         start_character_asset_worker(asset_id)
         created.append({**item, "image_url": None})
     return {"items": created}
@@ -4464,7 +4504,7 @@ def match_character_assets(payload: dict[str, Any]) -> dict[str, Any]:
 为每个角色建立稳定的 role_id（role_01 起）、story_name（沿用文案称呼，没有姓名时用身份称呼）、gender、age_group、description、core_personality、facial_persona、temporary_behavior。
 description 用 25～100 个汉字写身份、年龄段、脸型、眼睛、发型发色、体型、服装、标志特征，并把与 core_personality 一致、可长期保持的脸部气质写进去；不写姿势、场景和构图。
 core_personality 写全文验证后的稳定本性；facial_persona 写适合固定在脸上的可视气质；temporary_behavior 只写本故事阶段性行为，不得用它替代核心性格。
-从下方“{style}”专属资产中逐项比较性别、年龄、外观和人格兼容。资产描述中的精明、温和、强势、怯懦、正直等气质是永久脸相设定，不得忽略或改写。只有四项均相符且 match_confidence 不低于 0.78，才可填 asset_id，并令 persona_compatible=true；只匹配年龄性别、人格脸相冲突、证据不足或库中只有一个同类候选时，都必须填 null。宁可去抽卡，也禁止为了使用现有资产而勉强匹配。一个资产不能同时分配给两个角色。
+从下方“{style}”专属资产中逐项比较性别、年龄、外观和人格兼容。资产描述中的精明、温和、强势、怯懦、正直等气质是永久脸相设定，不得忽略或改写。只有四项均相符且 match_confidence 不低于 0.78，才可填 asset_id，并令 persona_compatible=true；只匹配年龄性别、人格脸相冲突或证据不足时必须填 null。候选数量不影响匹配结论：即使库中只有一个候选，只要四项均相符也必须正常分配。宁可去抽卡，也禁止为了使用现有资产而勉强匹配。一个资产不能同时分配给两个角色。
 match_reason 简述全文人物本性与候选脸相为什么相符或冲突；match_confidence 为 0～1 小数。
 只返回 JSON 数组，每项字段固定为 role_id、story_name、gender、age_group、description、core_personality、facial_persona、temporary_behavior、asset_id、persona_compatible、match_confidence、match_reason。
 
