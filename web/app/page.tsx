@@ -295,7 +295,7 @@ const estimateMinutes = (text: string) => Math.max(1 / 8, text.trim().length / 2
 const estimateSceneCount = (text: string) => Math.max(1, Math.min(20, countScriptUnits(text), Math.max(1, Math.ceil(estimateMinutes(text) * 10))));
 const normalizeIdentityMode = (value: unknown): IdentityMode => (value === "male" || value === "female" ? value : "consistent");
 const identityModeDescriptions: Record<IdentityMode, string> = {
-  consistent: "角色默认延续，剧情明确成长或换装时只更新相关属性",
+  consistent: "角色资产按分镜定义，禁止随地点、动作或镜头重新设计",
   male: "固定为短黑发、深色上衣的普通中国青年男性",
   female: "固定为自然黑色齐肩发、深色上衣的普通中国青年女性",
 };
@@ -2588,7 +2588,7 @@ export default function Home() {
             </div>
             <div className="styleRecipeBox fullPromptBox">
               <div>
-                <strong>完整拼接提示词（后台原文）</strong>
+                <strong>系统图片提示词模板（含人物参考规则）</strong>
                 <span>{stylePromptPreview ? `${stylePromptPreview.full_length} 字符` : "等待新版后台"}</span>
               </div>
               <pre>{stylePromptPreview?.full_prompt || `风格名称：${pageMode === "custom" ? "自定义参考" : style}\n视觉配方：${selectedStyleRecipe}\n\n完整动态模板将在当前运行任务结束、后台安全升级后显示。`}</pre>

@@ -8,7 +8,7 @@ $backendOutputLog = Join-Path $stateDir "backend-output.log"
 $backendErrorLog = Join-Path $stateDir "backend-error.log"
 $frontendOutputLog = Join-Path $stateDir "frontend-output.log"
 $frontendErrorLog = Join-Path $stateDir "frontend-error.log"
-$expectedPipelineVersion = "narrated_deck_v24_character_draw_source"
+$expectedPipelineVersion = "narrated_deck_v25_character_reference_preview"
 $backendUpdateDeferred = $false
 
 New-Item -ItemType Directory -Force -Path $stateDir | Out-Null

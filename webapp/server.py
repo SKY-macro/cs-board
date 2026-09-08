@@ -39,7 +39,7 @@ PYTHON = Path(sys.executable)
 NODE = shutil.which("node") or "node"
 REMOTION_RENDERER = ROOT / "video_renderer"
 HAND = ROOT / "assets" / "drawing-hand-clean.png"
-PIPELINE_VERSION = "narrated_deck_v24_character_draw_source"
+PIPELINE_VERSION = "narrated_deck_v25_character_reference_preview"
 ALIGNMENT_SEGMENTATION = "word-boundary-dtw-audio-v2"
 SUBTITLE_FONT = os.environ.get(
     "CS_BOARD_SUBTITLE_FONT",
@@ -67,11 +67,7 @@ INFOGRAPHIC_STYLE = "国风动态信息图"
 CLEAR_STORYBOOK_STYLE = "清透日系生活绘本"
 DEFAULT_IDENTITY_MODE = "consistent"
 IDENTITY_PROMPTS = {
-    "consistent": (
-        "同一角色跨分镜保持身份、基础脸型、眼睛形状、发色和标志性特征一致。"
-        "年龄、身高、体型、发型、服装和当前状态默认延续上一分镜；只有原文明示或剧情必然包含时间跳跃、成长、衰老、换装、受伤等变化时才允许更新。"
-        "发生变化时，只改变剧情要求改变的属性，其余身份锚点必须保留，确保仍能一眼认出是同一个人。不得因为地点、动作或镜头变化而重新设计角色。"
-    ),
+    "consistent": "不得因为地点、动作或镜头变化而重新设计角色。",
     "male": "同一主角固定为：中国青年男性，短黑发，朴素深色上衣，普通人形象；所有分镜中的年龄与外貌保持一致。",
     "female": "同一主角固定为：中国青年女性，自然黑色齐肩发，朴素深色上衣，普通人形象；所有分镜中的年龄与外貌保持一致。",
 }
@@ -4140,15 +4136,19 @@ def preview_style_prompt(payload: dict[str, Any]) -> dict[str, Any]:
             }
             for i in range(1, scene_count + 1)
         ]
+    character_reference_preview = page_mode == "standard" and identity_mode == "consistent"
     reference_instruction = (
         "{{上传风格参考图：只学习视觉风格，不复制图中人物或事件}}"
-        if page_mode == "custom" else ""
+        if page_mode == "custom" else
+        "输入图1定义人物“{{角色名称}}”（{{role_id}}）：{{外观与固定气质}}，"
+        "锁定身份、脸型、五官、发型、年龄体型和标志特征，状态随分镜。"
+        if character_reference_preview else ""
     )
     full_prompt = build_board_prompt(
         scenes,
         style if page_mode != "custom" else "自定义参考",
         reference_instruction,
-        page_mode == "custom",
+        page_mode == "custom" or character_reference_preview,
         page_mode == "infographic",
         aspect_ratio,
         presentation_mode,

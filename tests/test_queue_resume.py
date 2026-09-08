@@ -851,6 +851,20 @@ class QueueResumeTests(unittest.TestCase):
                 if other_mode != mode:
                     self.assertNotIn(other_prompt, prompt)
 
+    def test_consistent_identity_mode_removes_the_legacy_long_paragraph(self) -> None:
+        removed_text = (
+            "同一角色跨分镜保持身份、基础脸型、眼睛形状、发色和标志性特征一致。"
+            "年龄、身高、体型、发型、服装和当前状态默认延续上一分镜；只有原文明示或剧情必然包含时间跳跃、成长、衰老、换装、受伤等变化时才允许更新。"
+            "发生变化时，只改变剧情要求改变的属性，其余身份锚点必须保留，确保仍能一眼认出是同一个人。"
+        )
+        self.assertEqual(SERVER.IDENTITY_PROMPTS["consistent"], "不得因为地点、动作或镜头变化而重新设计角色。")
+        preview = SERVER.preview_style_prompt({"page_mode": "standard", "style": SERVER.DEFAULT_STYLE})
+        self.assertNotIn(removed_text, preview["full_prompt"])
+        self.assertNotIn(removed_text, preview["sent_prompt"])
+        self.assertIn("输入图1定义人物“{{角色名称}}”（{{role_id}}）", preview["full_prompt"])
+        self.assertIn("锁定身份、脸型、五官、发型、年龄体型和标志特征", preview["full_prompt"])
+        self.assertIn("只使用人物参考组中定义的角色", preview["full_prompt"])
+
     def test_identity_mode_defaults_to_consistent_and_persists_in_job_parameters(self) -> None:
         with TestClient(SERVER.app) as client:
             response = client.post("/api/jobs", data={

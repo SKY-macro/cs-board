@@ -236,7 +236,7 @@ test("shows a live prompt structure panel for the selected visual style", async 
   assert.match(page, /className="panelstylePromptPanel"/);
   assert.match(page, /画风提示词结构/);
   assert.match(page, /promptStructureLayers\.map/);
-  assert.match(page, /完整拼接提示词（后台原文）/);
+  assert.match(page, /系统图片提示词模板（含人物参考规则）/);
   assert.match(page, /实际提交给图片模型的提示词/);
   assert.match(page, /stylePromptPreview\?\.full_prompt/);
   assert.match(page, /stylePromptPreview\.sent_prompt/);
